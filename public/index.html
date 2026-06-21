@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlowX Auth API Tester</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0f172a; --surface: #1e293b; --surface2: #334155;
+    --border: #475569; --text: #f1f5f9; --text2: #94a3b8;
+    --primary: #6366f1; --primary-hover: #818cf8; --success: #22c55e;
+    --error: #ef4444; --warning: #f59e0b; --radius: 8px; --font: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  }
+  html { font-size: 14px; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+  }
+  .header {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 16px 24px; display: flex; align-items: center; gap: 16px;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .header h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; }
+  .header .sub { color: var(--text2); font-size: 0.85rem; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
+  }
+  .badge.online { background: rgba(34,197,94,0.15); color: var(--success); }
+  .badge.offline { background: rgba(239,68,68,0.15); color: var(--error); }
+  .badge .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .badge.online .dot { background: var(--success); }
+  .badge.offline .dot { background: var(--error); }
+
+  .layout { display: flex; min-height: calc(100vh - 60px); }
+  .sidebar {
+    width: 220px; background: var(--surface); border-right: 1px solid var(--border);
+    padding: 12px 0; flex-shrink: 0; overflow-y: auto;
+  }
+  .sidebar .section-label {
+    padding: 8px 16px 4px; font-size: 0.65rem; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.08em; color: var(--text2);
+  }
+  .sidebar a {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 16px; color: var(--text2); text-decoration: none;
+    font-size: 0.85rem; transition: all 0.15s; border-left: 3px solid transparent;
+  }
+  .sidebar a:hover { background: rgba(99,102,241,0.08); color: var(--text); }
+  .sidebar a.active {
+    background: rgba(99,102,241,0.12); color: var(--primary-hover);
+    border-left-color: var(--primary);
+  }
+  .sidebar a .icon { font-size: 1rem; width: 20px; text-align: center; }
+
+  .main { flex: 1; padding: 24px; overflow-y: auto; max-width: 960px; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 16px; overflow: hidden;
+  }
+  .card-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; cursor: pointer; user-select: none;
+    border-bottom: 1px solid transparent; transition: background 0.15s;
+  }
+  .card-header:hover { background: rgba(255,255,255,0.03); }
+  .card-header.open { border-bottom-color: var(--border); }
+  .card-header .left { display: flex; align-items: center; gap: 10px; }
+  .card-header .method {
+    font-family: var(--font); font-size: 0.7rem; font-weight: 700;
+    padding: 2px 6px; border-radius: 4px; text-transform: uppercase;
+  }
+  .method.post { background: rgba(99,102,241,0.2); color: #a5b4fc; }
+  .method.get { background: rgba(34,197,94,0.2); color: #86efac; }
+  .card-header .path {
+    font-family: var(--font); font-size: 0.8rem; color: var(--text2);
+  }
+  .card-header .toggle { color: var(--text2); transition: transform 0.2s; font-size: 0.75rem; }
+  .card-header.open .toggle { transform: rotate(180deg); }
+
+  .card-body { display: none; padding: 16px; }
+  .card-body.open { display: block; }
+
+  .form-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .form-group { flex: 1; min-width: 180px; }
+  .form-group label {
+    display: block; font-size: 0.75rem; font-weight: 600; color: var(--text2);
+    margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .form-group input, .form-group select {
+    width: 100%; padding: 8px 10px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    font-size: 0.85rem; font-family: var(--font); outline: none;
+    transition: border-color 0.15s;
+  }
+  .form-group input:focus, .form-group select:focus { border-color: var(--primary); }
+  .form-group select { cursor: pointer; }
+  .form-group input::placeholder { color: var(--text2); opacity: 0.5; }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 8px 16px; border-radius: 6px; font-size: 0.85rem; font-weight: 600;
+    border: none; cursor: pointer; transition: all 0.15s;
+  }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover { background: var(--primary-hover); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-sm { padding: 4px 10px; font-size: 0.75rem; }
+  .btn-success { background: var(--success); color: #fff; }
+  .btn-success:hover { background: #16a34a; }
+  .btn-outline {
+    background: transparent; border: 1px solid var(--border); color: var(--text2);
+  }
+  .btn-outline:hover { border-color: var(--text2); color: var(--text); }
+
+  .response-box {
+    margin-top: 12px; border-radius: 6px; overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .response-box .resp-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 12px; background: var(--bg); font-size: 0.75rem; color: var(--text2);
+    border-bottom: 1px solid var(--border);
+  }
+  .response-box .resp-header .status { font-family: var(--font); font-weight: 600; }
+  .response-box .resp-header .status.ok { color: var(--success); }
+  .response-box .resp-header .status.err { color: var(--error); }
+  .response-box pre {
+    padding: 12px; font-family: var(--font); font-size: 0.75rem;
+    line-height: 1.5; overflow-x: auto; max-height: 300px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all; color: var(--text);
+  }
+  .response-box pre .key { color: #818cf8; }
+  .response-box pre .string { color: #a5b4fc; }
+  .response-box pre .number { color: #34d399; }
+  .response-box pre .bool { color: #f472b6; }
+  .response-box pre .null { color: #94a3b8; }
+  .response-box pre .error-text { color: #f87171; }
+
+  .token-bar {
+    padding: 10px 16px; background: var(--surface2); border-top: 1px solid var(--border);
+    font-family: var(--font); font-size: 0.75rem;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .token-bar .label { color: var(--text2); font-weight: 600; }
+  .token-bar .value {
+    flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; min-width: 100px;
+  }
+  .token-bar .copy-btn { cursor: pointer; color: var(--primary); font-size: 0.7rem; font-weight: 600; }
+
+  .toast-container {
+    position: fixed; bottom: 24px; right: 24px; z-index: 999;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .toast {
+    padding: 10px 16px; border-radius: 6px; font-size: 0.85rem; font-weight: 500;
+    animation: slideIn 0.2s ease; max-width: 400px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  .toast.success { background: rgba(34,197,94,0.2); border: 1px solid var(--success); color: var(--success); }
+  .toast.error { background: rgba(239,68,68,0.2); border: 1px solid var(--error); color: var(--error); }
+  .toast.info { background: rgba(99,102,241,0.2); border: 1px solid var(--primary); color: var(--primary-hover); }
+  @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text2); }
+
+  @media (max-width: 768px) {
+    .sidebar { display: none; }
+    .main { padding: 16px; }
+    .form-row { flex-direction: column; }
+    .form-group { min-width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>FlowX Auth API</h1>
+  <span class="sub">API Tester</span>
+  <span class="badge offline" id="serverBadge"><span class="dot"></span><span id="serverStatus">Offline</span></span>
+  <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+    <span class="sub" style="font-size:0.75rem;color:var(--text2)">Token:</span>
+    <span id="tokenDisplay" style="font-family:var(--font);font-size:0.7rem;color:var(--text2);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">none</span>
+    <button class="btn btn-outline btn-sm" onclick="clearToken()">Clear</button>
+  </div>
+</div>
+
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main" id="mainContent"></main>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+const BASE = 'http://localhost:3001/api/v1';
+
+let accessToken = null;
+let authToken = null;
+
+function setToken(token) {
+  accessToken = token;
+  authToken = token;
+  document.getElementById('tokenDisplay').textContent = token ? token.substring(0, 40) + '...' : 'none';
+}
+
+function clearToken() {
+  setToken(null);
+  toast('Token cleared', 'info');
+}
+
+function getHeaders(extra = {}) {
+  const h = { 'Content-Type': 'application/json', ...extra };
+  if (accessToken) h['Authorization'] = `Bearer ${accessToken}`;
+  return h;
+}
+
+async function apiCall(method, path, body = null, opts = {}) {
+  const url = `${BASE}${path}`;
+  const fetchOpts = {
+    method,
+    headers: getHeaders(opts.headers),
+    credentials: 'include',
+  };
+  if (body) fetchOpts.body = JSON.stringify(body);
+  const res = await fetch(url, fetchOpts);
+  let data = null;
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) data = await res.json();
+  else data = { raw: await res.text() };
+  return { status: res.status, ok: res.ok, data };
+}
+
+function toast(message, type = 'info') {
+  const c = document.getElementById('toastContainer');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = message;
+  c.appendChild(el);
+  setTimeout(() => { el.remove(); }, 3000);
+}
+
+function highlightJSON(obj) {
+  const v = JSON.stringify(obj, null, 2);
+  return v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"([^"]+)":/g, '<span class="key">"$1"</span>:')
+    .replace(/: "([^"]+)"/g, ': <span class="string">"$1"</span>')
+    .replace(/: (-?\d+\.?\d*)/g, ': <span class="number">$1</span>')
+    .replace(/: (true|false)/g, ': <span class="bool">$1</span>')
+    .replace(/: (null)/g, ': <span class="null">$1</span>');
+}
+
+function showResponse(containerId, response) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const isSuccess = response.ok || (response.data && response.data.success);
+  el.innerHTML = `
+    <div class="resp-header">
+      <span class="status ${isSuccess ? 'ok' : 'err'}">${response.status} ${isSuccess ? 'OK' : 'Error'}</span>
+      <span style="font-size:0.7rem;color:var(--text2)">${new Date().toLocaleTimeString()}</span>
+    </div>
+    <pre>${highlightJSON(response.data)}</pre>`;
+}
+
+function createCard(id, label, method, path, fields, handler) {
+  const d = document.getElementById('mainContent');
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.id = `card-${id}`;
+  card.innerHTML = `
+    <div class="card-header open" onclick="toggleCard('${id}')">
+      <div class="left">
+        <span class="method ${method}">${method}</span>
+        <span class="path">${path}</span>
+        <span style="font-size:0.85rem;font-weight:500">${label}</span>
+      </div>
+      <span class="toggle">&#9660;</span>
+    </div>
+    <div class="card-body open" id="body-${id}">
+      <div class="form" id="form-${id}">
+        <div class="form-row" id="fields-${id}"></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-primary" id="btn-${id}">Send Request</button>
+          <span id="loading-${id}" style="display:none;color:var(--text2);font-size:0.8rem">Sending...</span>
+        </div>
+      </div>
+      <div class="response-box" id="resp-${id}">
+        <div class="resp-header"><span style="color:var(--text2)">Response</span></div>
+        <pre style="color:var(--text2)">Send a request to see the response</pre>
+      </div>
+    </div>`;
+  d.appendChild(card);
+
+  const fieldsContainer = document.getElementById(`fields-${id}`);
+  fields.forEach(f => {
+    const g = document.createElement('div');
+    g.className = 'form-group';
+    const requiredAttr = f.required !== false ? 'required' : '';
+    let inputHtml = '';
+    if (f.type === 'select') {
+      inputHtml = `<select id="input-${id}-${f.name}" ${requiredAttr}>
+        ${f.options.map(o => `<option value="${o}">${o}</option>`).join('')}
+      </select>`;
+    } else {
+      inputHtml = `<input type="${f.type || 'text'}" id="input-${id}-${f.name}"
+        placeholder="${f.placeholder || ''}" ${requiredAttr}>`;
+    }
+    g.innerHTML = `<label>${f.label}</label>${inputHtml}`;
+    fieldsContainer.appendChild(g);
+  });
+
+  document.getElementById(`btn-${id}`).addEventListener('click', async () => {
+    const btn = document.getElementById(`btn-${id}`);
+    const loading = document.getElementById(`loading-${id}`);
+    btn.disabled = true; loading.style.display = 'inline';
+    const formData = {};
+    fields.forEach(f => {
+      const el = document.getElementById(`input-${id}-${f.name}`);
+      if (el) formData[f.name] = f.type === 'number' ? (el.value ? Number(el.value) : undefined) : (el.value || undefined);
+    });
+    try { await handler(formData, id); } catch (e) {
+      showResponse(`resp-${id}`, { status: 0, ok: false, data: { error: e.message } });
+    }
+    btn.disabled = false; loading.style.display = 'none';
+  });
+}
+
+function toggleCard(id) {
+  const h = document.querySelector(`#card-${id} .card-header`);
+  const b = document.getElementById(`body-${id}`);
+  h.classList.toggle('open');
+  b.classList.toggle('open');
+}
+
+// --- NAV SETUP ---
+const navItems = [
+  { section: 'Server' },
+  { id: 'health', label: 'Health Check', icon: '♥', card: 'health' },
+  { section: 'Email Auth' },
+  { id: 'register', label: 'Register', icon: '✉', card: 'register' },
+  { id: 'login', label: 'Login', icon: '🔑', card: 'login' },
+  { id: 'refresh', label: 'Refresh Token', icon: '↻', card: 'refresh' },
+  { id: 'logout', label: 'Logout', icon: '🚪', card: 'logout' },
+  { section: 'Email Verification' },
+  { id: 'verify-email', label: 'Verify Email', icon: '✓', card: 'verify-email' },
+  { section: 'Password' },
+  { id: 'forgot-password', label: 'Forgot Password', icon: '❓', card: 'forgot-password' },
+  { id: 'reset-password', label: 'Reset Password', icon: '🔐', card: 'reset-password' },
+  { section: 'Phone OTP' },
+  { id: 'send-otp', label: 'Send OTP', icon: '📱', card: 'send-otp' },
+  { id: 'verify-otp', label: 'Verify OTP', icon: '✅', card: 'verify-otp' },
+  { section: 'OAuth' },
+  { id: 'google', label: 'Google OAuth', icon: 'G', card: 'google' },
+];
+
+function buildNav() {
+  const sb = document.getElementById('sidebar');
+  navItems.forEach(item => {
+    if (item.section) {
+      const l = document.createElement('div');
+      l.className = 'section-label';
+      l.textContent = item.section;
+      sb.appendChild(l);
+    } else {
+      const a = document.createElement('a');
+      a.href = `#${item.id}`;
+      a.id = `nav-${item.id}`;
+      a.innerHTML = `<span class="icon">${item.icon}</span>${item.label}`;
+      a.addEventListener('click', (e) => {
+        e.preventDefault();
+        document.querySelectorAll('.sidebar a').forEach(el => el.classList.remove('active'));
+        a.classList.add('active');
+        const card = document.getElementById(`card-${item.card}`);
+        if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+      sb.appendChild(a);
+    }
+  });
+}
+
+// --- BUILDER ---
+buildNav();
+
+// Dummy card placeholder for nav targets
+const cardsContainer = document.getElementById('mainContent');
+
+// 1. Health
+createCard('health', 'Server Health Check', 'GET', '/health', [], async (_, id) => {
+  const r = await apiCall('GET', '/health');
+  showResponse(`resp-${id}`, r);
+  const badge = document.getElementById('serverBadge');
+  if (r.ok) {
+    badge.className = 'badge online';
+    document.getElementById('serverStatus').textContent = 'Online';
+  } else {
+    badge.className = 'badge offline';
+    document.getElementById('serverStatus').textContent = 'Offline';
+  }
+});
+
+// 2. Register
+createCard('register', 'Register', 'POST', '/auth/register', [
+  { name: 'email', label: 'Email', type: 'email', placeholder: 'user@example.com' },
+  { name: 'password', label: 'Password', type: 'password', placeholder: 'Min 8 chars, upper+lower+number' },
+  { name: 'firstName', label: 'First Name', placeholder: 'John', required: false },
+  { name: 'lastName', label: 'Last Name', placeholder: 'Doe', required: false },
+  { name: 'phone', label: 'Phone', placeholder: '+919876543210', required: false },
+  { name: 'role', label: 'Role', type: 'select', options: ['publisher', 'client'], required: false },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/register', data);
+  showResponse(`resp-${id}`, r);
+  if (r.data?.data?.accessToken) setToken(r.data.data.accessToken);
+  if (r.data?.data?.verificationToken) {
+    document.getElementById('input-verify-email-token').value = r.data.data.verificationToken;
+    toast('Verification token copied to Verify Email form', 'info');
+  }
+  return r;
+});
+
+// 3. Login
+createCard('login', 'Login', 'POST', '/auth/login', [
+  { name: 'email', label: 'Email', type: 'email', placeholder: 'user@example.com' },
+  { name: 'password', label: 'Password', type: 'password', placeholder: 'Enter password' },
+  { name: 'deviceName', label: 'Device Name', placeholder: 'API Tester', required: false },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/login', data);
+  showResponse(`resp-${id}`, r);
+  if (r.data?.data?.accessToken) setToken(r.data.data.accessToken);
+  return r;
+});
+
+// 4. Refresh
+createCard('refresh', 'Refresh Token', 'POST', '/auth/refresh', [
+  { name: 'refreshToken', label: 'Refresh Token (optional — uses cookie by default)', placeholder: 'Leave empty to use cookie', required: false },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/refresh', data.refreshToken ? data : {});
+  showResponse(`resp-${id}`, r);
+  if (r.data?.data?.accessToken) setToken(r.data.data.accessToken);
+  return r;
+});
+
+// 5. Logout
+createCard('logout', 'Logout', 'POST', '/auth/logout', [
+  { name: 'refreshToken', label: 'Refresh Token (optional)', placeholder: 'Leave empty to use cookie', required: false },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/logout', data.refreshToken ? data : {});
+  showResponse(`resp-${id}`, r);
+  if (r.ok) { clearToken(); toast('Logged out', 'success'); }
+  return r;
+});
+
+// 6. Verify Email
+createCard('verify-email', 'Verify Email', 'POST', '/auth/verify-email', [
+  { name: 'token', label: 'Verification Token', placeholder: 'Paste verification token here' },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/verify-email', data);
+  showResponse(`resp-${id}`, r);
+  return r;
+});
+
+// 7. Forgot Password
+createCard('forgot-password', 'Forgot Password', 'POST', '/auth/forgot-password', [
+  { name: 'email', label: 'Email', type: 'email', placeholder: 'user@example.com' },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/forgot-password', data);
+  showResponse(`resp-${id}`, r);
+  if (r.data?.data?.resetToken) {
+    document.getElementById('input-reset-password-token').value = r.data.data.resetToken;
+    document.getElementById('input-reset-password-password').value = '';
+    toast('Reset token copied to Reset Password form', 'info');
+  }
+  return r;
+});
+
+// 8. Reset Password
+createCard('reset-password', 'Reset Password', 'POST', '/auth/reset-password', [
+  { name: 'token', label: 'Reset Token', placeholder: 'Paste reset token here' },
+  { name: 'password', label: 'New Password', type: 'password', placeholder: 'Min 8 chars, upper+lower+number' },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/reset-password', data);
+  showResponse(`resp-${id}`, r);
+  return r;
+});
+
+// 9. Send OTP
+createCard('send-otp', 'Send OTP', 'POST', '/auth/send-otp', [
+  { name: 'phone', label: 'Phone Number', placeholder: '+919876543210' },
+  { name: 'purpose', label: 'Purpose', type: 'select', options: ['login', 'phone_verification', 'password_reset'] },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/send-otp', data);
+  showResponse(`resp-${id}`, r);
+  if (r.data?.data?.otp) {
+    document.getElementById('input-verify-otp-otp').value = r.data.data.otp;
+    document.getElementById('input-verify-otp-phone').value = data.phone;
+    document.getElementById('input-verify-otp-purpose').value = data.purpose;
+    toast('OTP auto-filled in Verify OTP form', 'info');
+  }
+  return r;
+});
+
+// 10. Verify OTP
+createCard('verify-otp', 'Verify OTP', 'POST', '/auth/verify-otp', [
+  { name: 'phone', label: 'Phone Number', placeholder: '+919876543210' },
+  { name: 'otp', label: 'OTP (6 digits)', placeholder: '123456' },
+  { name: 'purpose', label: 'Purpose', type: 'select', options: ['login', 'phone_verification', 'password_reset'] },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/verify-otp', data);
+  showResponse(`resp-${id}`, r);
+  if (r.data?.data?.accessToken) setToken(r.data.data.accessToken);
+  return r;
+});
+
+// 11. Google OAuth
+createCard('google', 'Google OAuth', 'POST', '/auth/oauth/google', [
+  { name: 'accessToken', label: 'Google Access Token', placeholder: 'Paste Google OAuth access token' },
+], async (data, id) => {
+  const r = await apiCall('POST', '/auth/oauth/google', data);
+  showResponse(`resp-${id}`, r);
+  if (r.data?.data?.accessToken) setToken(r.data.data.accessToken);
+  return r;
+});
+
+// --- INIT: check health ---
+(async () => {
+  try {
+    const r = await apiCall('GET', '/health');
+    const badge = document.getElementById('serverBadge');
+    if (r.ok) {
+      badge.className = 'badge online';
+      document.getElementById('serverStatus').textContent = 'Online';
+    }
+  } catch (_) {}
+})();
+
+// Hash-based nav highlight
+window.addEventListener('hashchange', () => {
+  const id = window.location.hash.replace('#', '');
+  document.querySelectorAll('.sidebar a').forEach(el => el.classList.remove('active'));
+  const nav = document.getElementById(`nav-${id}`);
+  if (nav) nav.classList.add('active');
+});
+if (window.location.hash) {
+  const id = window.location.hash.replace('#', '');
+  const nav = document.getElementById(`nav-${id}`);
+  if (nav) nav.classList.add('active');
+}
+</script>
+</body>
+</html>

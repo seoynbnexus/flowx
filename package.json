@@ -2,16 +2,6 @@
   "name": "flowx",
   "version": "1.0.0",
   "description": "",
-  "homepage": "https://github.com/seoynbnexus/flowx#readme",
-  "bugs": {
-    "url": "https://github.com/seoynbnexus/flowx/issues"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/seoynbnexus/flowx.git"
-  },
-  "license": "ISC",
-  "author": "",
   "type": "module",
   "main": "app.js",
   "devDependencies": {
@@ -23,6 +13,7 @@
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dataloader": "^2.2.3",
+    "disposable-email-domains": "^1.0.62",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "form-data": "^4.0.5",
@@ -31,20 +22,19 @@
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
     "mysql2": "^3.15.3",
-    "node-pg-migrate": "^8.0.4",
     "nodemailer": "^7.0.11",
-    "pg": "^8.21.0",
-    "postgres": "^3.4.9",
     "sharp": "^0.34.5",
+    "umzug": "^3.8.3",
+    "uuid": "^14.0.0",
     "zod": "^4.1.13"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon app.js",
     "start": "node app.js",
-    "migrate:up": "node-pg-migrate up --migrations-dir shared/database/migrations",
-    "migrate:down": "node-pg-migrate down --migrations-dir shared/database/migrations",
-    "migrate:create": "node-pg-migrate create --migrations-dir shared/database/migrations",
-    "db:cleanup": "node shared/database/cleanup.js"
+    "migrate:up": "node shared/database/migrate.js up",
+    "migrate:down": "node shared/database/migrate.js down",
+    "migrate:list": "node shared/database/migrate.js list",
+    "db:cleanup": "node shared/database/cleanup.js",
+    "schema:sync": "node shared/database/schema-sync.js"
   }
 }

@@ -1,99 +1,84 @@
-import pg from 'pg';
-import 'dotenv/config';
+import { getPool } from './connection.js';
 
 const RETENTION_MONTHS = 12;
-const PARTITION_MONTHS_AHEAD = 2;
-
-function getNextMonthDate(year, month) {
-  if (month === 12) return { year: year + 1, month: 1 };
-  return { year, month: month + 1 };
-}
-
-function formatMonth(month) {
-  return String(month).padStart(2, '0');
-}
 
 async function runCleanup() {
-  const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+  const pool = getPool();
 
   try {
-    const now = new Date();
-    const currentYear = now.getUTCFullYear();
-    const currentMonth = now.getUTCMonth() + 1;
+    console.log(`[cleanup] Starting at ${new Date().toISOString()}`);
 
-    console.log(`[cleanup] Starting at ${now.toISOString()}`);
-
-    // 1. Ensure future partitions exist
-    for (let i = 0; i <= PARTITION_MONTHS_AHEAD; i++) {
-      const absMonth = currentMonth + i;
-      const year = currentYear + Math.floor((absMonth - 1) / 12);
-      const month = ((absMonth - 1) % 12) + 1;
-      const padded = formatMonth(month);
-
-      const next = getNextMonthDate(year, month);
-      const nextPadded = formatMonth(next.month);
-
-      for (const table of ['auth_login_history', 'audit_logs']) {
-        const partitionName = `${table}_${year}_${padded}`;
-        const exists = await pool.query(`
-          SELECT 1 FROM pg_class WHERE relname = $1 AND relkind = 'r'
-        `, [partitionName]);
-
-        if (exists.rowCount === 0) {
-          await pool.query(`
-            CREATE TABLE public.${partitionName}
-            PARTITION OF public.${table}
-            FOR VALUES FROM ('${year}-${padded}-01') TO ('${next.year}-${nextPadded}-01')
-          `);
-          console.log(`[cleanup] Created partition: ${partitionName}`);
-        }
-      }
+    // Purge expired sessions
+    const [sessionResult] = await pool.execute(
+      'DELETE FROM user_sessions WHERE expires_at < NOW()'
+    );
+    if (sessionResult.affectedRows > 0) {
+      console.log(`[cleanup] Purged ${sessionResult.affectedRows} expired sessions`);
     }
 
-    // 2. Drop partitions older than retention
-    const cutoffYear = currentYear - Math.ceil(RETENTION_MONTHS / 12) - 1;
-    const dropResult = await pool.query(`
-      SELECT relname FROM pg_class
-      WHERE relkind = 'r'
-        AND relname ~ '^(auth_login_history|audit_logs)_(\\d{4})_(\\d{2})$'
-    `);
-
-    for (const row of dropResult.rows) {
-      const match = row.relname.match(/^(auth_login_history|audit_logs)_(\d{4})_(\d{2})$/);
-      if (!match) continue;
-      const partitionYear = parseInt(match[2], 10);
-      const partitionMonth = parseInt(match[3], 10);
-      const partitionDate = new Date(partitionYear, partitionMonth, 1);
-      const cutoffDate = new Date(now.getFullYear(), now.getMonth() - RETENTION_MONTHS, 1);
-
-      if (partitionDate < cutoffDate) {
-        await pool.query(`DROP TABLE IF EXISTS public.${row.relname}`);
-        console.log(`[cleanup] Dropped old partition: ${row.relname}`);
-      }
+    // Purge old email verifications (older than 24 hours)
+    const [emailResult] = await pool.execute(
+      "DELETE FROM email_verifications WHERE expires_at < NOW() - INTERVAL 1 DAY"
+    );
+    if (emailResult.affectedRows > 0) {
+      console.log(`[cleanup] Purged ${emailResult.affectedRows} expired email verifications`);
     }
 
-    // 3. Purge expired data from non-partitioned tables
-    const purges = [
-      { table: 'user_sessions', where: 'expires_at < NOW()' },
-      { table: 'email_verifications', where: 'expires_at < NOW() - INTERVAL \'1 day\'' },
-      { table: 'password_resets', where: 'expires_at < NOW() - INTERVAL \'1 day\'' },
-      { table: 'oauth_tokens', where: 'expires_at < NOW() - INTERVAL \'1 day\'' },
-    ];
+    // Purge old password resets (older than 24 hours)
+    const [resetResult] = await pool.execute(
+      "DELETE FROM password_resets WHERE expires_at < NOW() - INTERVAL 1 DAY"
+    );
+    if (resetResult.affectedRows > 0) {
+      console.log(`[cleanup] Purged ${resetResult.affectedRows} expired password resets`);
+    }
 
-    for (const { table, where } of purges) {
-      const result = await pool.query(`DELETE FROM public.${table} WHERE ${where}`);
-      if (result.rowCount > 0) {
-        console.log(`[cleanup] Purged ${result.rowCount} rows from ${table}`);
-      }
+    // Purge used/expired phone OTPs (older than 24 hours)
+    const [otpResult] = await pool.execute(
+      "DELETE FROM phone_otps WHERE (used_at IS NOT NULL OR expires_at < NOW()) AND created_at < NOW() - INTERVAL 1 DAY"
+    );
+    if (otpResult.affectedRows > 0) {
+      console.log(`[cleanup] Purged ${otpResult.affectedRows} expired phone OTPs`);
+    }
+
+    // Purge used/expired email OTPs (older than 24 hours)
+    const [emailOtpResult] = await pool.execute(
+      "DELETE FROM email_otps WHERE (used_at IS NOT NULL OR expires_at < NOW()) AND created_at < NOW() - INTERVAL 1 DAY"
+    );
+    if (emailOtpResult.affectedRows > 0) {
+      console.log(`[cleanup] Purged ${emailOtpResult.affectedRows} expired email OTPs`);
+    }
+
+    // Purge expired OAuth tokens (older than 1 day after expiry)
+    const [tokenResult] = await pool.execute(
+      "DELETE FROM oauth_tokens WHERE expires_at < NOW() - INTERVAL 1 DAY"
+    );
+    if (tokenResult.affectedRows > 0) {
+      console.log(`[cleanup] Purged ${tokenResult.affectedRows} expired OAuth tokens`);
+    }
+
+    // Archive old audit logs (older than retention period)
+    const [auditResult] = await pool.execute(
+      `DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL ${RETENTION_MONTHS} MONTH`
+    );
+    if (auditResult.affectedRows > 0) {
+      console.log(`[cleanup] Purged ${auditResult.affectedRows} old audit logs`);
+    }
+
+    // Archive old login history (older than retention period)
+    const [loginResult] = await pool.execute(
+      `DELETE FROM auth_login_history WHERE created_at < NOW() - INTERVAL ${RETENTION_MONTHS} MONTH`
+    );
+    if (loginResult.affectedRows > 0) {
+      console.log(`[cleanup] Purged ${loginResult.affectedRows} old login history entries`);
     }
 
     console.log('[cleanup] Complete');
+  } catch (error) {
+    console.error('[cleanup] Failed:', error.message);
+    process.exit(1);
   } finally {
     await pool.end();
   }
 }
 
-runCleanup().catch((err) => {
-  console.error('[cleanup] Failed:', err.message);
-  process.exit(1);
-});
+runCleanup();
