@@ -46,3 +46,10 @@ export class ConflictError extends AppError {
     this.name = 'ConflictError';
   }
 }
+
+export class MethodMismatchError extends AppError {
+  constructor(message = 'Authentication method mismatch') {
+    super(message, HTTP_STATUS.UNAUTHORIZED, ERROR_CODES.AUTH_METHOD_MISMATCH);
+    this.name = 'MethodMismatchError';
+  }
+}

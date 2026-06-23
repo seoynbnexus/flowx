@@ -9,7 +9,7 @@ import {
   generateOtp,
 } from '../../../shared/utils/crypto.utils.js';
 import { query, transaction } from '../../../shared/database/connection.js';
-import { AuthError, ConflictError, ValidationError, ForbiddenError } from '../../../shared/errors/AppError.js';
+import { AuthError, ConflictError, ValidationError, ForbiddenError, MethodMismatchError } from '../../../shared/errors/AppError.js';
 import { ERROR_CODES } from '../../../shared/errors/errorCodes.js';
 import { TOKEN_EXPIRY } from './auth.model.js';
 import { USER_STATUS, LOGIN_METHOD, OTP_PURPOSE, ROLE_CODES } from '../../../shared/constants/index.js';
@@ -136,6 +136,7 @@ export async function register(data, ipAddress, userAgent) {
       firstName: data.firstName,
       lastName: data.lastName,
       countryCode: data.countryCode || 'IN',
+      state: data.state,
     });
     await repo.createUserPassword(userId, passwordHash);
 
@@ -178,6 +179,12 @@ export async function login(email, password, deviceName, ipAddress, userAgent) {
 
   const passwordRecord = await repo.getUserPassword(user.id);
   if (!passwordRecord) {
+    const oauthAccounts = await repo.findOauthAccountsByUserId(user.id);
+    if (oauthAccounts.length > 0) {
+      throw new MethodMismatchError(
+        `This account uses ${oauthAccounts[0].provider_name} Sign-In. Please sign in with ${oauthAccounts[0].provider_name}.`
+      );
+    }
     throw new AuthError('Invalid email or password', ERROR_CODES.AUTH_FAILED);
   }
 
@@ -319,7 +326,7 @@ export async function resetPassword(token, newPassword) {
 
 export async function googleLogin(accessToken, ipAddress, userAgent) {
   const { OAuth2Client } = await import('google-auth-library');
-  const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+  const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
 
   const ticket = await client.verifyIdToken({
     idToken: accessToken,
@@ -331,23 +338,34 @@ export async function googleLogin(accessToken, ipAddress, userAgent) {
 
   let user = await repo.findUserByEmail(email);
 
-  if (!user) {
+  if (user) {
+    const passwordRecord = await repo.getUserPassword(user.id);
+    if (passwordRecord) {
+      throw new ConflictError('An account with this email already exists. Please sign in with email and password.');
+    }
+  } else {
     const userId = generateUuid();
     const names = (name || '').split(' ');
     const firstName = names[0] || '';
     const lastName = names.slice(1).join(' ') || '';
 
-    user = await repo.createUser(userId, email, USER_STATUS.ACTIVE);
+    await repo.createUser(userId, email, USER_STATUS.ACTIVE);
     await repo.createUserProfile(generateUuid(), userId, { firstName, lastName });
     if (email_verified) {
       await repo.updateUserStatus(userId, USER_STATUS.ACTIVE);
-      await repo.query(
+      await query(
         'UPDATE users SET email_verified_at = NOW() WHERE id = ?',
         [uuidToBuffer(userId)]
       );
     }
     await repo.assignUserRole(userId, ROLE_CODES.CLIENT);
     user = await repo.findUserById(userId);
+
+    await repo.createAuditLog(
+      generateUuid(), userId, 'user', userId,
+      'user.registered', null,
+      { email, method: 'google', name, email_verified }
+    );
   }
 
   const provider = await repo.findOauthProviderByCode('google');
@@ -360,6 +378,12 @@ export async function googleLogin(accessToken, ipAddress, userAgent) {
   if (!oauthAccount) {
     await repo.createOauthAccount(
       generateUuid(), user.id, provider.id, sub, email, name
+    );
+
+    await repo.createAuditLog(
+      generateUuid(), user.id, 'oauth_account', user.id,
+      'oauth_account.linked', null,
+      { provider: 'google', provider_user_id: sub, email }
     );
   }
 

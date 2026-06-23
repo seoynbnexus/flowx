@@ -18,12 +18,24 @@ const rowToSession = (row) => {
 };
 
 export async function findUserByEmail(email) {
-  const row = await queryOne('SELECT * FROM users WHERE email = ?', [email]);
+  const row = await queryOne(
+    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city
+     FROM users u
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     WHERE u.email = ?`,
+    [email]
+  );
   return rowToUser(row);
 }
 
 export async function findUserById(id) {
-  const row = await queryOne('SELECT * FROM users WHERE id = ?', [uuidToBuffer(id)]);
+  const row = await queryOne(
+    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city
+     FROM users u
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     WHERE u.id = ?`,
+    [uuidToBuffer(id)]
+  );
   return rowToUser(row);
 }
 
@@ -37,14 +49,15 @@ export async function createUser(id, email, status = 'pending', phone = null) {
 
 export async function createUserProfile(id, userId, data) {
   await query(
-    `INSERT INTO user_profiles (id, user_id, first_name, last_name, country_code)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO user_profiles (id, user_id, first_name, last_name, country_code, state)
+     VALUES (?, ?, ?, ?, ?, ?)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(userId),
       data.firstName || null,
       data.lastName || null,
       data.countryCode || 'IN',
+      data.state || null,
     ]
   );
 }
@@ -250,12 +263,20 @@ export async function createLoginHistory(id, userId, method, ipAddress, userAgen
 }
 
 export async function findUserByPhone(phone) {
-  const row = await queryOne('SELECT * FROM users WHERE phone = ?', [phone]);
+  const row = await queryOne(
+    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city
+     FROM users u
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     WHERE u.phone = ?`,
+    [phone]
+  );
   return rowToUser(row);
 }
 
 export async function findOauthProviderByCode(code) {
-  return queryOne('SELECT * FROM oauth_providers WHERE code = ?', [code]);
+  const row = await queryOne('SELECT * FROM oauth_providers WHERE code = ?', [code]);
+  if (!row) return null;
+  return { ...row, id: bufferToUuid(row.id) };
 }
 
 export async function findOauthAccount(providerId, providerUserId) {
@@ -265,6 +286,19 @@ export async function findOauthAccount(providerId, providerUserId) {
   );
   if (!row) return null;
   return { ...row, id: bufferToUuid(row.id), user_id: bufferToUuid(row.user_id), provider_id: bufferToUuid(row.provider_id) };
+}
+
+export async function findOauthAccountsByUserId(userId) {
+  const rows = await query(
+    'SELECT oa.*, op.code AS provider_code, op.name AS provider_name FROM oauth_accounts oa JOIN oauth_providers op ON op.id = oa.provider_id WHERE oa.user_id = ?',
+    [uuidToBuffer(userId)]
+  );
+  return rows.map(r => ({
+    ...r,
+    id: bufferToUuid(r.id),
+    user_id: bufferToUuid(r.user_id),
+    provider_id: bufferToUuid(r.provider_id),
+  }));
 }
 
 export async function createOauthAccount(id, userId, providerId, providerUserId, providerEmail, providerUsername) {

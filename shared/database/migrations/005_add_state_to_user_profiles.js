@@ -1,0 +1,18 @@
+const UP = `
+ALTER TABLE user_profiles
+  ADD COLUMN state VARCHAR(100) DEFAULT NULL AFTER country_code;
+`;
+
+const DOWN = `
+ALTER TABLE user_profiles DROP COLUMN state;
+`;
+
+export async function up({ context: pool }) {
+  await pool.execute(UP);
+}
+
+export async function down({ context: pool }) {
+  await pool.execute(DOWN);
+}
+
+export default { up, down };

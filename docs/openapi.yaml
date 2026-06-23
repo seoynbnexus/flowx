@@ -1,0 +1,1241 @@
+openapi: "3.0.3"
+info:
+  title: FlowX API
+  description: |
+    FlowX is a social media advertising platform connecting clients with publishers.
+    Supports Instagram and Facebook account linking for ad placements.
+  version: "1.0.0"
+  contact:
+    name: FlowX Team
+    email: admin@flowx.com
+
+servers:
+  - url: http://localhost:3001/api/v1
+    description: Development server
+  - url: https://api.flowx.com/api/v1
+    description: Production server
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        message:
+          type: string
+        code:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        message:
+          type: string
+        data:
+          type: object
+
+    Pagination:
+      type: object
+      properties:
+        page:
+          type: integer
+        limit:
+          type: integer
+        total:
+          type: integer
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        phone:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [active, inactive, blocked, pending]
+        email_verified_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_login_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        roles:
+          type: array
+          items:
+            type: string
+        permissions:
+          type: array
+          items:
+            type: string
+
+    UserProfile:
+      type: object
+      properties:
+        first_name:
+          type: string
+        last_name:
+          type: string
+        avatar_url:
+          type: string
+          nullable: true
+        country_code:
+          type: string
+        state:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        timezone:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+
+    Role:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        is_system:
+          type: boolean
+        is_super_admin:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    Permission:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        name:
+          type: string
+        module:
+          type: string
+        description:
+          type: string
+          nullable: true
+
+    PlatformAccount:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        platformId:
+          type: string
+          format: uuid
+        profileUrl:
+          type: string
+          format: uri
+        platformUsername:
+          type: string
+          nullable: true
+        platformDisplayName:
+          type: string
+          nullable: true
+        verificationStatus:
+          type: string
+          enum: [pending, verified, rejected]
+        isActive:
+          type: boolean
+        platformCode:
+          type: string
+        platformName:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    AdCategory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        code:
+          type: string
+        description:
+          type: string
+          nullable: true
+        icon:
+          type: string
+          nullable: true
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+tags:
+  - name: Auth
+    description: Authentication and registration
+  - name: Users
+    description: User profile management
+  - name: Roles
+    description: Role management
+  - name: Permissions
+    description: Permission management
+  - name: Publisher
+    description: Publisher social account management
+  - name: Admin
+    description: Admin operations (platform accounts, categories)
+  - name: Ad Categories
+    description: Ad category management
+  - name: Health
+    description: Health check
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        "200":
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  # ─── AUTH ────────────────────────────────────────────────────────
+
+  /auth/send-registration-otp:
+    post:
+      tags: [Auth]
+      summary: Send OTP to email for registration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        "200":
+          description: OTP sent
+        "409":
+          description: Email already registered
+        "422":
+          description: Disposable email or invalid input
+
+  /auth/verify-registration-otp:
+    post:
+      tags: [Auth]
+      summary: Verify OTP and receive verification token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, otp]
+              properties:
+                email:
+                  type: string
+                  format: email
+                otp:
+                  type: string
+                  pattern: '^\d{6}$'
+      responses:
+        "200":
+          description: OTP verified
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      verificationToken:
+                        type: string
+        "422":
+          description: Invalid or expired OTP
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Complete registration with verification token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verificationToken, password]
+              properties:
+                verificationToken:
+                  type: string
+                password:
+                  type: string
+                  minLength: 8
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                phone:
+                  type: string
+                  pattern: '^\+[1-9]\d{9,14}$'
+                state:
+                  type: string
+                  pattern: '^[A-Za-z\s]+$'
+                role:
+                  type: string
+                  enum: [client, publisher]
+                  default: publisher
+      responses:
+        "201":
+          description: Registration successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      user:
+                        $ref: "#/components/schemas/User"
+                      accessToken:
+                        type: string
+        "401":
+          description: Invalid or expired verification token
+        "409":
+          description: Email already registered
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login with email and password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                deviceName:
+                  type: string
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      user:
+                        $ref: "#/components/schemas/User"
+                      accessToken:
+                        type: string
+        "401":
+          description: Invalid credentials
+        "403":
+          description: Account blocked, inactive, or locked
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh access token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        "200":
+          description: Token refreshed
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout and invalidate session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        "200":
+          description: Logged out
+
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Send password reset email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        "200":
+          description: Reset email sent if account exists
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Reset password with token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token:
+                  type: string
+                password:
+                  type: string
+                  minLength: 8
+      responses:
+        "200":
+          description: Password reset successfully
+
+  /auth/send-otp:
+    post:
+      tags: [Auth]
+      summary: Send OTP to phone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, purpose]
+              properties:
+                phone:
+                  type: string
+                purpose:
+                  type: string
+                  enum: [phone_verification, login, password_reset]
+      responses:
+        "200":
+          description: OTP sent
+
+  /auth/verify-otp:
+    post:
+      tags: [Auth]
+      summary: Verify phone OTP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, otp, purpose]
+              properties:
+                phone:
+                  type: string
+                otp:
+                  type: string
+                purpose:
+                  type: string
+                  enum: [phone_verification, login, password_reset]
+      responses:
+        "200":
+          description: OTP verified
+
+  /auth/oauth/google:
+    post:
+      tags: [Auth]
+      summary: Login or register with Google
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accessToken]
+              properties:
+                accessToken:
+                  type: string
+      responses:
+        "200":
+          description: Google login successful
+
+  # ─── USERS ───────────────────────────────────────────────────────
+
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Get current user profile
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: User profile
+        "401":
+          description: Unauthorized
+
+    patch:
+      tags: [Users]
+      summary: Update current user profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                avatarUrl:
+                  type: string
+                  format: uri
+                  nullable: true
+                countryCode:
+                  type: string
+                  minLength: 2
+                  maxLength: 2
+                state:
+                  type: string
+                city:
+                  type: string
+                timezone:
+                  type: string
+                metadata:
+                  type: object
+      responses:
+        "200":
+          description: Profile updated
+
+  /users/me/change-password:
+    post:
+      tags: [Users]
+      summary: Change current user password
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword:
+                  type: string
+                newPassword:
+                  type: string
+                  minLength: 8
+      responses:
+        "200":
+          description: Password changed
+
+  /users/me/categories:
+    get:
+      tags: [Users]
+      summary: Get current user's ad categories
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: User's selected categories
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AdCategory"
+
+    put:
+      tags: [Users]
+      summary: Set current user's ad categories (replaces all)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [categoryIds]
+              properties:
+                categoryIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+      responses:
+        "200":
+          description: Categories updated
+
+  /users:
+    get:
+      tags: [Users]
+      summary: List all users (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [active, inactive, blocked, pending]
+        - in: query
+          name: search
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated user list
+
+  /users/{id}:
+    get:
+      tags: [Users]
+      summary: Get user by ID (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: User profile
+
+  /users/{id}/status:
+    patch:
+      tags: [Users]
+      summary: Update user status (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [active, inactive, blocked, pending]
+      responses:
+        "200":
+          description: Status updated
+
+  /users/{id}:
+    delete:
+      tags: [Users]
+      summary: Soft delete user (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: User deleted
+
+  /users/{id}/roles:
+    get:
+      tags: [Users]
+      summary: Get user roles (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: User roles
+
+    post:
+      tags: [Users]
+      summary: Assign role to user (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roleId]
+              properties:
+                roleId:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Role assigned
+
+  /users/{id}/roles/{roleId}:
+    delete:
+      tags: [Users]
+      summary: Remove role from user (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: roleId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Role removed
+
+  # ─── ROLES ───────────────────────────────────────────────────────
+
+  /roles:
+    get:
+      tags: [Roles]
+      summary: List all roles
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Role list
+
+    post:
+      tags: [Roles]
+      summary: Create role
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, name]
+              properties:
+                code:
+                  type: string
+                name:
+                  type: string
+                description:
+                  type: string
+      responses:
+        "201":
+          description: Role created
+
+  /roles/{id}:
+    get:
+      tags: [Roles]
+      summary: Get role by ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Role details
+
+    patch:
+      tags: [Roles]
+      summary: Update role
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+      responses:
+        "200":
+          description: Role updated
+
+    delete:
+      tags: [Roles]
+      summary: Delete role
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Role deleted
+
+  /roles/{id}/permissions:
+    get:
+      tags: [Roles]
+      summary: Get role permissions
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Permission list
+
+    post:
+      tags: [Roles]
+      summary: Assign permissions to role
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [permissionIds]
+              properties:
+                permissionIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+      responses:
+        "200":
+          description: Permissions assigned
+
+  # ─── PERMISSIONS ─────────────────────────────────────────────────
+
+  /permissions:
+    get:
+      tags: [Permissions]
+      summary: List all permissions
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Permission list
+
+  /permissions/modules:
+    get:
+      tags: [Permissions]
+      summary: List permission modules
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Module list
+
+  # ─── PUBLISHER ACCOUNTS ──────────────────────────────────────────
+
+  /publisher/accounts:
+    post:
+      tags: [Publisher]
+      summary: Submit social account for verification
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platformCode, profileUrl]
+              properties:
+                platformCode:
+                  type: string
+                  enum: [instagram, facebook]
+                profileUrl:
+                  type: string
+                  format: uri
+      responses:
+        "201":
+          description: Account submitted
+        "409":
+          description: Already have an account for this platform
+        "422":
+          description: Invalid URL or unreachable
+
+    get:
+      tags: [Publisher]
+      summary: List my social accounts
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Account list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PlatformAccount"
+
+  /publisher/accounts/{id}:
+    delete:
+      tags: [Publisher]
+      summary: Remove my social account
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Account removed
+
+  # ─── ADMIN PLATFORM ACCOUNTS ─────────────────────────────────────
+
+  /admin/platform-accounts:
+    get:
+      tags: [Admin]
+      summary: List all platform accounts (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, verified, rejected]
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Paginated account list
+
+  /admin/platform-accounts/{id}/verify:
+    patch:
+      tags: [Admin]
+      summary: Verify or reject a platform account
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [verified, rejected]
+      responses:
+        "200":
+          description: Account status updated
+
+  # ─── AD CATEGORIES ───────────────────────────────────────────────
+
+  /ad-categories:
+    post:
+      tags: [Ad Categories]
+      summary: Create ad category (admin)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, code]
+              properties:
+                name:
+                  type: string
+                code:
+                  type: string
+                  pattern: '^[a-z0-9_]+$'
+                description:
+                  type: string
+                icon:
+                  type: string
+      responses:
+        "201":
+          description: Category created
+
+    get:
+      tags: [Ad Categories]
+      summary: List all categories (admin, includes inactive)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Category list
+
+  /ad-categories/active:
+    get:
+      tags: [Ad Categories]
+      summary: List active categories (any authenticated user)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Active category list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AdCategory"
+
+  /ad-categories/{id}:
+    get:
+      tags: [Ad Categories]
+      summary: Get category by ID (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Category details
+
+    patch:
+      tags: [Ad Categories]
+      summary: Update category (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                  nullable: true
+                icon:
+                  type: string
+                  nullable: true
+                isActive:
+                  type: boolean
+      responses:
+        "200":
+          description: Category updated
+
+    delete:
+      tags: [Ad Categories]
+      summary: Soft delete category (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Category deleted

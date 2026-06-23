@@ -43,6 +43,7 @@ export async function updateProfile(userId, data) {
   if (data.lastName !== undefined) { fields.push('last_name = ?'); values.push(data.lastName); }
   if (data.avatarUrl !== undefined) { fields.push('avatar_url = ?'); values.push(data.avatarUrl); }
   if (data.countryCode !== undefined) { fields.push('country_code = ?'); values.push(data.countryCode); }
+  if (data.state !== undefined) { fields.push('state = ?'); values.push(data.state); }
   if (data.city !== undefined) { fields.push('city = ?'); values.push(data.city); }
   if (data.timezone !== undefined) { fields.push('timezone = ?'); values.push(data.timezone); }
   if (data.metadata !== undefined) { fields.push('metadata = ?'); values.push(JSON.stringify(data.metadata)); }

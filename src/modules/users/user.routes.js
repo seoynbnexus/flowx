@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import * as controller from './user.controller.js';
+import * as categoryController from '../ad-categories/ad-category.controller.js';
 import { authenticate, requirePermission } from '../../../shared/middleware/auth.middleware.js';
 import { validate } from '../../../shared/middleware/validate.middleware.js';
 import {
@@ -8,12 +9,15 @@ import {
   changePasswordSchema,
   listUsersSchema,
 } from './user.validation.js';
+import { setUserCategoriesSchema } from '../ad-categories/ad-category.validation.js';
 
 const router = Router();
 
 router.get('/me', authenticate, controller.getProfile);
 router.patch('/me', authenticate, validate(updateProfileSchema), controller.updateProfile);
 router.post('/me/change-password', authenticate, validate(changePasswordSchema), controller.changePassword);
+router.get('/me/categories', authenticate, categoryController.getMyCategories);
+router.put('/me/categories', authenticate, validate(setUserCategoriesSchema), categoryController.setMyCategories);
 
 router.get('/', authenticate, requirePermission('users.read'), validate(listUsersSchema, 'query'), controller.listUsers);
 router.get('/:id', authenticate, requirePermission('users.read'), controller.getProfile);
