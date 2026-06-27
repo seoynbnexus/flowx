@@ -40,6 +40,17 @@ export const ROLE_CODES = {
 
 export const DEFAULT_COUNTRY_CODE = 'IN';
 
+export const IDENTITY_DOCUMENT_TYPE = {
+  AADHAAR: 'aadhaar',
+  DRIVERS_LICENSE: 'drivers_license',
+};
+
+export const IDENTITY_STATUS = {
+  PENDING: 'pending',
+  VERIFIED: 'verified',
+  REJECTED: 'rejected',
+};
+
 export const PAGINATION = {
   DEFAULT_PAGE: 1,
   DEFAULT_LIMIT: 20,

@@ -88,7 +88,7 @@ export async function findUserCategories(userId) {
   const rows = await query(
     `SELECT c.* FROM ad_categories c
      JOIN user_categories uc ON uc.category_id = c.id
-     WHERE uc.user_id = ?
+     WHERE uc.user_id = ? AND c.is_active = 1
      ORDER BY c.name`,
     [uuidToBuffer(userId)]
   );

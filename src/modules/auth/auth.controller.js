@@ -128,8 +128,8 @@ export async function verifyOtp(req, res, next) {
 
 export async function googleAuth(req, res, next) {
   try {
-    const { accessToken } = req.body;
-    const result = await authService.googleLogin(accessToken, req.ip, req.headers['user-agent']);
+    const { accessToken, role } = req.body;
+    const result = await authService.googleLogin(accessToken, req.ip, req.headers['user-agent'], role);
     setRefreshCookie(res, result.refreshToken);
     return sendSuccess(res, {
       user: result.user,

@@ -8,17 +8,19 @@ import {
   updateStatusSchema,
   changePasswordSchema,
   listUsersSchema,
+  createUserSchema,
 } from './user.validation.js';
 import { setUserCategoriesSchema } from '../ad-categories/ad-category.validation.js';
 
 const router = Router();
 
-router.get('/me', authenticate, controller.getProfile);
-router.patch('/me', authenticate, validate(updateProfileSchema), controller.updateProfile);
+router.get('/me', authenticate, requirePermission('own.profile.read'), controller.getProfile);
+router.patch('/me', authenticate, requirePermission('own.profile.update'), validate(updateProfileSchema), controller.updateProfile);
 router.post('/me/change-password', authenticate, validate(changePasswordSchema), controller.changePassword);
 router.get('/me/categories', authenticate, categoryController.getMyCategories);
 router.put('/me/categories', authenticate, validate(setUserCategoriesSchema), categoryController.setMyCategories);
 
+router.post('/', authenticate, requirePermission('users.create'), validate(createUserSchema), controller.createUser);
 router.get('/', authenticate, requirePermission('users.read'), validate(listUsersSchema, 'query'), controller.listUsers);
 router.get('/:id', authenticate, requirePermission('users.read'), controller.getProfile);
 router.patch('/:id/status', authenticate, requirePermission('users.update'), validate(updateStatusSchema), controller.updateStatus);

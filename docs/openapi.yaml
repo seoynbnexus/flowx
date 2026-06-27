@@ -64,6 +64,41 @@ components:
         total:
           type: integer
 
+    IdentityDocument:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        documentType:
+          type: string
+          enum: [aadhaar, drivers_license]
+        documentUrl:
+          type: string
+        status:
+          type: string
+          enum: [pending, verified, rejected]
+        rejectedReason:
+          type: string
+          nullable: true
+        verifiedBy:
+          type: string
+          format: uuid
+          nullable: true
+        verifiedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
     User:
       type: object
       properties:
@@ -237,10 +272,147 @@ tags:
     description: Admin operations (platform accounts, categories)
   - name: Ad Categories
     description: Ad category management
+  - name: Identity Documents
+    description: Identity document upload and verification for publishers
+  - name: Admin Identities
+    description: Admin operations for identity document management
   - name: Health
     description: Health check
 
 paths:
+  /identity/documents:
+    post:
+      tags: [Identity Documents]
+      summary: Upload identity document (publisher)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - documentType
+                - file
+              properties:
+                documentType:
+                  type: string
+                  enum: [aadhaar, drivers_license]
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Document submitted for verification
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  message:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/IdentityDocument"
+
+    get:
+      tags: [Identity Documents]
+      summary: Get my identity document (publisher)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Identity document details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  message:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/IdentityDocument"
+
+  /admin/identity-documents:
+    get:
+      tags: [Admin Identities]
+      summary: List all identity documents (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, verified, rejected]
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Paginated list of identity documents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  message:
+                    type: string
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/IdentityDocument"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
+
+  /admin/identity-documents/{id}/verify:
+    patch:
+      tags: [Admin Identities]
+      summary: Verify or reject identity document (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: string
+                  enum: [verified, rejected]
+                rejectedReason:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Document status updated
+
   /health:
     get:
       tags: [Health]
@@ -552,6 +724,10 @@ paths:
               properties:
                 accessToken:
                   type: string
+                role:
+                  type: string
+                  enum: [client, publisher]
+                  default: client
       responses:
         "200":
           description: Google login successful

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-const phoneRegex = /^[1-9]\d{9,14}$/;
+const phoneRegex = /^[6-9]\d{9}$/;
 
 export const registerSchema = z.object({
   verificationToken: z.string().min(1, 'Verification token is required'),
@@ -15,6 +15,7 @@ export const registerSchema = z.object({
   lastName: z.string().max(100).optional(),
   phone: z.string().regex(phoneRegex, 'Invalid phone format. Use E.164 (e.g. +911234567890)').optional(),
   state: z.string().regex(/^[A-Za-z\s]+$/, 'State must contain only letters and spaces').max(100).optional(),
+  pincode: z.string().regex(/^[0-9]{6}$/, 'Pincode must be exactly 6 digits').optional(),
   role: z.enum(['client', 'publisher']).optional().default('publisher'),
 });
 
@@ -65,4 +66,5 @@ export const verifyOtpSchema = z.object({
 
 export const googleAuthSchema = z.object({
   accessToken: z.string().min(1, 'Google access token is required'),
+  role: z.enum(['client', 'publisher']).optional().default('client'),
 });

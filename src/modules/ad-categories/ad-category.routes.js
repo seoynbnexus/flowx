@@ -6,11 +6,11 @@ import { createCategorySchema, updateCategorySchema, setUserCategoriesSchema } f
 
 const router = Router();
 
-router.post('/', authenticate, requirePermission('users.update'), validate(createCategorySchema), controller.createCategory);
-router.get('/', authenticate, requirePermission('users.update'), controller.listCategories);
+router.post('/', authenticate, requirePermission('ad_categories.create'), validate(createCategorySchema), controller.createCategory);
+router.get('/', authenticate, requirePermission('ad_categories.read'), controller.listCategories);
 router.get('/active', authenticate, controller.listActiveCategories);
-router.get('/:id', authenticate, requirePermission('users.update'), controller.getCategory);
-router.patch('/:id', authenticate, requirePermission('users.update'), validate(updateCategorySchema), controller.updateCategory);
-router.delete('/:id', authenticate, requirePermission('users.update'), controller.deleteCategory);
+router.get('/:id', authenticate, requirePermission('ad_categories.read'), controller.getCategory);
+router.patch('/:id', authenticate, requirePermission('ad_categories.update'), validate(updateCategorySchema), controller.updateCategory);
+router.delete('/:id', authenticate, requirePermission('ad_categories.delete'), controller.deleteCategory);
 
 export default router;

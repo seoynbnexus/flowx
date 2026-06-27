@@ -19,10 +19,10 @@ const rowToSession = (row) => {
 
 export async function findUserByEmail(email) {
   const row = await queryOne(
-    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city
+    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city, up.pincode
      FROM users u
      LEFT JOIN user_profiles up ON up.user_id = u.id
-     WHERE u.email = ?`,
+     WHERE u.email = ? AND u.deleted_at IS NULL`,
     [email]
   );
   return rowToUser(row);
@@ -30,10 +30,10 @@ export async function findUserByEmail(email) {
 
 export async function findUserById(id) {
   const row = await queryOne(
-    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city
+    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city, up.pincode
      FROM users u
      LEFT JOIN user_profiles up ON up.user_id = u.id
-     WHERE u.id = ?`,
+     WHERE u.id = ? AND u.deleted_at IS NULL`,
     [uuidToBuffer(id)]
   );
   return rowToUser(row);
@@ -49,8 +49,8 @@ export async function createUser(id, email, status = 'pending', phone = null) {
 
 export async function createUserProfile(id, userId, data) {
   await query(
-    `INSERT INTO user_profiles (id, user_id, first_name, last_name, country_code, state)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO user_profiles (id, user_id, first_name, last_name, country_code, state, city, pincode)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(userId),
@@ -58,6 +58,8 @@ export async function createUserProfile(id, userId, data) {
       data.lastName || null,
       data.countryCode || 'IN',
       data.state || null,
+      data.city || null,
+      data.pincode || null,
     ]
   );
 }
@@ -264,10 +266,10 @@ export async function createLoginHistory(id, userId, method, ipAddress, userAgen
 
 export async function findUserByPhone(phone) {
   const row = await queryOne(
-    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city
+    `SELECT u.*, up.first_name, up.last_name, up.avatar_url, up.country_code, up.state, up.city, up.pincode
      FROM users u
      LEFT JOIN user_profiles up ON up.user_id = u.id
-     WHERE u.phone = ?`,
+     WHERE u.phone = ? AND u.deleted_at IS NULL`,
     [phone]
   );
   return rowToUser(row);

@@ -91,7 +91,7 @@ export async function listAccountsByUser(userId) {
     `SELECT a.*, p.code as platform_code, p.name as platform_name
      FROM user_platform_accounts a
      JOIN platforms p ON p.id = a.platform_id
-     WHERE a.user_id = ?
+      WHERE a.user_id = ? AND a.is_active = 1
      ORDER BY a.created_at DESC`,
     [uuidToBuffer(userId)]
   );
@@ -125,7 +125,7 @@ export async function listAllAccounts({ status, page, limit }) {
      FROM user_platform_accounts a
      JOIN platforms p ON p.id = a.platform_id
      JOIN users u ON u.id = a.user_id
-     ${whereClause}
+     ${whereClause}${where.length > 0 ? ' AND' : ' WHERE'} u.deleted_at IS NULL
      ORDER BY a.created_at DESC
      LIMIT ? OFFSET ?`,
     [...params, String(limit), String(offset)]

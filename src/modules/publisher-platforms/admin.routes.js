@@ -6,7 +6,7 @@ import { verifyAccountSchema, listAccountsQuerySchema } from './publisher.valida
 
 const router = Router();
 
-router.get('/', authenticate, requirePermission('users.update'), validate(listAccountsQuerySchema, 'query'), controller.listAllAccounts);
-router.patch('/:id/verify', authenticate, requirePermission('users.update'), validate(verifyAccountSchema), controller.verifyAccount);
+router.get('/', authenticate, requirePermission('platform_accounts.read'), validate(listAccountsQuerySchema, 'query'), controller.listAllAccounts);
+router.patch('/:id/verify', authenticate, requirePermission('platform_accounts.verify'), validate(verifyAccountSchema), controller.verifyAccount);
 
 export default router;

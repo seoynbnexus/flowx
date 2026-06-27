@@ -6,8 +6,8 @@ import { submitAccountSchema, deleteAccountSchema } from './publisher.validation
 
 const router = Router();
 
-router.post('/', authenticate, requireRole('publisher'), validate(submitAccountSchema), controller.submitAccount);
-router.get('/', authenticate, requireRole('publisher'), controller.listMyAccounts);
-router.delete('/:id', authenticate, requireRole('publisher'), controller.removeAccount);
+router.post('/', authenticate, requireRole('publisher', 'client'), validate(submitAccountSchema), controller.submitAccount);
+router.get('/', authenticate, requireRole('publisher', 'client'), controller.listMyAccounts);
+router.delete('/:id', authenticate, requireRole('publisher', 'client'), controller.removeAccount);
 
 export default router;

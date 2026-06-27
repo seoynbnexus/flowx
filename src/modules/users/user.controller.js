@@ -1,5 +1,5 @@
 import * as userService from './user.service.js';
-import { sendSuccess, sendPaginated, sendNoContent } from '../../../shared/utils/response.utils.js';
+import { sendSuccess, sendCreated, sendPaginated, sendNoContent } from '../../../shared/utils/response.utils.js';
 
 export async function getProfile(req, res, next) {
   try {
@@ -16,6 +16,15 @@ export async function updateProfile(req, res, next) {
     const userId = req.user.id;
     const user = await userService.updateProfile(userId, req.body);
     return sendSuccess(res, user, 'Profile updated');
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function createUser(req, res, next) {
+  try {
+    const user = await userService.adminCreateUser(req.body);
+    return sendCreated(res, user, 'User created');
   } catch (error) {
     next(error);
   }

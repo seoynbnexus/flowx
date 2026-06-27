@@ -137,6 +137,8 @@ export async function register(data, ipAddress, userAgent) {
       lastName: data.lastName,
       countryCode: data.countryCode || 'IN',
       state: data.state,
+      city: data.city,
+      pincode: data.pincode,
     });
     await repo.createUserPassword(userId, passwordHash);
 
@@ -324,7 +326,7 @@ export async function resetPassword(token, newPassword) {
   );
 }
 
-export async function googleLogin(accessToken, ipAddress, userAgent) {
+export async function googleLogin(accessToken, ipAddress, userAgent, role) {
   const { OAuth2Client } = await import('google-auth-library');
   const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
 
@@ -358,7 +360,7 @@ export async function googleLogin(accessToken, ipAddress, userAgent) {
         [uuidToBuffer(userId)]
       );
     }
-    await repo.assignUserRole(userId, ROLE_CODES.CLIENT);
+    await repo.assignUserRole(userId, role || ROLE_CODES.CLIENT);
     user = await repo.findUserById(userId);
 
     await repo.createAuditLog(
@@ -444,8 +446,8 @@ export async function verifyOtp(phone, otp, purpose, ipAddress, userAgent) {
 
   if (purpose === OTP_PURPOSE.LOGIN && otpRecord.user_id) {
     const user = await repo.findUserById(otpRecord.user_id);
-    if (!user || user.status === USER_STATUS.BLOCKED) {
-      throw new AuthError('Account is not accessible', ERROR_CODES.ACCOUNT_BLOCKED);
+    if (!user || user.status === USER_STATUS.BLOCKED || user.status === USER_STATUS.INACTIVE) {
+      throw new AuthError('Account is not accessible', user?.status === USER_STATUS.BLOCKED ? ERROR_CODES.ACCOUNT_BLOCKED : ERROR_CODES.ACCOUNT_INACTIVE);
     }
 
     await repo.updateUserLogin(user.id);

@@ -1,10 +1,11 @@
 import * as repo from './user.repository.js';
-import { NotFoundError, AuthError } from '../../../shared/errors/AppError.js';
+import { NotFoundError, AuthError, ConflictError } from '../../../shared/errors/AppError.js';
 import { ERROR_CODES } from '../../../shared/errors/errorCodes.js';
 import { comparePassword, hashPassword } from '../../../shared/utils/crypto.utils.js';
-import { generateUuid } from '../../../shared/utils/uuid.utils.js';
-import { PAGINATION } from '../../../shared/constants/index.js';
-import { getUserPassword, updateUserPassword, createAuditLog } from '../auth/auth.repository.js';
+import { generateUuid, uuidToBuffer } from '../../../shared/utils/uuid.utils.js';
+import { query } from '../../../shared/database/connection.js';
+import { USER_STATUS, PAGINATION } from '../../../shared/constants/index.js';
+import { getUserPassword, updateUserPassword, createAuditLog, findUserByEmail, createUser, createUserProfile, createUserPassword, assignUserRole } from '../auth/auth.repository.js';
 
 export async function getProfile(userId) {
   const user = await repo.findById(userId);
@@ -24,6 +25,33 @@ export async function updateProfile(userId, data) {
 
   const updatedProfile = await repo.updateProfile(userId, data);
   return { ...user, profile: updatedProfile };
+}
+
+export async function adminCreateUser(data) {
+  const existing = await findUserByEmail(data.email);
+  if (existing) {
+    throw new ConflictError('Email already registered');
+  }
+
+  const userId = generateUuid();
+  const passwordHash = await hashPassword(data.password);
+
+  await createUser(userId, data.email, USER_STATUS.ACTIVE, data.phone || null);
+  await query('UPDATE users SET email_verified_at = NOW() WHERE id = ?', [uuidToBuffer(userId)]);
+  await createUserProfile(generateUuid(), userId, {
+    firstName: data.firstName,
+    lastName: data.lastName,
+    countryCode: 'IN',
+  });
+  await createUserPassword(userId, passwordHash);
+  await assignUserRole(userId, data.role);
+
+  await createAuditLog(
+    generateUuid(), userId, 'user', userId,
+    'user.created_by_admin', null, { email: data.email, role: data.role }
+  );
+
+  return repo.findById(userId);
 }
 
 export async function listUsers(filters) {
@@ -63,7 +91,7 @@ export async function deleteUser(userId) {
 
 export async function changePassword(userId, currentPassword, newPassword) {
   const user = await repo.findById(userId);
-  if (!user) throw new NotFoundError('User not found');
+  if (!user || user.deleted_at) throw new NotFoundError('User not found');
 
   const passwordRecord = await getUserPassword(userId);
   if (!passwordRecord) throw new AuthError('Password not set', ERROR_CODES.AUTH_FAILED);
@@ -94,5 +122,8 @@ export async function assignRoleToUser(userId, roleId) {
 }
 
 export async function removeRoleFromUser(userId, roleId) {
+  const user = await repo.findById(userId);
+  if (!user || user.deleted_at) throw new NotFoundError('User not found');
+
   await repo.removeRole(userId, roleId);
 }

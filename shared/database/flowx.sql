@@ -243,6 +243,7 @@ CREATE TABLE `user_profiles` (
   `avatar_url` text DEFAULT NULL,
   `country_code` char(2) DEFAULT 'IN',
   `city` varchar(100) DEFAULT NULL,
+  `pincode` varchar(6) DEFAULT NULL,
   `timezone` varchar(100) DEFAULT NULL,
   `metadata` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT json_object() CHECK (json_valid(`metadata`)),
   `created_at` timestamp NOT NULL DEFAULT current_timestamp(),

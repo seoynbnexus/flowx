@@ -8,6 +8,7 @@ export const updateProfileSchema = z.object({
   countryCode: z.string().length(2).optional(),
   state: z.string().regex(/^[A-Za-z\s]+$/, 'State must contain only letters and spaces').max(100).optional(),
   city: z.string().max(100).optional(),
+  pincode: z.string().regex(/^[0-9]{6}$/, 'Pincode must be exactly 6 digits').optional(),
   timezone: z.string().max(100).optional(),
   metadata: z.record(z.unknown()).optional(),
 });
@@ -25,6 +26,21 @@ export const changePasswordSchema = z.object({
     .regex(/[A-Z]/, 'Must contain at least one uppercase letter')
     .regex(/[a-z]/, 'Must contain at least one lowercase letter')
     .regex(/[0-9]/, 'Must contain at least one number'),
+});
+
+export const createUserSchema = z.object({
+  email: z.string().email(),
+  password: z
+    .string()
+    .min(8, 'Password must be at least 8 characters')
+    .max(128)
+    .regex(/[A-Z]/, 'Must contain at least one uppercase letter')
+    .regex(/[a-z]/, 'Must contain at least one lowercase letter')
+    .regex(/[0-9]/, 'Must contain at least one number'),
+  firstName: z.string().min(1).max(100).optional(),
+  lastName: z.string().max(100).optional(),
+  phone: z.string().optional(),
+  role: z.enum(['admin', 'publisher', 'client']),
 });
 
 export const listUsersSchema = z.object({

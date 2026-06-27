@@ -16,6 +16,7 @@ const from = {
 };
 
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3001';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 function otpEmailHtml(otp) {
   return `
@@ -34,7 +35,7 @@ function otpEmailHtml(otp) {
 }
 
 function passwordResetHtml(token) {
-  const link = `${BASE_URL}/api/v1/auth/reset-password?token=${token}`;
+  const link = `${FRONTEND_URL}/reset-password?token=${token}`;
   return `
 <!DOCTYPE html>
 <html>
