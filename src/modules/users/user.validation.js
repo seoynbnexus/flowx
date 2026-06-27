@@ -5,6 +5,7 @@ export const updateProfileSchema = z.object({
   firstName: z.string().min(1).max(100).optional(),
   lastName: z.string().max(100).optional(),
   avatarUrl: z.string().url().max(2048).optional().nullable(),
+  phone: z.string().optional(),
   countryCode: z.string().length(2).optional(),
   state: z.string().regex(/^[A-Za-z\s]+$/, 'State must contain only letters and spaces').max(100).optional(),
   city: z.string().max(100).optional(),

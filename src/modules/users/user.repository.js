@@ -49,13 +49,21 @@ export async function updateProfile(userId, data) {
   if (data.timezone !== undefined) { fields.push('timezone = ?'); values.push(data.timezone); }
   if (data.metadata !== undefined) { fields.push('metadata = ?'); values.push(JSON.stringify(data.metadata)); }
 
-  if (fields.length === 0) return null;
+  if (fields.length > 0) {
+    values.push(uuidToBuffer(userId));
+    await query(
+      `UPDATE user_profiles SET ${fields.join(', ')} WHERE user_id = ?`,
+      values
+    );
+  }
 
-  values.push(uuidToBuffer(userId));
-  await query(
-    `UPDATE user_profiles SET ${fields.join(', ')} WHERE user_id = ?`,
-    values
-  );
+  if (data.phone !== undefined) {
+    await query('UPDATE users SET phone = ? WHERE id = ?', [
+      data.phone || null,
+      uuidToBuffer(userId),
+    ]);
+  }
+
   return findProfileByUserId(userId);
 }
 

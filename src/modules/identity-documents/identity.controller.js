@@ -11,10 +11,19 @@ export async function uploadDocument(req, res, next) {
   }
 }
 
-export async function getMyDocument(req, res, next) {
+export async function getMyDocuments(req, res, next) {
   try {
-    const doc = await service.getMyDocument(req.user.id);
-    return sendSuccess(res, doc);
+    const docs = await service.getMyDocuments(req.user.id);
+    return sendSuccess(res, docs);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function getMissingMandatory(req, res, next) {
+  try {
+    const missing = await service.getMissingMandatory(req.user.id);
+    return sendSuccess(res, missing);
   } catch (error) {
     next(error);
   }

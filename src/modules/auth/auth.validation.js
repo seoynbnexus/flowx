@@ -14,6 +14,7 @@ export const registerSchema = z.object({
   firstName: z.string().min(1, 'First name is required').max(100).optional(),
   lastName: z.string().max(100).optional(),
   phone: z.string().regex(phoneRegex, 'Invalid phone format. Use E.164 (e.g. +911234567890)').optional(),
+  countryCode: z.string().length(2).optional(),
   state: z.string().regex(/^[A-Za-z\s]+$/, 'State must contain only letters and spaces').max(100).optional(),
   pincode: z.string().regex(/^[0-9]{6}$/, 'Pincode must be exactly 6 digits').optional(),
   role: z.enum(['client', 'publisher']).optional().default('publisher'),

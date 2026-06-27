@@ -26,9 +26,17 @@ export async function findById(id) {
 }
 
 export async function findByUserId(userId) {
-  const row = await queryOne(
-    'SELECT * FROM identity_documents WHERE user_id = ?',
+  const rows = await query(
+    'SELECT * FROM identity_documents WHERE user_id = ? ORDER BY created_at DESC',
     [uuidToBuffer(userId)]
+  );
+  return rows.map(mapRow);
+}
+
+export async function findByUserIdAndType(userId, documentType) {
+  const row = await queryOne(
+    'SELECT * FROM identity_documents WHERE user_id = ? AND document_type = ?',
+    [uuidToBuffer(userId), documentType]
   );
   return mapRow(row);
 }

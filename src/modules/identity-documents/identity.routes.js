@@ -6,12 +6,13 @@ import { z } from 'zod';
 import { validate } from '../../../shared/middleware/validate.middleware.js';
 
 const uploadSchema = z.object({
-  documentType: z.enum(['aadhaar', 'drivers_license'], 'Document type must be aadhaar or drivers_license'),
+  documentType: z.string().min(1, 'Document type is required'),
 });
 
 const router = Router();
 
 router.post('/', authenticate, requireRole('publisher', 'client'), uploadIdentity, validate(uploadSchema), controller.uploadDocument);
-router.get('/', authenticate, requireRole('publisher', 'client'), controller.getMyDocument);
+router.get('/', authenticate, requireRole('publisher', 'client'), controller.getMyDocuments);
+router.get('/missing-mandatory', authenticate, requireRole('publisher', 'client'), controller.getMissingMandatory);
 
 export default router;
