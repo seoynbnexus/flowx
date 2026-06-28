@@ -23,7 +23,13 @@ export async function updateProfile(userId, data) {
     throw new NotFoundError('User not found');
   }
 
-  const updatedProfile = await repo.updateProfile(userId, data);
+  const { role, ...profileData } = data;
+
+  if (role) {
+    await repo.updateUserRole(userId, role);
+  }
+
+  const updatedProfile = await repo.updateProfile(userId, profileData);
   return { ...user, profile: updatedProfile };
 }
 

@@ -12,6 +12,7 @@ export const updateProfileSchema = z.object({
   pincode: z.string().regex(/^[0-9]{6}$/, 'Pincode must be exactly 6 digits').optional(),
   timezone: z.string().max(100).optional(),
   metadata: z.record(z.unknown()).optional(),
+  role: z.enum(['client', 'publisher']).optional(),
 });
 
 export const updateStatusSchema = z.object({

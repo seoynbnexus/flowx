@@ -1,5 +1,6 @@
 import { query, queryOne } from '../../../shared/database/connection.js';
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js';
+import { AppError } from '../../../shared/errors/AppError.js';
 
 function mapUserRow(row) {
   if (!row) return null;
@@ -148,6 +149,16 @@ export async function assignRole(userId, roleId) {
   await query(
     'INSERT IGNORE INTO user_roles (id, user_id, role_id) VALUES (?, ?, ?)',
     [uuidToBuffer(generateUuid()), uuidToBuffer(userId), uuidToBuffer(roleId)]
+  );
+}
+
+export async function updateUserRole(userId, roleCode) {
+  const role = await queryOne('SELECT id FROM roles WHERE code = ?', [roleCode]);
+  if (!role) throw new AppError('Role not found', 404);
+  await query('DELETE FROM user_roles WHERE user_id = ?', [uuidToBuffer(userId)]);
+  await query(
+    'INSERT INTO user_roles (id, user_id, role_id) VALUES (?, ?, ?)',
+    [uuidToBuffer(generateUuid()), uuidToBuffer(userId), role.id]
   );
 }
 
