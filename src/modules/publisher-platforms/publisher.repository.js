@@ -1,6 +1,8 @@
 import { query, queryOne } from '../../../shared/database/connection.js';
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js';
 
+import { encrypt, decrypt } from '../../../shared/utils/crypto.utils.js';
+
 function mapAccountRow(row) {
   if (!row) return null;
   return {
@@ -13,6 +15,14 @@ function mapAccountRow(row) {
     avatarUrl: row.avatar_url,
     followersCount: row.followers_count,
     platformUserId: row.platform_user_id,
+    instagramAccountType: row.instagram_account_type,
+    instagramBusinessAccountId: row.instagram_business_account_id,
+    accessToken: row.access_token ? decrypt(row.access_token) : null,
+    refreshToken: row.refresh_token ? decrypt(row.refresh_token) : null,
+    tokenExpiresAt: row.token_expires_at,
+    tokenStatus: row.token_status,
+    tokenIssuedAt: row.token_issued_at,
+    oauthProvider: row.oauth_provider,
     verificationStatus: row.verification_status,
     verifiedAt: row.verified_at,
     verifiedBy: row.verified_by ? bufferToUuid(row.verified_by) : null,
@@ -21,6 +31,13 @@ function mapAccountRow(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function mapAccountRowPublic(row) {
+  const full = mapAccountRow(row);
+  if (!full) return null;
+  const { accessToken, refreshToken, tokenExpiresAt, tokenIssuedAt, ...rest } = full;
+  return { ...rest, tokenStatus: full.tokenStatus };
 }
 
 export async function findPlatformByCode(code) {
@@ -50,6 +67,36 @@ export async function createAccount(id, userId, platformId, profileUrl, username
     `INSERT INTO user_platform_accounts (id, user_id, platform_id, profile_url, platform_username)
      VALUES (?, ?, ?, ?, ?)`,
     [uuidToBuffer(id), uuidToBuffer(userId), uuidToBuffer(platformId), profileUrl, username]
+  );
+  return findAccountById(id);
+}
+
+export async function createOAuthAccount({ id, userId, platformId, profileUrl, username, displayName, avatarUrl, followersCount, platformUserId, igAccountType, igBusinessAccountId, accessToken, refreshToken, tokenExpiresAt, tokenIssuedAt, oauthProvider }) {
+  await query(
+    `INSERT INTO user_platform_accounts
+     (id, user_id, platform_id, profile_url, platform_username, platform_display_name,
+      avatar_url, followers_count, platform_user_id, instagram_account_type,
+      instagram_business_account_id, access_token, refresh_token, token_expires_at,
+      token_issued_at, oauth_provider, verification_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(userId),
+      uuidToBuffer(platformId),
+      profileUrl || '',
+      username || null,
+      displayName || null,
+      avatarUrl || null,
+      followersCount || 0,
+      platformUserId || null,
+      igAccountType || null,
+      igBusinessAccountId || null,
+      accessToken ? encrypt(accessToken) : null,
+      refreshToken ? encrypt(refreshToken) : null,
+      tokenExpiresAt,
+      tokenIssuedAt,
+      oauthProvider || 'meta',
+    ]
   );
   return findAccountById(id);
 }
@@ -96,7 +143,7 @@ export async function listAccountsByUser(userId) {
     [uuidToBuffer(userId)]
   );
   return rows.map(r => ({
-    ...mapAccountRow(r),
+    ...mapAccountRowPublic(r),
     platformCode: r.platform_code,
     platformName: r.platform_name,
   }));
@@ -133,7 +180,7 @@ export async function listAllAccounts({ status, page, limit }) {
 
   return {
     accounts: rows.map(r => ({
-      ...mapAccountRow(r),
+      ...mapAccountRowPublic(r),
       platformCode: r.platform_code,
       platformName: r.platform_name,
       userEmail: r.user_email,

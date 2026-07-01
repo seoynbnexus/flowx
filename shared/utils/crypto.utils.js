@@ -31,6 +31,7 @@ export function generateOtp(length = 6) {
 }
 
 export function encrypt(text) {
+  if (!text) return null;
   if (!ENCRYPTION_KEY || ENCRYPTION_KEY.length < 64) {
     throw new Error('ENCRYPTION_KEY must be 64 hex characters');
   }
@@ -43,6 +44,7 @@ export function encrypt(text) {
 }
 
 export function decrypt(encryptedText) {
+  if (!encryptedText) return null;
   if (!ENCRYPTION_KEY || ENCRYPTION_KEY.length < 64) {
     throw new Error('ENCRYPTION_KEY must be 64 hex characters');
   }

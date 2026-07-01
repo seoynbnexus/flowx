@@ -33,6 +33,7 @@ export function optionalAuth(req, _res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     req.user = null;
+    req.tokenProvided = false;
     return next();
   }
 
@@ -46,8 +47,10 @@ export function optionalAuth(req, _res, next) {
       roles: decoded.roles || [],
       permissions: decoded.permissions || [],
     };
+    req.tokenProvided = true;
   } catch {
     req.user = null;
+    req.tokenProvided = true;
   }
   next();
 }

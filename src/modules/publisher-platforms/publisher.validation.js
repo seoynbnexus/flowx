@@ -25,3 +25,7 @@ export const listAccountsQuerySchema = z.object({
 export const verifyAccountSchema = z.object({
   status: z.enum(['verified', 'rejected']),
 });
+
+export const oAuthPlatformQuerySchema = z.object({
+  platformCode: z.enum(['instagram', 'facebook']).optional().default('instagram'),
+});

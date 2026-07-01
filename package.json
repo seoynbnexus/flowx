@@ -37,6 +37,7 @@
     "migrate:down": "node shared/database/migrate.js down",
     "migrate:list": "node shared/database/migrate.js list",
     "db:cleanup": "node shared/database/cleanup.js",
-    "schema:sync": "node shared/database/schema-sync.js"
+    "schema:sync": "node shared/database/schema-sync.js",
+    "tokens:refresh": "node src/jobs/refresh-tokens.js"
   }
 }

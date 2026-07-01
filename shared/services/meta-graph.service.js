@@ -1,0 +1,79 @@
+import { META_CONFIG } from './meta-oauth.config.js';
+
+async function graphGet(path, params = {}) {
+  const query = new URLSearchParams({ ...params, access_token: params.access_token });
+  const url = `${META_CONFIG.graphUrl}/${path}?${query.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`Graph API GET ${path} failed: ${error}`);
+  }
+  return res.json();
+}
+
+export async function getFacebookPages(userToken) {
+  const data = await graphGet('me/accounts', {
+    access_token: userToken,
+    fields: 'id,name,access_token,picture',
+  });
+  return data.data || [];
+}
+
+export async function getInstagramBusinessAccount(pageId, pageToken) {
+  const data = await graphGet(pageId, {
+    access_token: pageToken,
+    fields: 'instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}',
+  });
+  return data.instagram_business_account || null;
+}
+
+export async function getInstagramProfile(igBusinessId, token) {
+  const data = await graphGet(igBusinessId, {
+    access_token: token,
+    fields: 'id,username,name,profile_picture_url,followers_count,media_count',
+  });
+  return data;
+}
+
+export async function getMe(userToken) {
+  const data = await graphGet('me', {
+    access_token: userToken,
+    fields: 'id,name,picture',
+  });
+  return data;
+}
+
+export async function getInstagramMedia(igBusinessId, token, limit = 25) {
+  const data = await graphGet(`${igBusinessId}/media`, {
+    access_token: token,
+    fields: 'id,caption,media_type,media_url,permalink,timestamp,like_count,comments_count',
+    limit: String(limit),
+  });
+  return data.data || [];
+}
+
+export async function getInstagramInsights(igBusinessId, token, metric = 'impressions,reach,profile_views,follower_count') {
+  const data = await graphGet(`${igBusinessId}/insights`, {
+    access_token: token,
+    metric,
+    period: 'day',
+  });
+  return data.data || [];
+}
+
+export async function getMediaInsights(mediaId, token, metric = 'impressions,reach,engagement') {
+  const data = await graphGet(`${mediaId}/insights`, {
+    access_token: token,
+    metric,
+  });
+  return data.data || [];
+}
+
+function extractIgBusinessId(data) {
+  if (data?.instagram_business_account?.id) {
+    return data.instagram_business_account.id;
+  }
+  return null;
+}
+
+export { extractIgBusinessId };

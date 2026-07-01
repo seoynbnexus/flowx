@@ -7,6 +7,14 @@ export async function getConfig(req, res, next) {
       return res.json({ success: true, data: config });
     }
 
+    if (req.tokenProvided) {
+      return res.status(401).json({
+        success: false,
+        message: 'Access token expired or invalid',
+        code: 'TOKEN_INVALID',
+      });
+    }
+
     const config = await configService.getPublicConfig();
     return res.json({ success: true, data: config });
   } catch (error) {

@@ -50,6 +50,14 @@ app.use(cors({
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/privacy-policy', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'privacy-policy.html'));
+});
+
+app.get('/terms-of-service', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'terms-of-service.html'));
+});
+
 app.use('/api/v1', routes);
 
 app.use(errorHandler);

@@ -2,6 +2,8 @@ import * as repo from './publisher.repository.js';
 import { generateUuid } from '../../../shared/utils/uuid.utils.js';
 import { NotFoundError, ConflictError, ValidationError } from '../../../shared/errors/AppError.js';
 import { ERROR_CODES } from '../../../shared/errors/errorCodes.js';
+import { isMetaConfigured } from '../../../shared/services/meta-oauth.config.js';
+import { generateOAuthUrl as buildAuthUrl } from '../../../shared/services/meta-auth.service.js';
 
 function extractUsername(platformCode, profileUrl) {
   const url = new URL(profileUrl.startsWith('http') ? profileUrl : `https://${profileUrl}`);
@@ -14,6 +16,10 @@ export async function submitAccount(userId, platformCode, profileUrl) {
   const platform = await repo.findPlatformByCode(platformCode);
   if (!platform) {
     throw new NotFoundError('Platform not found');
+  }
+
+  if (isMetaConfigured()) {
+    throw new ValidationError('Meta OAuth is configured. Please use the OAuth connection flow instead of URL submission.');
   }
 
   const username = extractUsername(platformCode, profileUrl);
