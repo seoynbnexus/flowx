@@ -1,0 +1,126 @@
+version: "1.0"
+
+categories:
+  violence:
+    enabled: true
+    severity: critical
+    action: block
+    keywords:
+      - "kill"
+      - "murder"
+      - "bomb"
+      - "weapon"
+      - "assault"
+      - "terrorist"
+      - "shoot"
+      - "explosive"
+      - "massacre"
+    patterns: []
+
+  hate_speech:
+    enabled: true
+    severity: critical
+    action: block
+    keywords:
+      - "racial slur"
+      - "hate crime"
+    patterns:
+      - "/\\b(hate|discriminat)\\b.{0,50}\\b(race|religion|gender|sexual|ethnic)\\b/i"
+
+  adult_content:
+    enabled: true
+    severity: high
+    action: block
+    keywords:
+      - "nsfw"
+      - "explicit"
+      - "porn"
+      - "sexual"
+      - "nude"
+      - "adult content"
+    patterns: []
+
+  drugs:
+    enabled: true
+    severity: high
+    action: block
+    keywords:
+      - "cocaine"
+      - "heroin"
+      - "meth"
+      - "illegal drug"
+      - "substance abuse"
+      - "mdma"
+      - "lsd"
+    patterns: []
+
+  weapons:
+    enabled: true
+    severity: high
+    action: block
+    keywords:
+      - "gun"
+      - "firearm"
+      - "sword"
+      - "knife weapon"
+      - "ammunition"
+    patterns: []
+
+  spam:
+    enabled: true
+    severity: medium
+    action: block
+    keywords:
+      - "buy followers"
+      - "click this link"
+      - "free instagram followers"
+      - "earn money fast"
+      - "get rich quick"
+      - "make money online"
+    patterns: []
+
+  defamation:
+    enabled: true
+    severity: high
+    action: block
+    keywords:
+      - "defame"
+      - "slander"
+      - "libel"
+      - "false accusation"
+    patterns: []
+
+  misinformation:
+    enabled: true
+    severity: high
+    action: block
+    keywords:
+      - "fake news"
+      - "hoax"
+      - "conspiracy"
+      - "false claim"
+    patterns: []
+
+  prompt_injection:
+    enabled: true
+    severity: critical
+    action: block
+    keywords: []
+    patterns:
+      - "/ignore\\s+(previous|all|your)\\s+(instructions|prompts|rules|commands)/i"
+      - "/forget\\s+(everything|all|previous)/i"
+      - "/you\\s+are\\s+(now|not)\\s+(an?|the)\\s+/i"
+      - "/system\\s+prompt/i"
+      - "/reveal\\s+(your|the)\\s+(prompt|instructions)/i"
+      - "/act\\s+as\\s+(if|though)\\s+you/i"
+      - "/do\\s+not\\s+follow/i"
+      - "/override\\s+(your|previous)/i"
+
+limits:
+  max_prompt_length: 1000
+
+abuse:
+  violation_threshold: 5
+  violation_window_hours: 24
+  auto_block_generation: true
+  auto_block_account_at: 10

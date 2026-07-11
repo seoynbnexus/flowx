@@ -2,6 +2,7 @@ import * as authRepo from '../auth/auth.repository.js';
 import * as adCategoryRepo from '../ad-categories/ad-category.repository.js';
 import * as publisherRepo from '../publisher-platforms/publisher.repository.js';
 import * as identityRepo from '../identity-documents/identity.repository.js';
+import * as aiRepo from '../ai/ai.repository.js';
 import { query } from '../../../shared/database/connection.js';
 import {
   IDENTITY_STATUS,
@@ -102,6 +103,11 @@ export async function getFullConfig(userId) {
   const userCategoryRows = await adCategoryRepo.findUserCategories(userId);
   const platformAccounts = await publisherRepo.listAccountsByUser(userId);
   const identityDocuments = await identityRepo.findByUserId(userId);
+  const [aiBalance, aiHistoryResult, aiBlocked] = await Promise.all([
+    aiRepo.findUserWalletCoins(userId),
+    aiRepo.findContentByUserId(userId, { page: 1, limit: 5, type: undefined }),
+    aiRepo.findBlockedStatus(userId),
+  ]);
 
   return {
     ...publicConfig,
@@ -126,5 +132,10 @@ export async function getFullConfig(userId) {
     userCategories: userCategoryRows.map(c => c.id),
     platformAccounts,
     identityDocuments,
+    ai: {
+      balance: aiBalance,
+      history: aiHistoryResult.items,
+      isBlocked: aiBlocked,
+    },
   };
 }

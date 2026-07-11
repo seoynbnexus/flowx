@@ -9,6 +9,7 @@ import {
   changePasswordSchema,
   listUsersSchema,
   createUserSchema,
+  searchUsersSchema,
 } from './user.validation.js';
 import { setUserCategoriesSchema } from '../ad-categories/ad-category.validation.js';
 
@@ -22,6 +23,7 @@ router.put('/me/categories', authenticate, validate(setUserCategoriesSchema), ca
 
 router.post('/', authenticate, requirePermission('users.create'), validate(createUserSchema), controller.createUser);
 router.get('/', authenticate, requirePermission('users.read'), validate(listUsersSchema, 'query'), controller.listUsers);
+router.get('/search', authenticate, requirePermission('users.read'), validate(searchUsersSchema, 'query'), controller.searchUsers);
 router.get('/:id', authenticate, requirePermission('users.read'), controller.getProfile);
 router.patch('/:id/status', authenticate, requirePermission('users.update'), validate(updateStatusSchema), controller.updateStatus);
 router.delete('/:id', authenticate, requirePermission('users.delete'), controller.deleteUser);

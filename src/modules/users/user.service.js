@@ -60,6 +60,10 @@ export async function adminCreateUser(data) {
   return repo.findById(userId);
 }
 
+export async function searchUsers(q, limit) {
+  return repo.searchUsers(q, limit);
+}
+
 export async function listUsers(filters) {
   const page = filters.page || PAGINATION.DEFAULT_PAGE;
   const limit = Math.min(filters.limit || PAGINATION.DEFAULT_LIMIT, PAGINATION.MAX_LIMIT);

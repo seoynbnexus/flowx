@@ -50,3 +50,12 @@ export async function verifyAccount(req, res, next) {
     next(error);
   }
 }
+
+export async function getInsights(req, res, next) {
+  try {
+    const data = await service.getAccountInsights(req.params.id);
+    return sendSuccess(res, data);
+  } catch (error) {
+    next(error);
+  }
+}

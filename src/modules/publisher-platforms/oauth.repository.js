@@ -20,6 +20,7 @@ function mapOAuthAccountRow(row) {
     refreshToken: row.refresh_token ? decrypt(row.refresh_token) : null,
     tokenExpiresAt: row.token_expires_at,
     tokenStatus: row.token_status,
+    tokenType: row.token_type || 'user',
     tokenIssuedAt: row.token_issued_at,
     oauthProvider: row.oauth_provider,
     verificationStatus: row.verification_status,
@@ -50,19 +51,43 @@ export async function findExistingByUserAndPlatform(userId, platformId) {
   return mapOAuthAccountRow(row);
 }
 
+export async function findUserLevelToken(userId, platformId) {
+  const row = await queryOne(
+    'SELECT * FROM user_platform_accounts WHERE user_id = ? AND platform_id = ? AND token_type = ?',
+    [uuidToBuffer(userId), uuidToBuffer(platformId), 'user']
+  );
+  return mapOAuthAccountRow(row);
+}
+
+export async function findExistingByUserAndPlatformUserId(userId, platformId, platformUserId) {
+  const row = await queryOne(
+    'SELECT * FROM user_platform_accounts WHERE user_id = ? AND platform_id = ? AND platform_user_id = ?',
+    [uuidToBuffer(userId), uuidToBuffer(platformId), platformUserId]
+  );
+  return mapOAuthAccountRow(row);
+}
+
+export async function findAllByUserAndPlatform(userId, platformId) {
+  const rows = await query(
+    'SELECT * FROM user_platform_accounts WHERE user_id = ? AND platform_id = ? AND is_active = 1',
+    [uuidToBuffer(userId), uuidToBuffer(platformId)]
+  );
+  return rows.map(mapOAuthAccountRow);
+}
+
 export async function findById(id) {
   const row = await queryOne('SELECT * FROM user_platform_accounts WHERE id = ?', [uuidToBuffer(id)]);
   return mapOAuthAccountRow(row);
 }
 
-export async function createOAuthAccount({ id, userId, platformId, profileUrl, username, displayName, avatarUrl, followersCount, platformUserId, igAccountType, igBusinessAccountId, accessToken, refreshToken, tokenExpiresAt, tokenIssuedAt, oauthProvider }) {
+export async function createOAuthAccount({ id, userId, platformId, profileUrl, username, displayName, avatarUrl, followersCount, platformUserId, igAccountType, igBusinessAccountId, accessToken, refreshToken, tokenExpiresAt, tokenIssuedAt, oauthProvider, tokenType }) {
   await query(
     `INSERT INTO user_platform_accounts
      (id, user_id, platform_id, profile_url, platform_username, platform_display_name,
       avatar_url, followers_count, platform_user_id, instagram_account_type,
       instagram_business_account_id, access_token, refresh_token, token_expires_at,
-      token_issued_at, oauth_provider, verification_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      token_issued_at, oauth_provider, token_type, verification_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
     [
       uuidToBuffer(id),
       uuidToBuffer(userId),
@@ -80,6 +105,7 @@ export async function createOAuthAccount({ id, userId, platformId, profileUrl, u
       tokenExpiresAt,
       tokenIssuedAt,
       oauthProvider || 'meta',
+      tokenType || 'user',
     ]
   );
   return findById(id);
@@ -102,7 +128,9 @@ export async function updateOAuthAccount(id, updates) {
   if (updates.tokenExpiresAt !== undefined) { fields.push('token_expires_at = ?'); params.push(updates.tokenExpiresAt); }
   if (updates.tokenIssuedAt !== undefined) { fields.push('token_issued_at = ?'); params.push(updates.tokenIssuedAt); }
   if (updates.tokenStatus !== undefined) { fields.push('token_status = ?'); params.push(updates.tokenStatus); }
+  if (updates.tokenType !== undefined) { fields.push('token_type = ?'); params.push(updates.tokenType); }
   if (updates.verificationStatus !== undefined) { fields.push('verification_status = ?'); params.push(updates.verificationStatus); }
+  if (updates.isActive !== undefined) { fields.push('is_active = ?'); params.push(updates.isActive); }
 
   if (fields.length === 0) return findById(id);
 

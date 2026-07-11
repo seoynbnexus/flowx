@@ -30,6 +30,16 @@ export async function createUser(req, res, next) {
   }
 }
 
+export async function searchUsers(req, res, next) {
+  try {
+    const { q, limit } = req.query;
+    const users = await userService.searchUsers(q, limit);
+    return sendSuccess(res, users);
+  } catch (error) {
+    next(error);
+  }
+}
+
 export async function listUsers(req, res, next) {
   try {
     const result = await userService.listUsers(req.query);

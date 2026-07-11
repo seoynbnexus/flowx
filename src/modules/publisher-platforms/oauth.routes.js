@@ -7,5 +7,9 @@ const router = Router();
 router.get('/url', authenticate, controller.getOAuthUrl);
 router.get('/callback', controller.handleCallback);
 router.get('/status', authenticate, controller.getConnectionStatus);
+router.get('/available-pages', authenticate, controller.getAvailablePages);
+router.post('/pages', authenticate, controller.addPage);
+router.get('/available-instagram', authenticate, controller.getAvailableInstagram);
+router.post('/instagram', authenticate, controller.addInstagram);
 
 export default router;

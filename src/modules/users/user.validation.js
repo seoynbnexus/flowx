@@ -51,3 +51,8 @@ export const listUsersSchema = z.object({
   status: z.enum([USER_STATUS.ACTIVE, USER_STATUS.INACTIVE, USER_STATUS.BLOCKED, USER_STATUS.PENDING]).optional(),
   search: z.string().max(255).optional(),
 });
+
+export const searchUsersSchema = z.object({
+  q: z.string().min(2).max(100),
+  limit: z.coerce.number().int().positive().max(50).default(10),
+});

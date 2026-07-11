@@ -123,6 +123,33 @@ export async function listUsers({ page, limit, status, search }) {
   };
 }
 
+export async function searchUsers(q, limit) {
+  const pattern = `%${q}%`;
+  const rows = await query(
+    `SELECT u.id, u.email, u.status, u.created_at, up.first_name, up.last_name, up.avatar_url
+     FROM users u
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     WHERE u.deleted_at IS NULL
+       AND (u.email LIKE ? OR up.first_name LIKE ? OR up.last_name LIKE ?)
+     ORDER BY
+       CASE WHEN u.email = ? THEN 0
+            WHEN u.email LIKE ? THEN 1
+            ELSE 2 END,
+       u.created_at DESC
+     LIMIT ?`,
+    [pattern, pattern, pattern, q, `${q}%`, String(limit)]
+  );
+  return rows.map(r => ({
+    id: bufferToUuid(r.id),
+    email: r.email,
+    status: r.status,
+    createdAt: r.created_at,
+    firstName: r.first_name,
+    lastName: r.last_name,
+    avatarUrl: r.avatar_url,
+  }));
+}
+
 export async function updateStatus(userId, status) {
   await query('UPDATE users SET status = ? WHERE id = ?', [status, uuidToBuffer(userId)]);
   return findById(userId);

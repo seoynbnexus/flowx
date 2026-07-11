@@ -37,10 +37,10 @@ export async function handleCallback(req, res, next) {
     if (result.success) {
       return res.redirect(`${FRONTEND_URL}/meta/callback?success=true&platform=${result.platformCode || 'instagram'}&accountId=${result.accountId}`);
     }
-    return res.redirect(`${FRONTEND_URL}/meta/callback?error=${encodeURIComponent(result.error || 'unknown')}`);
+    return res.redirect(`${FRONTEND_URL}/meta/callback?error=${encodeURIComponent(result.error || 'unknown')}&errorType=${result.errorType || 'oauth'}`);
   } catch (error) {
     const message = error.message || 'OAuth callback failed';
-    return res.redirect(`${FRONTEND_URL}/meta/callback?error=${encodeURIComponent(message)}`);
+    return res.redirect(`${FRONTEND_URL}/meta/callback?error=${encodeURIComponent(message)}&errorType=system`);
   }
 }
 
@@ -49,6 +49,50 @@ export async function getConnectionStatus(req, res, next) {
     const { platformCode = 'instagram' } = req.query;
     const status = await oauthService.getConnectionStatus(req.user.id, platformCode);
     return sendSuccess(res, status);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function getAvailablePages(req, res, next) {
+  try {
+    const result = await oauthService.getAvailablePages(req.user.id);
+    return sendSuccess(res, result);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function addPage(req, res, next) {
+  try {
+    const { platformUserId } = req.body;
+    if (!platformUserId) {
+      return res.status(422).json({ success: false, message: 'platformUserId is required' });
+    }
+    const result = await oauthService.addPage(req.user.id, platformUserId);
+    return sendCreated(res, result.account);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function getAvailableInstagram(req, res, next) {
+  try {
+    const result = await oauthService.getAvailableInstagramAccounts(req.user.id);
+    return sendSuccess(res, result);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function addInstagram(req, res, next) {
+  try {
+    const { igBusinessAccountId } = req.body;
+    if (!igBusinessAccountId) {
+      return res.status(422).json({ success: false, message: 'igBusinessAccountId is required' });
+    }
+    const result = await oauthService.addInstagramAccount(req.user.id, igBusinessAccountId);
+    return sendCreated(res, result.account);
   } catch (error) {
     next(error);
   }

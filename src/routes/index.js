@@ -12,6 +12,9 @@ import adminIdentityRoutes from '../modules/identity-documents/admin.routes.js';
 import identityDocumentTypeRoutes from '../modules/identity-document-types/identity-document-types.routes.js';
 import swaggerMiddleware from '../docs/swagger.js';
 import configRoutes from '../modules/config/config.routes.js';
+import aiRoutes from '../modules/ai/ai.routes.js';
+import adminAiRoutes from '../modules/ai/admin.routes.js';
+import adminAnalyticsRoutes from '../modules/analytics/admin.routes.js';
 
 const router = Router();
 
@@ -27,6 +30,9 @@ router.use('/ad-categories', adCategoryRoutes);
 router.use('/identity/documents', identityRoutes);
 router.use('/admin/identity-documents', adminIdentityRoutes);
 router.use('/admin/identity-document-types', identityDocumentTypeRoutes);
+router.use('/ai', aiRoutes);
+router.use('/admin/ai', adminAiRoutes);
+router.use('/admin/analytics', adminAnalyticsRoutes);
 router.use('/docs', swaggerMiddleware);
 
 router.get('/health', (_req, res) => {

@@ -145,6 +145,15 @@ export async function register(data, ipAddress, userAgent) {
     const role = data.role || ROLE_CODES.PUBLISHER;
     await repo.assignUserRole(userId, role);
 
+    await query(
+      'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
+      [uuidToBuffer(userId), 10000]
+    );
+    await repo.createAuditLog(
+      generateUuid(), userId, 'wallet', userId,
+      'wallet.signup_bonus', null, { coins: 10000 }
+    );
+
     await repo.createAuditLog(generateUuid(), userId, 'user', userId, 'user.registered', null, { email, role });
 
     const user = await repo.findUserById(userId);
@@ -361,6 +370,12 @@ export async function googleLogin(accessToken, ipAddress, userAgent, role) {
       );
     }
     await repo.assignUserRole(userId, role || ROLE_CODES.CLIENT);
+
+    await query(
+      'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
+      [uuidToBuffer(userId), 10000]
+    );
+
     user = await repo.findUserById(userId);
 
     await repo.createAuditLog(

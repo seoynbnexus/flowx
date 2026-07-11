@@ -7,6 +7,7 @@ import { verifyAccountSchema, listAccountsQuerySchema } from './publisher.valida
 const router = Router();
 
 router.get('/', authenticate, requirePermission('platform_accounts.read'), validate(listAccountsQuerySchema, 'query'), controller.listAllAccounts);
+router.get('/:id/insights', authenticate, requirePermission('platform_accounts.read'), controller.getInsights);
 router.patch('/:id/verify', authenticate, requirePermission('platform_accounts.verify'), validate(verifyAccountSchema), controller.verifyAccount);
 
 export default router;

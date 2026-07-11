@@ -69,6 +69,40 @@ export async function getMediaInsights(mediaId, token, metric = 'impressions,rea
   return data.data || [];
 }
 
+export async function getPageDetails(pageId, pageToken) {
+  const data = await graphGet(pageId, {
+    access_token: pageToken,
+    fields: 'id,name,about,followers_count,picture{url},website,username',
+  })
+  return data
+}
+
+export async function getFacebookPageInsights(pageId, pageToken, metric, period = 'days_28') {
+  const data = await graphGet(`${pageId}/insights`, {
+    access_token: pageToken,
+    metric,
+    period,
+  })
+  return data.data || []
+}
+
+export async function getFacebookPagePosts(pageId, pageToken, limit = 5) {
+  const data = await graphGet(`${pageId}/feed`, {
+    access_token: pageToken,
+    fields: 'id,message,created_time,likes.summary(true),comments.summary(true),shares',
+    limit: String(limit),
+  })
+  return data.data || []
+}
+
+export async function getPageAccessToken(pageId, userToken) {
+  const data = await graphGet(pageId, {
+    access_token: userToken,
+    fields: 'access_token',
+  });
+  return data.access_token || null;
+}
+
 function extractIgBusinessId(data) {
   if (data?.instagram_business_account?.id) {
     return data.instagram_business_account.id;
