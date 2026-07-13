@@ -36,10 +36,7 @@ export async function submitAccount(userId, platformCode, profileUrl) {
 
   const existing = await repo.findAccountByUserAndPlatform(userId, platform.id);
   if (existing) {
-    if (existing.isActive) {
-      throw new ConflictError('You already have an account linked for this platform');
-    }
-    return repo.reactivateAccount(existing.id, profileUrl, username);
+    throw new ConflictError('You already have an account linked for this platform');
   }
 
   return repo.createAccount(generateUuid(), userId, platform.id, profileUrl, username);
@@ -54,7 +51,7 @@ export async function removeAccount(userId, accountId) {
   if (!account || account.userId !== userId) {
     throw new NotFoundError('Account not found');
   }
-  await repo.softDeleteAccount(accountId);
+  await repo.hardDeleteAccount(accountId);
 }
 
 export async function listAllAccounts(filters) {

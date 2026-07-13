@@ -35,6 +35,9 @@ export async function handleCallback(req, res, next) {
     const result = await oauthService.handleOAuthCallback(code, stateData);
 
     if (result.success) {
+      if (result.pendingSelection) {
+        return res.redirect(`${FRONTEND_URL}/meta/callback?pending_selection=true`);
+      }
       return res.redirect(`${FRONTEND_URL}/meta/callback?success=true&platform=${result.platformCode || 'instagram'}&accountId=${result.accountId}`);
     }
     return res.redirect(`${FRONTEND_URL}/meta/callback?error=${encodeURIComponent(result.error || 'unknown')}&errorType=${result.errorType || 'oauth'}`);
@@ -93,6 +96,25 @@ export async function addInstagram(req, res, next) {
     }
     const result = await oauthService.addInstagramAccount(req.user.id, igBusinessAccountId);
     return sendCreated(res, result.account);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function getDiscoveredAssets(req, res, next) {
+  try {
+    const result = await oauthService.getDiscoveredAssets(req.user.id);
+    return sendSuccess(res, result);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function connectSelectedAssets(req, res, next) {
+  try {
+    const { pageIds = [], igBusinessAccountIds = [] } = req.body;
+    const result = await oauthService.connectSelectedAssets(req.user.id, pageIds, igBusinessAccountIds);
+    return sendCreated(res, result.accounts);
   } catch (error) {
     next(error);
   }

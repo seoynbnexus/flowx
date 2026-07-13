@@ -26,8 +26,6 @@ function mapOAuthAccountRow(row) {
     verificationStatus: row.verification_status,
     verifiedAt: row.verified_at,
     verifiedBy: row.verified_by ? bufferToUuid(row.verified_by) : null,
-    isActive: !!row.is_active,
-    revokedAt: row.revoked_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -69,7 +67,7 @@ export async function findExistingByUserAndPlatformUserId(userId, platformId, pl
 
 export async function findAllByUserAndPlatform(userId, platformId) {
   const rows = await query(
-    'SELECT * FROM user_platform_accounts WHERE user_id = ? AND platform_id = ? AND is_active = 1',
+    'SELECT * FROM user_platform_accounts WHERE user_id = ? AND platform_id = ?',
     [uuidToBuffer(userId), uuidToBuffer(platformId)]
   );
   return rows.map(mapOAuthAccountRow);
@@ -130,7 +128,6 @@ export async function updateOAuthAccount(id, updates) {
   if (updates.tokenStatus !== undefined) { fields.push('token_status = ?'); params.push(updates.tokenStatus); }
   if (updates.tokenType !== undefined) { fields.push('token_type = ?'); params.push(updates.tokenType); }
   if (updates.verificationStatus !== undefined) { fields.push('verification_status = ?'); params.push(updates.verificationStatus); }
-  if (updates.isActive !== undefined) { fields.push('is_active = ?'); params.push(updates.isActive); }
 
   if (fields.length === 0) return findById(id);
 
@@ -142,4 +139,8 @@ export async function updateOAuthAccount(id, updates) {
     params
   );
   return findById(id);
+}
+
+export async function hardDeleteAccount(id) {
+  await query('DELETE FROM user_platform_accounts WHERE id = ?', [uuidToBuffer(id)]);
 }

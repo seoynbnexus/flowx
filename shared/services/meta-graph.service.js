@@ -103,6 +103,46 @@ export async function getPageAccessToken(pageId, userToken) {
   return data.access_token || null;
 }
 
+export async function getUserBusinesses(userToken) {
+  const data = await graphGet('me/businesses', {
+    access_token: userToken,
+    fields: 'id,name',
+  });
+  return data.data || [];
+}
+
+export async function getBusinessOwnedPages(businessId, userToken) {
+  const data = await graphGet(`${businessId}/owned_pages`, {
+    access_token: userToken,
+    fields: 'id,name,picture,access_token',
+  });
+  return data.data || [];
+}
+
+export async function getBusinessClientPages(businessId, userToken) {
+  const data = await graphGet(`${businessId}/client_pages`, {
+    access_token: userToken,
+    fields: 'id,name,picture,access_token',
+  });
+  return data.data || [];
+}
+
+export async function getBusinessOwnedInstagramAccounts(businessId, userToken) {
+  const data = await graphGet(`${businessId}/owned_instagram_accounts`, {
+    access_token: userToken,
+    fields: 'instagram_business_account{id,username,name,profile_picture_url,followers_count}',
+  });
+  return data.data?.map(item => item.instagram_business_account).filter(Boolean) || [];
+}
+
+export async function getBusinessClientInstagramAccounts(businessId, userToken) {
+  const data = await graphGet(`${businessId}/client_instagram_accounts`, {
+    access_token: userToken,
+    fields: 'instagram_business_account{id,username,name,profile_picture_url,followers_count}',
+  });
+  return data.data?.map(item => item.instagram_business_account).filter(Boolean) || [];
+}
+
 function extractIgBusinessId(data) {
   if (data?.instagram_business_account?.id) {
     return data.instagram_business_account.id;

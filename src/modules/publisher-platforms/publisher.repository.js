@@ -27,8 +27,6 @@ function mapAccountRow(row) {
     verificationStatus: row.verification_status,
     verifiedAt: row.verified_at,
     verifiedBy: row.verified_by ? bufferToUuid(row.verified_by) : null,
-    isActive: !!row.is_active,
-    revokedAt: row.revoked_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -72,23 +70,9 @@ export async function createAccount(id, userId, platformId, profileUrl, username
   return findAccountById(id);
 }
 
-export async function reactivateAccount(id, profileUrl, username) {
+export async function hardDeleteAccount(id) {
   await query(
-    `UPDATE user_platform_accounts
-     SET profile_url = ?, platform_username = ?, verification_status = 'pending',
-         is_active = 1, revoked_at = NULL, verified_at = NULL, verified_by = NULL,
-         updated_at = NOW()
-     WHERE id = ?`,
-    [profileUrl, username, uuidToBuffer(id)]
-  );
-  return findAccountById(id);
-}
-
-export async function softDeleteAccount(id) {
-  await query(
-    `UPDATE user_platform_accounts
-     SET is_active = 0, revoked_at = NOW(), updated_at = NOW()
-     WHERE id = ?`,
+    'DELETE FROM user_platform_accounts WHERE id = ?',
     [uuidToBuffer(id)]
   );
 }
@@ -97,7 +81,7 @@ export async function verifyAccount(id, status, adminId) {
   await query(
     `UPDATE user_platform_accounts
      SET verification_status = ?, verified_at = NOW(), verified_by = ?,
-         is_active = 1, updated_at = NOW()
+         updated_at = NOW()
      WHERE id = ?`,
     [status, uuidToBuffer(adminId), uuidToBuffer(id)]
   );
@@ -109,7 +93,7 @@ export async function listAccountsByUser(userId) {
     `SELECT a.*, p.code as platform_code, p.name as platform_name
      FROM user_platform_accounts a
      JOIN platforms p ON p.id = a.platform_id
-      WHERE a.user_id = ? AND a.is_active = 1
+      WHERE a.user_id = ?
      ORDER BY a.created_at DESC`,
     [uuidToBuffer(userId)]
   );

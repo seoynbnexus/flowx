@@ -11,5 +11,7 @@ router.get('/available-pages', authenticate, controller.getAvailablePages);
 router.post('/pages', authenticate, controller.addPage);
 router.get('/available-instagram', authenticate, controller.getAvailableInstagram);
 router.post('/instagram', authenticate, controller.addInstagram);
+router.get('/discovered-assets', authenticate, controller.getDiscoveredAssets);
+router.post('/connect-selected', authenticate, controller.connectSelectedAssets);
 
 export default router;

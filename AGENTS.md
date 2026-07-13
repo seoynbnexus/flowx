@@ -575,3 +575,7 @@ A feature is complete when:
 19. **No semicolons** — the codebase uses none
 20. **No TypeScript** — the codebase is plain JavaScript with ESM
 21. **No new dependencies without justification** — prefer solving problems with existing libraries
+
+## Post-Change Knowledge Graph Indexing
+
+After making any code change (edit, create, delete files), run `codebase-memory-mcp_index_repository` with `mode: "fast"` for the `flowx` project to keep the knowledge graph accurate for future `search_graph` / `trace_path` queries. This is a final step in every implementation task.

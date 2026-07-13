@@ -1,6 +1,6 @@
 import * as repo from './oauth.repository.js';
 import { generateOAuthUrl as buildAuthUrl, exchangeCodeForToken, exchangeForLongLivedToken, debugToken } from '../../../shared/services/meta-auth.service.js';
-import { getFacebookPages, getInstagramBusinessAccount, getInstagramProfile, getPageDetails, getPageAccessToken, getMe } from '../../../shared/services/meta-graph.service.js';
+import { getFacebookPages, getInstagramBusinessAccount, getInstagramProfile, getPageDetails, getPageAccessToken, getMe, getUserBusinesses, getBusinessOwnedPages, getBusinessClientPages, getBusinessOwnedInstagramAccounts, getBusinessClientInstagramAccounts } from '../../../shared/services/meta-graph.service.js';
 import { generateUuid } from '../../../shared/utils/uuid.utils.js';
 import { isMetaConfigured } from '../../../shared/services/meta-oauth.config.js';
 import { NotFoundError } from '../../../shared/errors/AppError.js';
@@ -39,7 +39,6 @@ async function upsertUserLevelToken(userId, platform, data) {
   }
 
   if (existing) {
-    payload.isActive = true
     return repo.updateOAuthAccount(existing.id, payload)
   }
 
@@ -73,7 +72,6 @@ async function upsertPageAccount(userId, platform, data) {
 
   if (existing) {
     payload.verificationStatus = existing.verificationStatus
-    payload.isActive = true
     return repo.updateOAuthAccount(existing.id, payload)
   }
 
@@ -119,13 +117,12 @@ export async function handleOAuthCallback(code, stateData) {
     const tokenIssuedAt = new Date();
 
     const fbPlatform = await repo.findPlatformByCode('facebook')
-    const igPlatform = await repo.findPlatformByCode('instagram')
 
     if (!fbPlatform) {
       return { success: false, error: 'Facebook platform not found in database', errorType: 'system' }
     }
 
-    // Store user-level token for future page discovery
+    // Store user-level token only — pages and IG are connected separately via discovery flow
     const fbUser = await getMe(accessToken)
     await upsertUserLevelToken(userId, fbPlatform, {
       profileUrl: `https://facebook.com/${fbUser.id}`,
@@ -139,78 +136,10 @@ export async function handleOAuthCallback(code, stateData) {
       tokenStatus: 'active',
     })
 
-    const fbPages = await getFacebookPages(accessToken);
-
-    if (!fbPages || fbPages.length === 0) {
-      return { success: false, error: 'No Facebook Pages found. Please create a Facebook Page first.', errorType: 'oauth' }
-    }
-
-    let storedAccounts = []
-    let igConnected = false
-
-    for (const page of fbPages) {
-      const pageToken = page.access_token
-      let pageDetails
-      try {
-        pageDetails = await getPageDetails(page.id, pageToken)
-      } catch {
-        continue
-      }
-
-      // Store each page individually
-      await upsertPageAccount(userId, fbPlatform, {
-        profileUrl: `https://facebook.com/${page.id}`,
-        username: pageDetails.username || null,
-        displayName: pageDetails.name || page.name,
-        avatarUrl: pageDetails.picture?.data?.url || page.picture?.data?.url || null,
-        followersCount: pageDetails.followers_count || 0,
-        platformUserId: page.id,
-        accessToken: pageToken,
-        tokenExpiresAt,
-        tokenIssuedAt,
-      })
-      storedAccounts.push({ platformCode: 'facebook', accountId: page.id })
-
-      // Check for Instagram — try each page until one succeeds
-      if (!igConnected && igPlatform) {
-        try {
-          const igAccount = await getInstagramBusinessAccount(page.id, pageToken)
-          if (!igAccount) continue
-          const igProfile = await getInstagramProfile(igAccount.id, pageToken)
-          await upsertPageAccount(userId, igPlatform, {
-            profileUrl: `https://instagram.com/${igProfile.username}`,
-            username: igProfile.username,
-            displayName: igProfile.name || igProfile.username,
-            avatarUrl: igProfile.profile_picture_url,
-            followersCount: igProfile.followers_count,
-            platformUserId: igProfile.id,
-            igAccountType: 'business',
-            igBusinessAccountId: igAccount.id,
-            accessToken: pageToken,
-            tokenExpiresAt,
-            tokenIssuedAt,
-          })
-          igConnected = true
-          storedAccounts.push({ platformCode: 'instagram', accountId: igAccount.id })
-        } catch (err) {
-          console.warn(`[Instagram] Skipping page ${page.id}: ${err.message}`)
-        }
-      }
-    }
-
-    if (storedAccounts.length === 0) {
-      return {
-        success: false,
-        error: 'No Facebook Pages or Instagram Business accounts could be stored. Please ensure you have a Facebook Page, and optionally an Instagram Business or Creator account linked to it.',
-        errorType: 'oauth',
-      }
-    }
-
     return {
       success: true,
-      accounts: storedAccounts,
-      platformCode: storedAccounts[0]?.platformCode || platformCode,
-      accountId: storedAccounts[0]?.accountId || null,
+      pendingSelection: true,
+      platformCode: 'facebook',
     }
   } catch (error) {
     return { success: false, error: error.message || 'OAuth callback processing failed', errorType: 'system' };
@@ -229,11 +158,20 @@ export async function getAvailablePages(userId) {
   }
 
   const fbPages = await getFacebookPages(userToken.accessToken)
-  if (!fbPages || fbPages.length === 0) {
-    return { pages: [] }
+
+  const allPages = new Map()
+
+  if (fbPages) {
+    for (const page of fbPages) {
+      allPages.set(page.id, {
+        id: page.id,
+        name: page.name,
+        picture: page.picture?.data?.url || null,
+      })
+    }
   }
 
-  // Get already-connected page IDs
+  // Get already-connected active page IDs
   const existingAccounts = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
   const connectedPageIds = new Set(
     existingAccounts
@@ -241,13 +179,8 @@ export async function getAvailablePages(userId) {
       .map(a => a.platformUserId)
   )
 
-  const available = fbPages
+  const available = Array.from(allPages.values())
     .filter(page => !connectedPageIds.has(page.id))
-    .map(page => ({
-      id: page.id,
-      name: page.name,
-      picture: page.picture?.data?.url || null,
-    }))
 
   return { pages: available }
 }
@@ -265,7 +198,7 @@ export async function addPage(userId, platformUserId) {
 
   // Check not already connected
   const existing = await repo.findExistingByUserAndPlatformUserId(userId, fbPlatform.id, platformUserId)
-  if (existing && existing.isActive) {
+  if (existing) {
     throw new NotFoundError('This page is already connected.')
   }
 
@@ -303,11 +236,9 @@ export async function getAvailableInstagramAccounts(userId) {
     throw new NotFoundError('No Facebook user-level token found. Please reconnect your Facebook account.')
   }
 
-  const fbPages = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
-  if (fbPages.length === 0) {
-    return { accounts: [] }
-  }
+  const accessToken = userToken.accessToken
 
+  // Get already-connected IG accounts
   const existingIgAccounts = await repo.findAllByUserAndPlatform(userId, igPlatform.id)
   const connectedIgIds = new Set(
     existingIgAccounts
@@ -315,30 +246,137 @@ export async function getAvailableInstagramAccounts(userId) {
       .map(a => a.platformUserId)
   )
 
-  const available = []
+  const available = new Map()
 
-  for (const page of fbPages) {
+  // 1. Discover via Facebook Pages
+  const allFbPages = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
+
+  for (const page of allFbPages) {
     if (!page.accessToken) continue
     try {
       const igAccount = await getInstagramBusinessAccount(page.platformUserId, page.accessToken)
       if (!igAccount) continue
       if (connectedIgIds.has(igAccount.id)) continue
-
-      available.push({
-        igBusinessAccountId: igAccount.id,
-        igUsername: igAccount.username || null,
-        igName: igAccount.name || null,
-        igProfilePicture: igAccount.profile_picture_url || null,
-        followersCount: igAccount.followers_count || 0,
-        linkedFbPageId: page.platformUserId,
-        linkedFbPageName: page.platformDisplayName || 'Facebook Page',
-      })
+      const key = igAccount.id
+      if (!available.has(key)) {
+        available.set(key, {
+          igBusinessAccountId: igAccount.id,
+          igUsername: igAccount.username || null,
+          igName: igAccount.name || null,
+          igProfilePicture: igAccount.profile_picture_url || null,
+          followersCount: igAccount.followers_count || 0,
+          linkedFbPageId: page.platformUserId,
+          linkedFbPageName: page.platformDisplayName || 'Facebook Page',
+          source: 'page_linked',
+        })
+      }
     } catch {
       // page has no linked Instagram — skip
     }
   }
 
-  return { accounts: available }
+  // Also try from pages discovered via Business Portfolio (not yet connected)
+  try {
+    const businesses = await getUserBusinesses(accessToken)
+    for (const business of businesses) {
+      const ownedPages = await getBusinessOwnedPages(business.id, accessToken)
+      for (const page of ownedPages) {
+        if (!page.access_token) continue
+        try {
+          const igAccount = await getInstagramBusinessAccount(page.id, page.access_token)
+          if (!igAccount) continue
+          if (connectedIgIds.has(igAccount.id)) continue
+          const key = igAccount.id
+          if (!available.has(key)) {
+            available.set(key, {
+              igBusinessAccountId: igAccount.id,
+              igUsername: igAccount.username || null,
+              igName: igAccount.name || null,
+              igProfilePicture: igAccount.profile_picture_url || null,
+              followersCount: igAccount.followers_count || 0,
+              linkedFbPageId: page.id,
+              linkedFbPageName: page.name,
+              source: 'business_page_linked',
+            })
+          }
+        } catch {
+          // skip
+        }
+      }
+      // client pages too
+      const clientPages = await getBusinessClientPages(business.id, accessToken)
+      for (const page of clientPages) {
+        if (!page.access_token) continue
+        try {
+          const igAccount = await getInstagramBusinessAccount(page.id, page.access_token)
+          if (!igAccount) continue
+          if (connectedIgIds.has(igAccount.id)) continue
+          const key = igAccount.id
+          if (!available.has(key)) {
+            available.set(key, {
+              igBusinessAccountId: igAccount.id,
+              igUsername: igAccount.username || null,
+              igName: igAccount.name || null,
+              igProfilePicture: igAccount.profile_picture_url || null,
+              followersCount: igAccount.followers_count || 0,
+              linkedFbPageId: page.id,
+              linkedFbPageName: page.name,
+              source: 'business_page_linked',
+            })
+          }
+        } catch {
+          // skip
+        }
+      }
+    }
+  } catch {
+    // Business Portfolio lookup failed — move on
+  }
+
+  // 2. Discover standalone Instagram accounts via Business Portfolio
+  try {
+    const businesses = await getUserBusinesses(accessToken)
+    for (const business of businesses) {
+      const ownedIg = await getBusinessOwnedInstagramAccounts(business.id, accessToken)
+      for (const ig of ownedIg) {
+        if (connectedIgIds.has(ig.id)) continue
+        const key = ig.id
+        if (!available.has(key)) {
+          available.set(key, {
+            igBusinessAccountId: ig.id,
+            igUsername: ig.username || null,
+            igName: ig.name || null,
+            igProfilePicture: ig.profile_picture_url || null,
+            followersCount: ig.followers_count || 0,
+            linkedFbPageId: null,
+            linkedFbPageName: null,
+            source: 'business_portfolio',
+          })
+        }
+      }
+      const clientIg = await getBusinessClientInstagramAccounts(business.id, accessToken)
+      for (const ig of clientIg) {
+        if (connectedIgIds.has(ig.id)) continue
+        const key = ig.id
+        if (!available.has(key)) {
+          available.set(key, {
+            igBusinessAccountId: ig.id,
+            igUsername: ig.username || null,
+            igName: ig.name || null,
+            igProfilePicture: ig.profile_picture_url || null,
+            followersCount: ig.followers_count || 0,
+            linkedFbPageId: null,
+            linkedFbPageName: null,
+            source: 'business_portfolio_client',
+          })
+        }
+      }
+    }
+  } catch {
+    // Business Portfolio Instagram lookup failed — move on
+  }
+
+  return { accounts: Array.from(available.values()) }
 }
 
 export async function addInstagramAccount(userId, igBusinessAccountId) {
@@ -348,14 +386,18 @@ export async function addInstagramAccount(userId, igBusinessAccountId) {
     throw new NotFoundError('Required platforms not found in database')
   }
 
-  const fbPages = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
-  if (fbPages.length === 0) {
-    throw new NotFoundError('No Facebook Pages found. Please connect a Facebook page first.')
+  const userToken = await repo.findUserLevelToken(userId, fbPlatform.id)
+  if (!userToken || !userToken.accessToken) {
+    throw new NotFoundError('No Facebook user-level token found. Please reconnect your Facebook account.')
   }
 
+  const accessToken = userToken.accessToken
+
+  // Try 1: Find via already-connected FB pages
   let matchedPage = null
   let matchedIgAccount = null
 
+  const fbPages = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
   for (const page of fbPages) {
     if (!page.accessToken) continue
     try {
@@ -370,12 +412,52 @@ export async function addInstagramAccount(userId, igBusinessAccountId) {
     }
   }
 
+  // Try 2: Find via Business Portfolio pages (not yet connected)
+  if (!matchedPage) {
+    try {
+      const businesses = await getUserBusinesses(accessToken)
+      for (const business of businesses) {
+        const ownedPages = await getBusinessOwnedPages(business.id, accessToken)
+        for (const page of ownedPages) {
+          if (!page.access_token) continue
+          try {
+            const igAccount = await getInstagramBusinessAccount(page.id, page.access_token)
+            if (igAccount && igAccount.id === igBusinessAccountId) {
+              matchedPage = { platformUserId: page.id, accessToken: page.access_token, platformDisplayName: page.name, tokenExpiresAt: userToken.tokenExpiresAt }
+              matchedIgAccount = igAccount
+              break
+            }
+          } catch { continue }
+          if (matchedPage) break
+        }
+        if (!matchedPage) {
+          const clientPages = await getBusinessClientPages(business.id, accessToken)
+          for (const page of clientPages) {
+            if (!page.access_token) continue
+            try {
+              const igAccount = await getInstagramBusinessAccount(page.id, page.access_token)
+              if (igAccount && igAccount.id === igBusinessAccountId) {
+                matchedPage = { platformUserId: page.id, accessToken: page.access_token, platformDisplayName: page.name, tokenExpiresAt: userToken.tokenExpiresAt }
+                matchedIgAccount = igAccount
+                break
+              }
+            } catch { continue }
+            if (matchedPage) break
+          }
+        }
+        if (matchedPage) break
+      }
+    } catch {
+      // Business Portfolio lookup failed — move on
+    }
+  }
+
   if (!matchedPage || !matchedIgAccount) {
     throw new NotFoundError('No Facebook Page linked to this Instagram account was found.')
   }
 
   const existing = await repo.findExistingByUserAndPlatformUserId(userId, igPlatform.id, matchedIgAccount.id)
-  if (existing && existing.isActive) {
+  if (existing) {
     throw new NotFoundError('This Instagram account is already connected.')
   }
 
@@ -391,11 +473,357 @@ export async function addInstagramAccount(userId, igBusinessAccountId) {
     igAccountType: 'business',
     igBusinessAccountId: matchedIgAccount.id,
     accessToken: matchedPage.accessToken,
-    tokenExpiresAt: matchedPage.tokenExpiresAt,
+    tokenExpiresAt: matchedPage.tokenExpiresAt || userToken.tokenExpiresAt,
     tokenIssuedAt: new Date(),
   })
 
   return { account }
+}
+
+export async function getDiscoveredAssets(userId) {
+  const fbPlatform = await repo.findPlatformByCode('facebook')
+  const igPlatform = await repo.findPlatformByCode('instagram')
+  if (!fbPlatform) {
+    throw new NotFoundError('Required platforms not found in database')
+  }
+
+  const userToken = await repo.findUserLevelToken(userId, fbPlatform.id)
+  if (!userToken || !userToken.accessToken) {
+    throw new NotFoundError('No Facebook user-level token found. Please reconnect your Facebook account.')
+  }
+
+  const accessToken = userToken.accessToken
+
+  // Discover pages from all sources
+  const allPages = new Map()
+
+  // 1. Direct-role pages from /me/accounts
+  try {
+    const directPages = await getFacebookPages(accessToken)
+    for (const page of directPages) {
+      allPages.set(page.id, {
+        id: page.id,
+        name: page.name,
+        picture: page.picture?.data?.url || null,
+        pageToken: page.access_token,
+        source: 'direct',
+        businessName: null,
+      })
+    }
+  } catch (err) {
+    console.warn(`[Discover] /me/accounts failed: ${err.message}`)
+  }
+
+  // 2. Business Portfolio pages
+  try {
+    const businesses = await getUserBusinesses(accessToken)
+    for (const business of businesses) {
+      const ownedPages = await getBusinessOwnedPages(business.id, accessToken)
+      for (const page of ownedPages) {
+        if (!allPages.has(page.id)) {
+          allPages.set(page.id, {
+            id: page.id,
+            name: page.name,
+            picture: page.picture?.data?.url || null,
+            pageToken: page.access_token,
+            source: 'business',
+            businessName: business.name,
+          })
+        }
+      }
+      const clientPages = await getBusinessClientPages(business.id, accessToken)
+      for (const page of clientPages) {
+        if (!allPages.has(page.id)) {
+          allPages.set(page.id, {
+            id: page.id,
+            name: page.name,
+            picture: page.picture?.data?.url || null,
+            pageToken: page.access_token,
+            source: 'business',
+            businessName: business.name,
+          })
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[Discover] Business pages failed: ${err.message}`)
+  }
+
+  const existingFbAccounts = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
+  const connectedPageIds = new Set(
+    existingFbAccounts
+      .filter(a => a.tokenType === 'page' && a.platformUserId)
+      .map(a => a.platformUserId)
+  )
+
+  const existingIgAccounts = await repo.findAllByUserAndPlatform(userId, igPlatform?.id || '')
+  const connectedIgIds = new Set(
+    existingIgAccounts
+      .filter(a => a.tokenType === 'page' && a.platformUserId)
+      .map(a => a.platformUserId)
+  )
+
+  // Discover Instagram via linked pages (from all page sources)
+  const allInstagram = new Map()
+
+  for (const [, page] of allPages) {
+    if (!page.pageToken) continue
+    try {
+      const igAccount = await getInstagramBusinessAccount(page.id, page.pageToken)
+      if (!igAccount) continue
+      const key = igAccount.id
+      if (!allInstagram.has(key) && !connectedIgIds.has(key)) {
+        allInstagram.set(key, {
+          igBusinessAccountId: igAccount.id,
+          igUsername: igAccount.username || null,
+          igName: igAccount.name || null,
+          igProfilePicture: igAccount.profile_picture_url || null,
+          followersCount: igAccount.followers_count || 0,
+          linkedFbPageId: page.id,
+          linkedFbPageName: page.name,
+        })
+      }
+    } catch {
+      // page has no linked Instagram — skip
+    }
+  }
+
+  // Discover standalone Instagram accounts via Business Portfolio
+  try {
+    const businesses = await getUserBusinesses(accessToken)
+    for (const business of businesses) {
+      const ownedIg = await getBusinessOwnedInstagramAccounts(business.id, accessToken)
+      for (const ig of ownedIg) {
+        if (connectedIgIds.has(ig.id)) continue
+        const key = ig.id
+        if (!allInstagram.has(key)) {
+          allInstagram.set(key, {
+            igBusinessAccountId: ig.id,
+            igUsername: ig.username || null,
+            igName: ig.name || null,
+            igProfilePicture: ig.profile_picture_url || null,
+            followersCount: ig.followers_count || 0,
+            linkedFbPageId: null,
+            linkedFbPageName: null,
+          })
+        }
+      }
+      const clientIg = await getBusinessClientInstagramAccounts(business.id, accessToken)
+      for (const ig of clientIg) {
+        if (connectedIgIds.has(ig.id)) continue
+        const key = ig.id
+        if (!allInstagram.has(key)) {
+          allInstagram.set(key, {
+            igBusinessAccountId: ig.id,
+            igUsername: ig.username || null,
+            igName: ig.name || null,
+            igProfilePicture: ig.profile_picture_url || null,
+            followersCount: ig.followers_count || 0,
+            linkedFbPageId: null,
+            linkedFbPageName: null,
+          })
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[Discover] Business Portfolio Instagram failed: ${err.message}`)
+  }
+
+  // Build response — pages not yet connected
+  const pages = Array.from(allPages.values())
+    .filter(p => !connectedPageIds.has(p.id))
+    .map(p => ({
+      id: p.id,
+      name: p.name,
+      picture: p.picture,
+      source: p.source,
+      businessName: p.businessName,
+    }))
+
+  return {
+    assets: {
+      pages,
+      instagramAccounts: Array.from(allInstagram.values()),
+    },
+  }
+}
+
+export async function connectSelectedAssets(userId, pageIds, igBusinessAccountIds) {
+  const fbPlatform = await repo.findPlatformByCode('facebook')
+  const igPlatform = await repo.findPlatformByCode('instagram')
+  if (!fbPlatform) {
+    throw new NotFoundError('Required platforms not found in database')
+  }
+
+  const userToken = await repo.findUserLevelToken(userId, fbPlatform.id)
+  if (!userToken || !userToken.accessToken) {
+    throw new NotFoundError('No Facebook user-level token found. Please reconnect your Facebook account.')
+  }
+
+  const storedAccounts = []
+
+  // Connect selected pages
+  for (const pageId of pageIds) {
+    const existing = await repo.findExistingByUserAndPlatformUserId(userId, fbPlatform.id, pageId)
+    if (existing) continue
+
+    let pageToken
+    let pageDetails
+
+    try {
+      pageToken = await getPageAccessToken(pageId, userToken.accessToken)
+      if (!pageToken) continue
+      pageDetails = await getPageDetails(pageId, pageToken)
+    } catch {
+      continue
+    }
+
+    const account = await upsertPageAccount(userId, fbPlatform, {
+      profileUrl: `https://facebook.com/${pageId}`,
+      username: pageDetails.username || null,
+      displayName: pageDetails.name || 'Facebook Page',
+      avatarUrl: pageDetails.picture?.data?.url || null,
+      followersCount: pageDetails.followers_count || 0,
+      platformUserId: pageId,
+      accessToken: pageToken,
+      tokenExpiresAt: userToken.tokenExpiresAt,
+      tokenIssuedAt: new Date(),
+    })
+    storedAccounts.push(account)
+  }
+
+  // Connect selected Instagram accounts
+  if (igPlatform) {
+    for (const igId of igBusinessAccountIds) {
+      const existing = await repo.findExistingByUserAndPlatformUserId(userId, igPlatform.id, igId)
+      if (existing) continue
+
+      // Try 1: Find which FB page has this Instagram linked (connected + newly stored)
+      let matchedPage = null
+      let matchedIgAccount = null
+
+      const allFbPages = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
+      for (const page of [...allFbPages, ...storedAccounts]) {
+        if (!page.accessToken) continue
+        try {
+          const igAcct = await getInstagramBusinessAccount(page.platformUserId || page.id, page.accessToken)
+          if (igAcct && igAcct.id === igId) {
+            matchedPage = page
+            matchedIgAccount = igAcct
+            break
+          }
+        } catch {
+          continue
+        }
+      }
+
+      // Try 2: Fresh token from pages being connected
+      if (!matchedPage) {
+        for (const pageId of pageIds) {
+          try {
+            const pageToken = await getPageAccessToken(pageId, userToken.accessToken)
+            if (!pageToken) continue
+            const igAcct = await getInstagramBusinessAccount(pageId, pageToken)
+            if (igAcct && igAcct.id === igId) {
+              matchedPage = { id: pageId, accessToken: pageToken, platformDisplayName: 'Facebook Page' }
+              matchedIgAccount = igAcct
+              break
+            }
+          } catch {
+            continue
+          }
+        }
+      }
+
+      // Try 3: Business Portfolio pages
+      if (!matchedPage) {
+        try {
+          const businesses = await getUserBusinesses(userToken.accessToken)
+          for (const business of businesses) {
+            const ownedPages = await getBusinessOwnedPages(business.id, userToken.accessToken)
+            for (const page of ownedPages) {
+              if (!page.access_token) continue
+              try {
+                const igAcct = await getInstagramBusinessAccount(page.id, page.access_token)
+                if (igAcct && igAcct.id === igId) {
+                  matchedPage = { id: page.id, accessToken: page.access_token, platformDisplayName: page.name }
+                  matchedIgAccount = igAcct
+                  break
+                }
+              } catch { continue }
+              if (matchedPage) break
+            }
+            if (!matchedPage) {
+              const clientPages = await getBusinessClientPages(business.id, userToken.accessToken)
+              for (const page of clientPages) {
+                if (!page.access_token) continue
+                try {
+                  const igAcct = await getInstagramBusinessAccount(page.id, page.access_token)
+                  if (igAcct && igAcct.id === igId) {
+                    matchedPage = { id: page.id, accessToken: page.access_token, platformDisplayName: page.name }
+                    matchedIgAccount = igAcct
+                    break
+                  }
+                } catch { continue }
+                if (matchedPage) break
+              }
+            }
+            if (matchedPage) break
+          }
+        } catch {
+          // Business Portfolio lookup failed
+        }
+      }
+
+      // Try 4: Standalone Instagram account in Business Portfolio (no linked page)
+      if (!matchedPage) {
+        try {
+          const igProfile = await getInstagramProfile(igId, userToken.accessToken)
+          if (igProfile && igProfile.id) {
+            const account = await upsertPageAccount(userId, igPlatform, {
+              profileUrl: `https://instagram.com/${igProfile.username}`,
+              username: igProfile.username,
+              displayName: igProfile.name || igProfile.username,
+              avatarUrl: igProfile.profile_picture_url,
+              followersCount: igProfile.followers_count,
+              platformUserId: igProfile.id,
+              igAccountType: 'business',
+              igBusinessAccountId: igProfile.id,
+              accessToken: userToken.accessToken,
+              tokenExpiresAt: userToken.tokenExpiresAt,
+              tokenIssuedAt: new Date(),
+            })
+            storedAccounts.push(account)
+          }
+        } catch {
+          // Standalone IG not found — skip
+        }
+        continue
+      }
+
+      try {
+        const igProfile = await getInstagramProfile(matchedIgAccount.id, matchedPage.accessToken)
+        const account = await upsertPageAccount(userId, igPlatform, {
+          profileUrl: `https://instagram.com/${igProfile.username}`,
+          username: igProfile.username,
+          displayName: igProfile.name || igProfile.username,
+          avatarUrl: igProfile.profile_picture_url,
+          followersCount: igProfile.followers_count,
+          platformUserId: igProfile.id,
+          igAccountType: 'business',
+          igBusinessAccountId: matchedIgAccount.id,
+          accessToken: matchedPage.accessToken,
+          tokenExpiresAt: userToken.tokenExpiresAt,
+          tokenIssuedAt: new Date(),
+        })
+        storedAccounts.push(account)
+      } catch {
+        continue
+      }
+    }
+  }
+
+  return { accounts: storedAccounts }
 }
 
 export async function getConnectionStatus(userId, platformCode = 'instagram') {
