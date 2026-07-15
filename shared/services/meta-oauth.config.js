@@ -1,6 +1,8 @@
 const META_APP_ID = process.env.META_APP_ID || ''
 const META_APP_SECRET = process.env.META_APP_SECRET || ''
 const META_REDIRECT_URI = process.env.META_REDIRECT_URI || 'http://localhost:3001/api/v1/publisher/accounts/oauth/callback'
+const META_AD_ACCOUNT_ID = process.env.META_AD_ACCOUNT_ID || ''
+const META_SYSTEM_USER_TOKEN = process.env.META_SYSTEM_USER_TOKEN || ''
 const GRAPH_VERSION = 'v22.0'
 
 const SCOPES = [
@@ -11,6 +13,7 @@ const SCOPES = [
   'pages_manage_metadata',
   'instagram_content_publish',
   'business_management',
+  'ads_management',
 ]
 
 const AUTH_URL = `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth`
@@ -21,6 +24,8 @@ export const META_CONFIG = {
   appId: META_APP_ID,
   appSecret: META_APP_SECRET,
   redirectUri: META_REDIRECT_URI,
+  adAccountId: META_AD_ACCOUNT_ID,
+  systemUserToken: META_SYSTEM_USER_TOKEN,
   graphVersion: GRAPH_VERSION,
   scopes: SCOPES,
   authUrl: AUTH_URL,
@@ -30,4 +35,8 @@ export const META_CONFIG = {
 
 export function isMetaConfigured() {
   return !!(META_APP_ID && META_APP_SECRET)
+}
+
+export function isAdsConfigured() {
+  return !!(META_AD_ACCOUNT_ID && META_SYSTEM_USER_TOKEN)
 }

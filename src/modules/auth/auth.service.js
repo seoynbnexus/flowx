@@ -145,14 +145,16 @@ export async function register(data, ipAddress, userAgent) {
     const role = data.role || ROLE_CODES.PUBLISHER;
     await repo.assignUserRole(userId, role);
 
-    await query(
-      'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
-      [uuidToBuffer(userId), 10000]
-    );
-    await repo.createAuditLog(
-      generateUuid(), userId, 'wallet', userId,
-      'wallet.signup_bonus', null, { coins: 10000 }
-    );
+    if (role === ROLE_CODES.CLIENT) {
+      await query(
+        'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
+        [uuidToBuffer(userId), 10000]
+      );
+      await repo.createAuditLog(
+        generateUuid(), userId, 'wallet', userId,
+        'wallet.signup_bonus', null, { coins: 10000 }
+      );
+    }
 
     await repo.createAuditLog(generateUuid(), userId, 'user', userId, 'user.registered', null, { email, role });
 
@@ -369,12 +371,15 @@ export async function googleLogin(accessToken, ipAddress, userAgent, role) {
         [uuidToBuffer(userId)]
       );
     }
-    await repo.assignUserRole(userId, role || ROLE_CODES.CLIENT);
+    const assignedRole = role || ROLE_CODES.CLIENT;
+    await repo.assignUserRole(userId, assignedRole);
 
-    await query(
-      'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
-      [uuidToBuffer(userId), 10000]
-    );
+    if (assignedRole === ROLE_CODES.CLIENT) {
+      await query(
+        'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
+        [uuidToBuffer(userId), 10000]
+      );
+    }
 
     user = await repo.findUserById(userId);
 

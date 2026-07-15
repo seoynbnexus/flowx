@@ -3,6 +3,7 @@ import * as adCategoryRepo from '../ad-categories/ad-category.repository.js';
 import * as publisherRepo from '../publisher-platforms/publisher.repository.js';
 import * as identityRepo from '../identity-documents/identity.repository.js';
 import * as aiRepo from '../ai/ai.repository.js';
+import * as subService from '../subscriptions/subscription.service.js';
 import { query } from '../../../shared/database/connection.js';
 import {
   IDENTITY_STATUS,
@@ -103,14 +104,30 @@ export async function getFullConfig(userId) {
   const userCategoryRows = await adCategoryRepo.findUserCategories(userId);
   const platformAccounts = await publisherRepo.listAccountsByUser(userId);
   const identityDocuments = await identityRepo.findByUserId(userId);
-  const [aiBalance, aiHistoryResult, aiBlocked] = await Promise.all([
-    aiRepo.findUserWalletCoins(userId),
+
+  const isPublisher = roles.includes('publisher')
+  const coinService = await import('../../../shared/services/coin.service.js')
+  const coinInfo = isPublisher ? null : await coinService.getAvailable(userId).catch(() => null)
+  const [aiHistoryResult, aiBlocked] = await Promise.all([
     aiRepo.findContentByUserId(userId, { page: 1, limit: 5, type: undefined }),
     aiRepo.findBlockedStatus(userId),
   ]);
+  let subscription = null
+  if (!isPublisher) {
+    const [entitlements, allUsage] = await Promise.all([
+      subService.getUserEntitlements(userId),
+      subService.getAllUsage(userId),
+    ])
+    subscription = {
+      plan: entitlements.plan,
+      features: entitlements.features,
+      usage: allUsage,
+    }
+  }
 
   return {
     ...publicConfig,
+    subscription,
     user: {
       id: user.id,
       email: user.email,
@@ -133,7 +150,13 @@ export async function getFullConfig(userId) {
     platformAccounts,
     identityDocuments,
     ai: {
-      balance: aiBalance,
+      balance: coinInfo ? coinInfo.total : 0,
+      monthlyRemaining: coinInfo ? coinInfo.monthlyRemaining : null,
+      topupBalance: coinInfo ? coinInfo.topupBalance : 0,
+      monthlyLimit: coinInfo ? coinInfo.limit : null,
+      monthlyUsed: coinInfo ? coinInfo.used : 0,
+      periodStart: coinInfo ? coinInfo.periodStart : null,
+      periodEnd: coinInfo ? coinInfo.periodEnd : null,
       history: aiHistoryResult.items,
       isBlocked: aiBlocked,
     },

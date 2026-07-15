@@ -21,15 +21,6 @@ export async function generateContent(userId, prompt, type, tone, language, targ
     throw new ForbiddenError('AI content generation has been blocked for your account. Contact support.');
   }
 
-  const balance = await repo.findUserWalletCoins(userId);
-  if (balance < markupCoins) {
-    throw new ValidationError(
-      `Insufficient coins. Minimum ${markupCoins} coins required. Current balance: ${balance}.`,
-      null,
-      'INSUFFICIENT_COINS'
-    );
-  }
-
   const moderation = await moderatePrompt(prompt, userId);
   await repo.logUsage(userId, prompt, type, !moderation.allowed, moderation.reason, 0, 0);
 
@@ -50,6 +41,9 @@ export async function generateContent(userId, prompt, type, tone, language, targ
 
     throw new ValidationError(moderation.reason || 'Prompt violates content policy', null, 'CONTENT_POLICY_VIOLATION');
   }
+
+  const subService = await import('../subscriptions/subscription.service.js');
+  await subService.canPerform(userId, 'ai_content');
 
   const llm = await getLLM();
   const systemPrompt = getSystemPrompt();
@@ -75,21 +69,13 @@ export async function generateContent(userId, prompt, type, tone, language, targ
   }
 
   const cost = calculateCost(totalTokens, markupCoins);
-  if (balance < cost) {
-    throw new ValidationError(
-      `Insufficient coins. Need ${cost} coins for this generation. Current balance: ${balance}.`,
-      null,
-      'INSUFFICIENT_COINS'
-    );
-  }
 
-  await repo.deductCoins(userId, cost);
-  const transactionId = generateUuid();
-  await repo.createTransaction(transactionId, userId, `AI ${type} generation`, cost, 'debit', 'ai_generation', null);
+  const coinService = await import('../../../shared/services/coin.service.js');
+  await coinService.spend(userId, cost, 'ai_generation', null, `AI ${type} generation`);
 
   await repo.logUsage(userId, prompt, type, false, null, totalTokens, cost);
 
-  const newBalance = balance - cost;
+  const available = await coinService.getAvailable(userId);
   const providerInfo = getProviderInfo();
 
   return {
@@ -104,7 +90,7 @@ export async function generateContent(userId, prompt, type, tone, language, targ
       completionTokens: tokenUsage.output_tokens || 0,
     },
     cost,
-    balanceRemaining: newBalance,
+    balanceRemaining: available.total,
   };
 }
 
@@ -131,12 +117,18 @@ export async function deleteContent(id, userId) {
 }
 
 export async function getUserWallet(userId, page = 1, limit = 20) {
-  const [balance, transactions] = await Promise.all([
-    repo.findUserWalletCoins(userId),
+  const [coinInfo, transactions] = await Promise.all([
+    import('../../../shared/services/coin.service.js').then(m => m.getAvailable(userId)),
     repo.findTransactions(userId, { page, limit }),
   ]);
   return {
-    balance,
+    balance: coinInfo.total,
+    monthlyRemaining: coinInfo.monthlyRemaining,
+    topupBalance: coinInfo.topupBalance,
+    monthlyLimit: coinInfo.limit,
+    monthlyUsed: coinInfo.used,
+    periodStart: coinInfo.periodStart,
+    periodEnd: coinInfo.periodEnd,
     transactions: transactions.map(t => ({
       id: bufferToUuid(t.id),
       label: t.label,
@@ -184,30 +176,24 @@ export async function generateImage(userId, prompt, size = '1024x1024', style) {
 
   await checkAbuseAndBlock(userId, prompt, 'image');
 
-  const balance = await repo.findUserWalletCoins(userId);
-  if (balance < cost) {
-    throw new ValidationError(
-      `Insufficient coins. Minimum ${cost} coins required. Current balance: ${balance}.`,
-      null,
-      'INSUFFICIENT_COINS'
-    );
-  }
+  const subService = await import('../subscriptions/subscription.service.js');
+  await subService.canPerform(userId, 'ai_image');
+
+  const coinService = await import('../../../shared/services/coin.service.js');
+  await coinService.spend(userId, cost, 'ai_image', null, 'AI image generation');
 
   const provider = await getImageLLM();
   const imageUrl = await provider.generate(prompt, { size, style });
 
-  await repo.deductCoins(userId, cost);
-  const transactionId = generateUuid();
-  await repo.createTransaction(transactionId, userId, 'AI image generation', cost, 'debit', 'ai_generation', null);
   await repo.logUsage(userId, prompt, 'image', false, null, 0, cost);
 
-  const newBalance = balance - cost;
+  const available = await coinService.getAvailable(userId);
   const providerInfo = provider.getProviderInfo();
 
   return {
     imageUrl,
     cost,
-    balanceRemaining: newBalance,
+    balanceRemaining: available.total,
     metadata: {
       ...providerInfo,
       size,

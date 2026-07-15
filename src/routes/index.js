@@ -15,6 +15,11 @@ import configRoutes from '../modules/config/config.routes.js';
 import aiRoutes from '../modules/ai/ai.routes.js';
 import adminAiRoutes from '../modules/ai/admin.routes.js';
 import adminAnalyticsRoutes from '../modules/analytics/admin.routes.js';
+import campaignRoutes from '../modules/campaigns/campaign.routes.js';
+import adminCampaignRoutes from '../modules/campaigns/admin.routes.js';
+import publisherCampaignRoutes from '../modules/campaigns/publisher.routes.js';
+import subscriptionRoutes from '../modules/subscriptions/subscription.routes.js';
+import adminSubscriptionRoutes from '../modules/subscriptions/admin.routes.js';
 
 const router = Router();
 
@@ -33,6 +38,11 @@ router.use('/admin/identity-document-types', identityDocumentTypeRoutes);
 router.use('/ai', aiRoutes);
 router.use('/admin/ai', adminAiRoutes);
 router.use('/admin/analytics', adminAnalyticsRoutes);
+router.use('/campaigns', campaignRoutes);
+router.use('/admin/campaigns', adminCampaignRoutes);
+router.use('/publisher', publisherCampaignRoutes);
+router.use('/subscriptions', subscriptionRoutes);
+router.use('/admin/subscriptions', adminSubscriptionRoutes);
 router.use('/docs', swaggerMiddleware);
 
 router.get('/health', (_req, res) => {

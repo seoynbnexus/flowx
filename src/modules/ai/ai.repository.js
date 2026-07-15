@@ -110,20 +110,12 @@ export async function countAbuseViolations(userId, windowHours) {
   return row?.count || 0;
 }
 
-const INITIAL_COINS = 10000;
-
 export async function findUserWalletCoins(userId) {
   const row = await queryOne(
     'SELECT coins FROM user_wallets WHERE user_id = ?',
     [uuidToBuffer(userId)]
   );
-  if (row) return row.coins;
-
-  await query(
-    'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
-    [uuidToBuffer(userId), INITIAL_COINS]
-  );
-  return INITIAL_COINS;
+  return row ? row.coins : 0;
 }
 
 export async function addCoins(userId, amount) {
@@ -183,6 +175,34 @@ export async function getUsageStats(userId, since) {
     [uuidToBuffer(userId), since]
   );
   return rows;
+}
+
+export async function getAiUsageSummary(userId, since) {
+  const rows = await query(
+    `SELECT COUNT(*) as total_generations,
+            SUM(coins_spent) as total_coins_spent,
+            SUM(tokens_used) as total_tokens_used,
+            SUM(was_blocked) as total_blocked
+     FROM ai_usage_log
+     WHERE user_id = ? AND created_at > ?`,
+    [uuidToBuffer(userId), since]
+  )
+  return rows[0] || { total_generations: 0, total_coins_spent: 0, total_tokens_used: 0, total_blocked: 0 }
+}
+
+export async function getAiUsageByType(userId, since) {
+  const rows = await query(
+    `SELECT content_type, COUNT(*) as count, SUM(coins_spent) as coins_spent
+     FROM ai_usage_log
+     WHERE user_id = ? AND created_at > ?
+     GROUP BY content_type`,
+    [uuidToBuffer(userId), since]
+  )
+  return rows.map(r => ({
+    type: r.content_type || 'unknown',
+    count: r.count,
+    coins_spent: r.coins_spent || 0,
+  }))
 }
 
 function mapImageRow(row) {
