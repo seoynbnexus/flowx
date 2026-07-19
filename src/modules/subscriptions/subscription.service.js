@@ -131,7 +131,8 @@ export async function getUserEntitlements(userId) {
 
   let subscription = await repo.findUserSubscription(userId)
 
-  if (!subscription || subscription.status === 'canceled') {
+  const isExpired = subscription?.currentPeriodEnd && new Date(subscription.currentPeriodEnd) < new Date()
+  if (!subscription || subscription.status === 'canceled' || isExpired) {
     const freePlan = await repo.findPlanBySlug('free')
     if (!freePlan) return { plan: null, features: {} }
     subscription = await repo.upsertUserSubscription(userId, freePlan.id, {

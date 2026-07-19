@@ -20,6 +20,8 @@ import adminCampaignRoutes from '../modules/campaigns/admin.routes.js';
 import publisherCampaignRoutes from '../modules/campaigns/publisher.routes.js';
 import subscriptionRoutes from '../modules/subscriptions/subscription.routes.js';
 import adminSubscriptionRoutes from '../modules/subscriptions/admin.routes.js';
+import paymentRoutes from '../modules/payments/payment.routes.js';
+import adminPaymentRoutes from '../modules/payments/admin.routes.js';
 
 const router = Router();
 
@@ -43,6 +45,8 @@ router.use('/admin/campaigns', adminCampaignRoutes);
 router.use('/publisher', publisherCampaignRoutes);
 router.use('/subscriptions', subscriptionRoutes);
 router.use('/admin/subscriptions', adminSubscriptionRoutes);
+router.use('/payments', paymentRoutes);
+router.use('/admin/payments', adminPaymentRoutes);
 router.use('/docs', swaggerMiddleware);
 
 router.get('/health', (_req, res) => {

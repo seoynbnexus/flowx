@@ -48,7 +48,7 @@ export async function getMissingMandatory(userId) {
   if (mandatory.length === 0) return [];
 
   const userDocs = await repo.findByUserId(userId);
-  const uploadedTypes = new Set(userDocs.map(d => d.documentType));
+  const uploadedTypes = new Set(userDocs.map(d => d.documentType))
 
   return mandatory.filter(t => !uploadedTypes.has(t.code));
 }

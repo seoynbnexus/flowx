@@ -32,7 +32,7 @@ export async function getUsage(userId, featureKey, periodStart, periodEnd) {
        AND billing_period_end = ?`,
     [uuidToBuffer(userId), featureKey, periodStart, periodEnd]
   )
-  return rows[0] ? Number(rows[0].total_used) : 0
+  return rows[0] ? Math.max(0, Number(rows[0].total_used)) : 0
 }
 
 export async function hasConsumedResource(userId, featureKey, resourceType, resourceId) {
@@ -44,6 +44,21 @@ export async function hasConsumedResource(userId, featureKey, resourceType, reso
        AND resource_type = ?
        AND resource_id = ?
        AND transaction_type = 'consume'
+     LIMIT 1`,
+    [uuidToBuffer(userId), featureKey, resourceType, resourceId]
+  )
+  return !!row
+}
+
+export async function hasRefundedResource(userId, featureKey, resourceType, resourceId) {
+  if (!resourceId) return false
+  const row = await queryOne(
+    `SELECT id FROM usage_ledger
+     WHERE user_id = ?
+       AND feature_key = ?
+       AND resource_type = ?
+       AND resource_id = ?
+       AND transaction_type = 'refund'
      LIMIT 1`,
     [uuidToBuffer(userId), featureKey, resourceType, resourceId]
   )
@@ -66,6 +81,11 @@ export async function consume(userId, featureKey, resourceType, resourceId, note
 }
 
 export async function refund(userId, featureKey, resourceType, resourceId, notes, periodStart, periodEnd, subscriptionId, quantity = 1) {
+  if (resourceId && quantity === 1) {
+    const already = await hasRefundedResource(userId, featureKey, resourceType, resourceId)
+    if (already) return
+  }
+
   const id = generateUuid()
   await query(
     `INSERT INTO usage_ledger (id, user_id, subscription_id, feature_key, resource_type, resource_id, transaction_type, quantity, billing_period_start, billing_period_end, notes)

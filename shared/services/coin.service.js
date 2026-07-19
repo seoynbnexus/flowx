@@ -47,7 +47,10 @@ export async function spend(userId, amount, resourceType, resourceId, notes) {
 
   if (remaining > 0) {
     await aiRepo.deductCoins(userId, remaining)
-    await aiRepo.createTransaction(generateUuid(), userId, notes || 'Coin spend', remaining, 'debit', resourceType || 'spend', resourceId || null)
+  }
+
+  if (amount > 0) {
+    await aiRepo.createTransaction(generateUuid(), userId, notes || 'Coin spend', amount, 'debit', resourceType || 'spend', resourceId || null)
   }
 }
 

@@ -92,9 +92,10 @@ export async function listAll({ status, page, limit }) {
   );
 
   const rows = await query(
-    `SELECT d.*, u.email as user_email
+    `    SELECT d.*, u.email as user_email, up.first_name as user_first_name, up.last_name as user_last_name
      FROM identity_documents d
      JOIN users u ON u.id = d.user_id
+     LEFT JOIN user_profiles up ON up.user_id = u.id
      ${whereClause}
      ORDER BY d.created_at DESC
      LIMIT ? OFFSET ?`,
@@ -105,6 +106,8 @@ export async function listAll({ status, page, limit }) {
     documents: rows.map(r => ({
       ...mapRow(r),
       userEmail: r.user_email,
+      userFirstName: r.user_first_name,
+      userLastName: r.user_last_name,
     })),
     total: countRow.total,
     page,

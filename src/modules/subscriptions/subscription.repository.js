@@ -11,6 +11,7 @@ function mapPlan(row) {
     monthlyPrice: row.monthly_price,
     yearlyPrice: row.yearly_price,
     currency: row.currency,
+    taxRate: row.tax_rate ? Number(row.tax_rate) : 18,
     trialDays: row.trial_days,
     displayOrder: row.display_order,
     isActive: row.is_active,
