@@ -49,3 +49,12 @@ export async function setMyCategories(req, res, next) {
     next(error)
   }
 }
+
+export async function completeRequest(req, res, next) {
+  try {
+    const request = await service.completePublisherRequest(req.params.requestId)
+    return sendSuccess(res, request, 'Request completed, coins paid out')
+  } catch (error) {
+    next(error)
+  }
+}

@@ -9,6 +9,7 @@ const router = Router()
 router.get('/requests', authenticate, requireRole('publisher', 'super_admin'), validate(campaignQuerySchema, 'query'), publisherController.listRequests)
 router.post('/requests/:requestId/accept', authenticate, requireRole('publisher', 'super_admin'), publisherController.acceptRequest)
 router.post('/requests/:requestId/reject', authenticate, requireRole('publisher', 'super_admin'), publisherController.rejectRequest)
+router.post('/requests/:requestId/complete', authenticate, requireRole('publisher', 'super_admin'), publisherController.completeRequest)
 router.get('/categories', authenticate, requireRole('publisher', 'super_admin'), publisherController.getMyCategories)
 router.put('/categories', authenticate, requireRole('publisher', 'super_admin'), publisherController.setMyCategories)
 

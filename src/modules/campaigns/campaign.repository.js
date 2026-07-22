@@ -1,5 +1,6 @@
 import { query, queryOne } from '../../../shared/database/connection.js'
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js'
+import { decrypt } from '../../../shared/utils/crypto.utils.js'
 
 function mapCampaignRow(row) {
   if (!row) return null
@@ -15,6 +16,8 @@ function mapCampaignRow(row) {
     coinsPerPublisher: row.coins_per_publisher ? Number(row.coins_per_publisher) : null,
     escrowAmount: Number(row.escrow_amount),
     coinsEscrowedAt: row.coins_escrowed_at,
+    metaStatus: row.meta_status || 'pending',
+    metaError: row.meta_error || null,
     clientConfirmed: !!row.client_confirmed,
     clientConfirmedAt: row.client_confirmed_at,
     adminNotes: row.admin_notes,
@@ -51,6 +54,7 @@ function mapMetaSettingsRow(row) {
     optimizationGoal: row.optimization_goal,
     budgetType: row.budget_type,
     budgetAmount: row.budget_amount ? Number(row.budget_amount) : null,
+    billingEvent: row.billing_event || null,
     targeting: typeof row.targeting === 'string' ? JSON.parse(row.targeting) : row.targeting || {},
     platformPlacement: typeof row.platform_placement === 'string' ? JSON.parse(row.platform_placement) : row.platform_placement || {},
   }
@@ -219,6 +223,8 @@ export async function updateCampaign(id, data) {
   if (data.coinsEscrowedAt !== undefined) { fields.push('coins_escrowed_at = ?'); params.push(data.coinsEscrowedAt) }
   if (data.clientConfirmed !== undefined) { fields.push('client_confirmed = ?'); params.push(data.clientConfirmed ? 1 : 0) }
   if (data.clientConfirmedAt !== undefined) { fields.push('client_confirmed_at = ?'); params.push(data.clientConfirmedAt) }
+  if (data.metaStatus !== undefined) { fields.push('meta_status = ?'); params.push(data.metaStatus) }
+  if (data.metaError !== undefined) { fields.push('meta_error = ?'); params.push(data.metaError) }
   if (data.adminNotes !== undefined) { fields.push('admin_notes = ?'); params.push(data.adminNotes) }
   if (data.reviewedBy !== undefined) { fields.push('reviewed_by = ?'); params.push(uuidToBuffer(data.reviewedBy)) }
   if (data.reviewedAt !== undefined) { fields.push('reviewed_at = ?'); params.push(data.reviewedAt) }
@@ -264,12 +270,12 @@ export async function findCreativeByCampaignId(campaignId) {
 
 export async function createMetaSettings(id, campaignId, data) {
   await query(
-    `INSERT INTO campaign_meta_settings (id, campaign_id, objective, ad_account_id, bid_strategy, optimization_goal, budget_type, budget_amount, targeting, platform_placement)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO campaign_meta_settings (id, campaign_id, objective, ad_account_id, bid_strategy, optimization_goal, budget_type, budget_amount, billing_event, targeting, platform_placement)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE objective = VALUES(objective), ad_account_id = VALUES(ad_account_id),
        bid_strategy = VALUES(bid_strategy), optimization_goal = VALUES(optimization_goal),
        budget_type = VALUES(budget_type), budget_amount = VALUES(budget_amount),
-       targeting = VALUES(targeting), platform_placement = VALUES(platform_placement)`,
+       billing_event = VALUES(billing_event), targeting = VALUES(targeting), platform_placement = VALUES(platform_placement)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(campaignId),
@@ -279,6 +285,7 @@ export async function createMetaSettings(id, campaignId, data) {
       data.optimizationGoal || null,
       data.budgetType || null,
       data.budgetAmount || null,
+      data.billingEvent || null,
       JSON.stringify(data.targeting || {}),
       JSON.stringify(data.platformPlacement || {}),
     ]
@@ -543,6 +550,7 @@ function mapPlatformAccountRow(row) {
     platformDisplayName: row.platform_display_name,
     verificationStatus: row.verification_status,
     platformCode: row.platform_code,
+    accessToken: row.access_token ? decrypt(row.access_token) : null,
   }
 }
 
@@ -553,6 +561,7 @@ export async function findVerifiedFacebookPage(userId) {
      JOIN platforms p ON p.id = upa.platform_id
      WHERE upa.user_id = ?
        AND p.code = 'facebook'
+       AND upa.token_type = 'page'
        AND upa.verification_status = 'verified'
      LIMIT 1`,
     [uuidToBuffer(userId)]
@@ -585,4 +594,12 @@ export async function updatePublisherRequestPublished(id) {
 
 export async function updateCampaignStatus(id, status) {
   await query('UPDATE campaigns SET status = ? WHERE id = ?', [status, uuidToBuffer(id)])
+}
+
+export async function deleteMetaObjectsByCampaignId(campaignId) {
+  await query('DELETE FROM campaign_meta_objects WHERE campaign_id = ?', [uuidToBuffer(campaignId)])
+}
+
+export async function deleteMetaObjectById(id) {
+  await query('DELETE FROM campaign_meta_objects WHERE id = ?', [uuidToBuffer(id)])
 }

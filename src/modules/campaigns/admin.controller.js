@@ -40,3 +40,12 @@ export async function rejectCampaign(req, res, next) {
     next(error)
   }
 }
+
+export async function retryCampaignMeta(req, res, next) {
+  try {
+    const result = await service.retryCampaignMeta(req.params.id)
+    return sendSuccess(res, result, result.success ? 'Meta ads created successfully' : 'Meta ad creation failed')
+  } catch (error) {
+    next(error)
+  }
+}

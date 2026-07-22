@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import * as controller from './campaign.controller.js'
+import * as searchController from './search.controller.js'
 import { authenticate, requireRole } from '../../../shared/middleware/auth.middleware.js'
 import { validate } from '../../../shared/middleware/validate.middleware.js'
 import {
@@ -12,6 +13,7 @@ import {
 
 const router = Router()
 
+router.get('/meta-search', authenticate, requireRole('client', 'admin', 'super_admin'), searchController.metaSearch)
 router.post('/', authenticate, requireRole('client', 'super_admin'), validate(createCampaignSchema), controller.createCampaign)
 router.get('/', authenticate, requireRole('client', 'super_admin'), validate(campaignQuerySchema, 'query'), controller.listCampaigns)
 router.get('/:id', authenticate, requireRole('client', 'super_admin'), controller.getCampaign)

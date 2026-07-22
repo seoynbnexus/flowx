@@ -27,6 +27,16 @@ export const creativeSchema = z.object({
   callToAction: z.string().max(100).optional().nullable(),
 })
 
+const geoLocationFields = {
+  countries: z.array(z.string()).optional(),
+  regions: z.array(z.object({ key: z.string() })).optional(),
+  cities: z.array(z.object({ key: z.string() })).optional(),
+  zips: z.array(z.object({ key: z.string() })).optional(),
+  location_types: z.array(z.string()).optional(),
+}
+
+const targetingMetaItem = z.object({ id: z.string(), name: z.string() })
+
 export const metaSettingsSchema = z.object({
   objective: z.string().min(1, 'Objective is required'),
   adAccountId: z.string().optional().nullable(),
@@ -34,8 +44,25 @@ export const metaSettingsSchema = z.object({
   optimizationGoal: z.string().optional().nullable(),
   budgetType: z.nativeEnum(BUDGET_TYPES).optional().nullable(),
   budgetAmount: z.coerce.number().positive().optional().nullable(),
-  targeting: z.record(z.unknown()).optional().default({}),
-  platformPlacement: z.record(z.unknown()).optional().default({}),
+  billingEvent: z.string().optional().nullable(),
+  targeting: z.object({
+    age_min: z.number().int().min(13).max(65).optional(),
+    age_max: z.number().int().min(13).max(65).optional(),
+    genders: z.array(z.number().int().min(1).max(2)).optional(),
+    geo_locations: z.object(geoLocationFields).optional(),
+    excluded_geo_locations: z.object(geoLocationFields).optional(),
+    interests: z.array(targetingMetaItem).optional(),
+    behaviors: z.array(targetingMetaItem).optional(),
+    languages: z.array(targetingMetaItem).optional(),
+    device_platforms: z.array(z.enum(['mobile', 'desktop'])).optional(),
+  }).optional().default({}),
+  platformPlacement: z.object({
+    publisher_platforms: z.array(z.string()).optional(),
+    facebook_positions: z.array(z.enum(['feed', 'video_feeds', 'story', 'marketplace', 'reels', 'in_stream', 'search'])).optional(),
+    instagram_positions: z.array(z.enum(['stream', 'story', 'explore', 'reels', 'search'])).optional(),
+    messenger_positions: z.array(z.enum(['messenger_home', 'story'])).optional(),
+    audience_network_positions: z.array(z.enum(['native', 'banner', 'interstitial', 'rewarded_video'])).optional(),
+  }).optional().default({}),
 })
 
 export const campaignQuerySchema = z.object({
