@@ -87,4 +87,7 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-start();
+const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isDirectRun) start();
+
+export default app;

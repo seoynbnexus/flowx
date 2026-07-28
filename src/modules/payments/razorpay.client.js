@@ -1,5 +1,6 @@
 import Razorpay from 'razorpay'
 import crypto from 'crypto'
+import { wrapSdkCall } from '../../../shared/utils/api-logger.js'
 
 let instance = null
 
@@ -18,19 +19,23 @@ function getInstance() {
 }
 
 export async function createOrder({ amount, currency = 'INR', receipt, notes = {} }) {
-  const rzp = getInstance()
-  const options = {
-    amount,
-    currency,
-    receipt: receipt || `rcpt_${Date.now()}`,
-    notes,
-  }
-  return rzp.orders.create(options)
+  return wrapSdkCall({ service: 'razorpay', operation: 'create_order' }, async () => {
+    const rzp = getInstance()
+    const options = {
+      amount,
+      currency,
+      receipt: receipt || `rcpt_${Date.now()}`,
+      notes,
+    }
+    return rzp.orders.create(options)
+  })
 }
 
 export async function fetchOrder(orderId) {
-  const rzp = getInstance()
-  return rzp.orders.fetch(orderId)
+  return wrapSdkCall({ service: 'razorpay', operation: 'fetch_order' }, async () => {
+    const rzp = getInstance()
+    return rzp.orders.fetch(orderId)
+  })
 }
 
 export function verifyPayment({ razorpayOrderId, razorpayPaymentId, razorpaySignature }) {
@@ -47,41 +52,51 @@ export function verifyPayment({ razorpayOrderId, razorpayPaymentId, razorpaySign
 }
 
 export async function createSubscription({ planId, totalCount, customerNotify = true, quantity = 1, notes = {} }) {
-  const rzp = getInstance()
-  const options = {
-    plan_id: planId,
-    total_count: totalCount,
-    customer_notify: customerNotify,
-    quantity,
-    notes,
-  }
-  return rzp.subscriptions.create(options)
+  return wrapSdkCall({ service: 'razorpay', operation: 'create_subscription' }, async () => {
+    const rzp = getInstance()
+    const options = {
+      plan_id: planId,
+      total_count: totalCount,
+      customer_notify: customerNotify,
+      quantity,
+      notes,
+    }
+    return rzp.subscriptions.create(options)
+  })
 }
 
 export async function cancelSubscription(subscriptionId, cancelAtCycleEnd = true) {
-  const rzp = getInstance()
-  return rzp.subscriptions.cancel(subscriptionId, cancelAtCycleEnd)
+  return wrapSdkCall({ service: 'razorpay', operation: 'cancel_subscription' }, async () => {
+    const rzp = getInstance()
+    return rzp.subscriptions.cancel(subscriptionId, cancelAtCycleEnd)
+  })
 }
 
 export async function fetchSubscription(subscriptionId) {
-  const rzp = getInstance()
-  return rzp.subscriptions.fetch(subscriptionId)
+  return wrapSdkCall({ service: 'razorpay', operation: 'fetch_subscription' }, async () => {
+    const rzp = getInstance()
+    return rzp.subscriptions.fetch(subscriptionId)
+  })
 }
 
 export async function fetchPayment(paymentId) {
-  const rzp = getInstance()
-  return rzp.payments.fetch(paymentId)
+  return wrapSdkCall({ service: 'razorpay', operation: 'fetch_payment' }, async () => {
+    const rzp = getInstance()
+    return rzp.payments.fetch(paymentId)
+  })
 }
 
 export async function createRazorpayPlan({ period, interval, item, notes = {} }) {
-  const rzp = getInstance()
-  const options = {
-    period,
-    interval,
-    item,
-    notes,
-  }
-  return rzp.plans.create(options)
+  return wrapSdkCall({ service: 'razorpay', operation: 'create_plan' }, async () => {
+    const rzp = getInstance()
+    const options = {
+      period,
+      interval,
+      item,
+      notes,
+    }
+    return rzp.plans.create(options)
+  })
 }
 
 export function verifyWebhookSignature(body, signature, secret) {

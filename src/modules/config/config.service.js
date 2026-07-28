@@ -87,6 +87,7 @@ export async function getPublicConfig() {
     countryCodes,
     pagination: raw.pagination || null,
     uploads: raw.uploads || null,
+    coinConversionRate: raw.coin_conversion_rate ?? null,
   };
 }
 

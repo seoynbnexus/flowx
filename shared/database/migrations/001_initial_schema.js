@@ -288,7 +288,7 @@ export async function up({ context: pool }) {
   }
 
   await pool.execute(
-    'INSERT IGNORE INTO oauth_providers (id, code, name, active) VALUES (?, ?, ?, 1)',
+    'INSERT IGNORE INTO oauth_providers (id, code, name, active) VALUES (?, ?, ?, ?)',
     [uuidToBuffer(generateUuid()), 'google', 'Google', 1]
   );
 }

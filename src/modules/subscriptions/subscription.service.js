@@ -2,6 +2,7 @@ import * as repo from './subscription.repository.js'
 import * as authRepo from '../auth/auth.repository.js'
 import * as ledger from '../../../shared/services/usage-ledger.service.js'
 import { ForbiddenError } from '../../../shared/errors/AppError.js'
+import { transaction } from '../../../shared/database/connection.js'
 
 const entitlementCache = new Map()
 const ENTR_CACHE_TTL = 5 * 60 * 1000
@@ -98,18 +99,20 @@ export async function consumeUsage(userId, featureKey, resourceType, resourceId,
   const { periodStart, periodEnd } = await getCurrentPeriod(userId)
   const subscription = await repo.findUserSubscription(userId)
 
-  const consumed = await ledger.consume(userId, featureKey, resourceType || featureKey, resourceId || null, notes || null, periodStart, periodEnd, subscription?.id || null, quantity)
-  if (consumed) {
-    clearCache(userId)
-    return
-  }
-
-  const topupAvailable = await repo.getAvailableTopup(userId, featureKey)
-  if (topupAvailable >= quantity) {
-    for (let i = 0; i < quantity; i++) {
-      await repo.consumeTopup(userId, featureKey)
+  return await transaction(async () => {
+    const consumed = await ledger.consume(userId, featureKey, resourceType || featureKey, resourceId || null, notes || null, periodStart, periodEnd, subscription?.id || null, quantity)
+    if (consumed) {
+      clearCache(userId)
+      return
     }
-  }
+
+    const topupAvailable = await repo.getAvailableTopup(userId, featureKey)
+    if (topupAvailable >= quantity) {
+      for (let i = 0; i < quantity; i++) {
+        await repo.consumeTopup(userId, featureKey)
+      }
+    }
+  })
 }
 
 export async function refundUsage(userId, featureKey, resourceType, resourceId, notes, quantity = 1) {

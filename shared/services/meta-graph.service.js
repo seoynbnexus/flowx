@@ -1,9 +1,10 @@
 import { META_CONFIG } from './meta-oauth.config.js';
+import { apiFetch } from '../utils/api-logger.js'
 
 async function graphGet(path, params = {}) {
   const query = new URLSearchParams({ ...params, access_token: params.access_token });
   const url = `${META_CONFIG.graphUrl}/${path}?${query.toString()}`;
-  const res = await fetch(url);
+  const res = await apiFetch(url, {}, { service: 'meta_graph', operation: path })
   if (!res.ok) {
     const error = await res.text();
     throw new Error(`Graph API GET ${path} failed: ${error}`);

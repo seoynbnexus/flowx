@@ -3,7 +3,7 @@ import { NotFoundError, AuthError, ConflictError } from '../../../shared/errors/
 import { ERROR_CODES } from '../../../shared/errors/errorCodes.js';
 import { comparePassword, hashPassword } from '../../../shared/utils/crypto.utils.js';
 import { generateUuid, uuidToBuffer } from '../../../shared/utils/uuid.utils.js';
-import { query } from '../../../shared/database/connection.js';
+import { query, transaction } from '../../../shared/database/connection.js';
 import { USER_STATUS, PAGINATION } from '../../../shared/constants/index.js';
 import { getUserPassword, updateUserPassword, createAuditLog, findUserByEmail, createUser, createUserProfile, createUserPassword, assignUserRole } from '../auth/auth.repository.js';
 
@@ -25,12 +25,14 @@ export async function updateProfile(userId, data) {
 
   const { role, ...profileData } = data;
 
-  if (role) {
-    await repo.updateUserRole(userId, role);
-  }
+  return await transaction(async () => {
+    if (role) {
+      await repo.updateUserRole(userId, role);
+    }
 
-  const updatedProfile = await repo.updateProfile(userId, profileData);
-  return { ...user, profile: updatedProfile };
+    const updatedProfile = await repo.updateProfile(userId, profileData);
+    return { ...user, profile: updatedProfile };
+  });
 }
 
 export async function adminCreateUser(data) {
@@ -42,22 +44,24 @@ export async function adminCreateUser(data) {
   const userId = generateUuid();
   const passwordHash = await hashPassword(data.password);
 
-  await createUser(userId, data.email, USER_STATUS.ACTIVE, data.phone || null);
-  await query('UPDATE users SET email_verified_at = NOW() WHERE id = ?', [uuidToBuffer(userId)]);
-  await createUserProfile(generateUuid(), userId, {
-    firstName: data.firstName,
-    lastName: data.lastName,
-    countryCode: 'IN',
+  return await transaction(async () => {
+    await createUser(userId, data.email, USER_STATUS.ACTIVE, data.phone || null);
+    await query('UPDATE users SET email_verified_at = NOW() WHERE id = ?', [uuidToBuffer(userId)]);
+    await createUserProfile(generateUuid(), userId, {
+      firstName: data.firstName,
+      lastName: data.lastName,
+      countryCode: 'IN',
+    });
+    await createUserPassword(userId, passwordHash);
+    await assignUserRole(userId, data.role);
+
+    await createAuditLog(
+      generateUuid(), userId, 'user', userId,
+      'user.created_by_admin', null, { email: data.email, role: data.role }
+    );
+
+    return repo.findById(userId);
   });
-  await createUserPassword(userId, passwordHash);
-  await assignUserRole(userId, data.role);
-
-  await createAuditLog(
-    generateUuid(), userId, 'user', userId,
-    'user.created_by_admin', null, { email: data.email, role: data.role }
-  );
-
-  return repo.findById(userId);
 }
 
 export async function searchUsers(q, limit) {
@@ -78,12 +82,14 @@ export async function updateUserStatus(userId, status) {
   }
 
   const oldStatus = user.status;
-  const updated = await repo.updateStatus(userId, status);
-  await createAuditLog(
-    generateUuid(), userId, 'user', userId,
-    'user.status_changed', { status: oldStatus }, { status }
-  );
-  return updated;
+  return await transaction(async () => {
+    const updated = await repo.updateStatus(userId, status);
+    await createAuditLog(
+      generateUuid(), userId, 'user', userId,
+      'user.status_changed', { status: oldStatus }, { status }
+    );
+    return updated;
+  });
 }
 
 export async function deleteUser(userId) {
@@ -92,11 +98,13 @@ export async function deleteUser(userId) {
     throw new NotFoundError('User not found');
   }
 
-  await repo.softDelete(userId);
-  await createAuditLog(
-    generateUuid(), userId, 'user', userId,
-    'user.deleted', { email: user.email, status: user.status }, { deleted_at: new Date() }
-  );
+  return await transaction(async () => {
+    await repo.softDelete(userId);
+    await createAuditLog(
+      generateUuid(), userId, 'user', userId,
+      'user.deleted', { email: user.email, status: user.status }, { deleted_at: new Date() }
+    );
+  });
 }
 
 export async function changePassword(userId, currentPassword, newPassword) {
@@ -110,11 +118,13 @@ export async function changePassword(userId, currentPassword, newPassword) {
   if (!valid) throw new AuthError('Current password is incorrect', ERROR_CODES.AUTH_FAILED);
 
   const newHash = await hashPassword(newPassword);
-  await updateUserPassword(userId, newHash);
-  await createAuditLog(
-    generateUuid(), userId, 'user', userId,
-    'user.password_changed', { password_changed_at: passwordRecord.password_changed_at }, { password_changed_at: new Date() }
-  );
+  return await transaction(async () => {
+    await updateUserPassword(userId, newHash);
+    await createAuditLog(
+      generateUuid(), userId, 'user', userId,
+      'user.password_changed', { password_changed_at: passwordRecord.password_changed_at }, { password_changed_at: new Date() }
+    );
+  });
 }
 
 export async function getUserRoles(userId) {

@@ -1,5 +1,7 @@
+import { apiFetch, logTiming } from '../utils/api-logger.js'
+
 const IMAGE_PROVIDER = process.env.AI_IMAGE_PROVIDER || process.env.AI_PROVIDER || 'gemini';
-const API_KEY = process.env.AI_API_KEY;
+const API_KEY = process.env.AI_IMAGE_API_KEY;
 const MODEL = process.env.AI_IMAGE_MODEL || 'black-forest-labs/flux-1.1-pro';
 
 function extractImageUrl(content) {
@@ -20,31 +22,8 @@ const PROVIDER_FACTORIES = {
       generate: async (prompt, { size, style } = {}) => {
         const baseURL = process.env.OPENAI_BASE_URL || 'https://openrouter.ai/api/v1';
         const fullPrompt = style ? `${style}: ${prompt}` : prompt;
-        const isDalle = MODEL.startsWith('openai/');
 
-        if (isDalle) {
-          const resp = await fetch(`${baseURL}/images/generations`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${API_KEY}`,
-            },
-            body: JSON.stringify({
-              model: MODEL,
-              prompt: fullPrompt,
-              n: 1,
-              size: size || '1024x1024',
-            }),
-          });
-          if (!resp.ok) {
-            const text = await resp.text();
-            throw new Error(`Image generation failed: ${resp.status} ${text}`);
-          }
-          const data = await resp.json();
-          return data.data[0].url;
-        }
-
-        const resp = await fetch(`${baseURL}/chat/completions`, {
+        const resp = await apiFetch(`${baseURL}/images/generations`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -52,16 +31,31 @@ const PROVIDER_FACTORIES = {
           },
           body: JSON.stringify({
             model: MODEL,
-            messages: [{ role: 'user', content: fullPrompt }],
+            prompt: fullPrompt,
             n: 1,
+            size: size || '1024x1024',
           }),
-        });
+        }, { service: 'ai_image', operation: 'openai_generate' });
+
         if (!resp.ok) {
           const text = await resp.text();
           throw new Error(`Image generation failed: ${resp.status} ${text}`);
         }
+
         const data = await resp.json();
-        return extractImageUrl(data.choices[0].message.content);
+
+        if (data.data?.[0]?.url) return data.data[0].url;
+
+        if (data.data?.[0]?.b64_json) {
+          const mime = data.data[0].media_type || 'image/png';
+          return `data:${mime};base64,${data.data[0].b64_json}`;
+        }
+
+        if (data.choices?.[0]?.message?.content) {
+          return extractImageUrl(data.choices[0].message.content);
+        }
+
+        throw new Error('Unexpected image generation response format');
       },
       getProviderInfo: () => ({ provider: IMAGE_PROVIDER, model: MODEL, type: 'image' }),
     };
@@ -77,13 +71,17 @@ const PROVIDER_FACTORIES = {
     return {
       generate: async (prompt, { size, style } = {}) => {
         const fullPrompt = style ? `${style}: ${prompt}` : prompt;
+        const start = Date.now();
         const result = await genModel.generateContent(fullPrompt);
+        const ms = Date.now() - start;
         const parts = result.response.candidates?.[0]?.content?.parts || [];
         for (const part of parts) {
           if (part.inlineData) {
+            logTiming({ service: 'ai_image', operation: 'gemini_generate', ms, success: true })
             return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
           }
         }
+        logTiming({ service: 'ai_image', operation: 'gemini_generate', ms, success: false, errorMessage: 'Gemini did not return an image' })
         throw new Error('Gemini did not return an image');
       },
       getProviderInfo: () => ({ provider: IMAGE_PROVIDER, model: MODEL, type: 'image' }),

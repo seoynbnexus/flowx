@@ -88,6 +88,10 @@ export const rejectCampaignSchema = z.object({
   notes: z.string().min(1, 'Rejection notes are required').max(1000),
 })
 
+export const coinConversionRateSchema = z.object({
+  rate: z.coerce.number().positive('Rate must be positive').max(10000, 'Rate too high'),
+})
+
 export const publisherRequestActionSchema = z.object({
   requestId: z.string().uuid('Invalid request ID'),
 })

@@ -123,6 +123,11 @@ export async function findOrderByRazorpayId(razorpayOrderId) {
   return rowToOrder(row)
 }
 
+export async function findOrderByRazorpayIdForUpdate(razorpayOrderId) {
+  const row = await queryOne('SELECT * FROM payment_orders WHERE razorpay_order_id = ? FOR UPDATE', [razorpayOrderId])
+  return rowToOrder(row)
+}
+
 export async function findOrdersByUserId(userId, limit = 20, offset = 0) {
   const rows = await query(
     'SELECT * FROM payment_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?',

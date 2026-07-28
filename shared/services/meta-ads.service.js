@@ -1,4 +1,5 @@
 import { META_CONFIG } from './meta-oauth.config.js'
+import { apiFetch } from '../utils/api-logger.js'
 
 async function graphPost(path, params = {}) {
   const query = new URLSearchParams({ access_token: params.access_token })
@@ -11,7 +12,7 @@ async function graphPost(path, params = {}) {
     }
   }
 
-  const res = await fetch(url, { method: 'POST', body: body.toString() })
+  const res = await apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_ads', operation: `POST ${path}` })
   if (!res.ok) {
     const error = await res.text()
     throw new Error(`Graph API POST ${path} failed: ${error}`)
@@ -21,7 +22,7 @@ async function graphPost(path, params = {}) {
 
 async function graphDelete(path, accessToken) {
   const url = `${META_CONFIG.graphUrl}/${path}?access_token=${accessToken}`
-  const res = await fetch(url, { method: 'DELETE' })
+  const res = await apiFetch(url, { method: 'DELETE' }, { service: 'meta_ads', operation: `DELETE ${path}` })
   if (!res.ok) {
     const error = await res.text()
     throw new Error(`Graph API DELETE ${path} failed: ${error}`)
@@ -38,7 +39,7 @@ async function graphGet(path, params = {}) {
   }
   qs.append('access_token', params.access_token)
   const url = `${META_CONFIG.graphUrl}/${path}?${qs.toString()}`
-  const res = await fetch(url)
+  const res = await apiFetch(url, {}, { service: 'meta_ads', operation: `GET ${path}` })
   if (!res.ok) {
     const error = await res.text()
     throw new Error(`Graph API GET ${path} failed: ${error}`)
@@ -254,6 +255,22 @@ export async function updateAdStatus(adId, status, accessToken) {
   const data = await graphPost(adId, {
     access_token: accessToken,
     status,
+  })
+  return data
+}
+
+export async function getObjectStatus(objectId, accessToken) {
+  const data = await graphGet(objectId, {
+    access_token: accessToken,
+    fields: 'status,effective_status',
+  })
+  return data
+}
+
+export async function getCampaignSpend(campaignId, accessToken) {
+  const data = await graphGet(campaignId, {
+    access_token: accessToken,
+    fields: 'spend',
   })
   return data
 }

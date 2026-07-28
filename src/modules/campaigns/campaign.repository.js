@@ -1,6 +1,7 @@
 import { query, queryOne } from '../../../shared/database/connection.js'
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js'
 import { decrypt } from '../../../shared/utils/crypto.utils.js'
+import { ValidationError } from '../../../shared/errors/AppError.js'
 
 function mapCampaignRow(row) {
   if (!row) return null
@@ -18,6 +19,8 @@ function mapCampaignRow(row) {
     coinsEscrowedAt: row.coins_escrowed_at,
     metaStatus: row.meta_status || 'pending',
     metaError: row.meta_error || null,
+    metaSpentPaise: row.meta_spent_paise ? Number(row.meta_spent_paise) : 0,
+    lastMetaSyncAt: row.last_meta_sync_at || null,
     clientConfirmed: !!row.client_confirmed,
     clientConfirmedAt: row.client_confirmed_at,
     adminNotes: row.admin_notes,
@@ -214,7 +217,7 @@ export async function updateCampaign(id, data) {
 
   if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name) }
   if (data.type !== undefined) { fields.push('type = ?'); params.push(data.type) }
-  if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(uuidToBuffer(data.categoryId)) }
+  if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(data.categoryId ? uuidToBuffer(data.categoryId) : null) }
   if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(data.scheduledAt) }
   if (data.publisherCount !== undefined) { fields.push('publisher_count = ?'); params.push(data.publisherCount) }
   if (data.coinsPerPublisher !== undefined) { fields.push('coins_per_publisher = ?'); params.push(data.coinsPerPublisher) }
@@ -226,7 +229,7 @@ export async function updateCampaign(id, data) {
   if (data.metaStatus !== undefined) { fields.push('meta_status = ?'); params.push(data.metaStatus) }
   if (data.metaError !== undefined) { fields.push('meta_error = ?'); params.push(data.metaError) }
   if (data.adminNotes !== undefined) { fields.push('admin_notes = ?'); params.push(data.adminNotes) }
-  if (data.reviewedBy !== undefined) { fields.push('reviewed_by = ?'); params.push(uuidToBuffer(data.reviewedBy)) }
+  if (data.reviewedBy !== undefined) { fields.push('reviewed_by = ?'); params.push(data.reviewedBy ? uuidToBuffer(data.reviewedBy) : null) }
   if (data.reviewedAt !== undefined) { fields.push('reviewed_at = ?'); params.push(data.reviewedAt) }
   if (data.reviewNotes !== undefined) { fields.push('review_notes = ?'); params.push(data.reviewNotes) }
 
@@ -237,6 +240,41 @@ export async function updateCampaign(id, data) {
     `UPDATE campaigns SET ${fields.join(', ')} WHERE id = ?`,
     params
   )
+  return findCampaignById(id)
+}
+
+export async function updateCampaignWithStatusGuard(id, data, expectedStatus) {
+  const fields = []
+  const params = []
+
+  if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name) }
+  if (data.type !== undefined) { fields.push('type = ?'); params.push(data.type) }
+  if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(data.categoryId ? uuidToBuffer(data.categoryId) : null) }
+  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(data.scheduledAt) }
+  if (data.publisherCount !== undefined) { fields.push('publisher_count = ?'); params.push(data.publisherCount) }
+  if (data.coinsPerPublisher !== undefined) { fields.push('coins_per_publisher = ?'); params.push(data.coinsPerPublisher) }
+  if (data.status !== undefined) { fields.push('status = ?'); params.push(data.status) }
+  if (data.escrowAmount !== undefined) { fields.push('escrow_amount = ?'); params.push(data.escrowAmount) }
+  if (data.coinsEscrowedAt !== undefined) { fields.push('coins_escrowed_at = ?'); params.push(data.coinsEscrowedAt) }
+  if (data.clientConfirmed !== undefined) { fields.push('client_confirmed = ?'); params.push(data.clientConfirmed ? 1 : 0) }
+  if (data.clientConfirmedAt !== undefined) { fields.push('client_confirmed_at = ?'); params.push(data.clientConfirmedAt) }
+  if (data.metaStatus !== undefined) { fields.push('meta_status = ?'); params.push(data.metaStatus) }
+  if (data.metaError !== undefined) { fields.push('meta_error = ?'); params.push(data.metaError) }
+  if (data.adminNotes !== undefined) { fields.push('admin_notes = ?'); params.push(data.adminNotes) }
+  if (data.reviewedBy !== undefined) { fields.push('reviewed_by = ?'); params.push(data.reviewedBy ? uuidToBuffer(data.reviewedBy) : null) }
+  if (data.reviewedAt !== undefined) { fields.push('reviewed_at = ?'); params.push(data.reviewedAt) }
+  if (data.reviewNotes !== undefined) { fields.push('review_notes = ?'); params.push(data.reviewNotes) }
+
+  if (fields.length === 0) return findCampaignById(id)
+
+  params.push(expectedStatus, uuidToBuffer(id))
+  const result = await query(
+    `UPDATE campaigns SET ${fields.join(', ')} WHERE status = ? AND id = ?`,
+    params
+  )
+  if (result.affectedRows === 0) {
+    throw new ValidationError('Campaign status conflict — concurrent modification detected')
+  }
   return findCampaignById(id)
 }
 
@@ -298,6 +336,38 @@ export async function findMetaSettingsByCampaignId(campaignId) {
   return mapMetaSettingsRow(row)
 }
 
+export async function saveMetaObjectStatus(objectId, status) {
+  await query(
+    'UPDATE campaign_meta_objects SET status = ? WHERE object_id = ?',
+    [status, objectId]
+  )
+}
+
+export async function saveMetaSpend(campaignId, spentPaise) {
+  await query(
+    'UPDATE campaigns SET meta_spent_paise = ?, last_meta_sync_at = NOW() WHERE id = ?',
+    [spentPaise, uuidToBuffer(campaignId)]
+  )
+}
+
+export async function findSyncableCampaigns() {
+  const rows = await query(
+    `SELECT c.* FROM campaigns c
+     WHERE c.status IN ('running', 'paused')
+       AND EXISTS (SELECT 1 FROM campaign_meta_objects mo WHERE mo.campaign_id = c.id)
+     ORDER BY
+  c.last_meta_sync_at IS NOT NULL,
+  c.last_meta_sync_at ASC`
+  )
+  // const rows = await query(
+  //   `SELECT c.* FROM campaigns c
+  //    WHERE c.status IN ('running', 'paused')
+  //      AND EXISTS (SELECT 1 FROM campaign_meta_objects mo WHERE mo.campaign_id = c.id)
+  //    ORDER BY c.last_meta_sync_at ASC NULLS FIRST`
+  // )
+  return rows.map(mapCampaignRow)
+}
+
 export async function createMetaObject(campaignId, objectType, objectId, platformAccountId, status) {
   const id = generateUuid()
   await query(
@@ -331,7 +401,7 @@ export async function createReviewLog(campaignId, reviewerId, action, previousSt
     [
       uuidToBuffer(id),
       uuidToBuffer(campaignId),
-      uuidToBuffer(reviewerId),
+      reviewerId ? uuidToBuffer(reviewerId) : null,
       action,
       previousStatus,
       notes || null,
@@ -366,11 +436,11 @@ export async function createPublisherRequests(campaignId, publisherIds, coinsOff
     coinsOffered,
   ])
 
-  const placeholders = values.map(() => '(?, ?, ?, ?, ?)').join(', ')
+  const placeholders = values.map(() => '(?, ?, ?, ?)').join(', ')
   const flatValues = values.flat()
 
   await query(
-    `INSERT INTO campaign_publisher_requests (id, campaign_id, publisher_id, coins_offered, status)
+    `INSERT INTO campaign_publisher_requests (id, campaign_id, publisher_id, coins_offered)
      VALUES ${placeholders}`,
     flatValues
   )
@@ -469,6 +539,35 @@ export async function updatePublisherRequestStatus(id, status, respondedAt) {
     `UPDATE campaign_publisher_requests SET ${fields.join(', ')} WHERE id = ?`,
     params
   )
+}
+
+export async function updatePublisherRequestStatusWithGuard(id, status, respondedAt, expectedStatus) {
+  const fields = ['status = ?']
+  const params = [status]
+
+  if (respondedAt) {
+    fields.push('responded_at = ?')
+    params.push(respondedAt)
+  }
+
+  params.push(expectedStatus, uuidToBuffer(id))
+  const result = await query(
+    `UPDATE campaign_publisher_requests SET ${fields.join(', ')} WHERE status = ? AND id = ?`,
+    params
+  )
+  if (result.affectedRows === 0) {
+    throw new ValidationError('Publisher request status conflict — concurrent modification detected')
+  }
+}
+
+export async function updatePublisherRequestPublishedWithGuard(id, expectedStatus) {
+  const result = await query(
+    'UPDATE campaign_publisher_requests SET status = ?, published_at = NOW() WHERE status = ? AND id = ?',
+    ['published', expectedStatus, uuidToBuffer(id)]
+  )
+  if (result.affectedRows === 0) {
+    throw new ValidationError('Publisher request status conflict — concurrent modification detected')
+  }
 }
 
 export async function setPublisherCategories(publisherId, categoryIds) {
@@ -593,7 +692,24 @@ export async function updatePublisherRequestPublished(id) {
 }
 
 export async function updateCampaignStatus(id, status) {
-  await query('UPDATE campaigns SET status = ? WHERE id = ?', [status, uuidToBuffer(id)])
+  const result = await query('UPDATE campaigns SET status = ? WHERE id = ?', [status, uuidToBuffer(id)])
+  return result
+}
+
+export async function findDueScheduledCampaigns() {
+  const rows = await query(
+    `SELECT c.id, c.client_id, c.name, c.scheduled_at
+     FROM campaigns c
+     WHERE c.status = 'scheduled'
+       AND c.scheduled_at IS NOT NULL
+       AND c.scheduled_at <= NOW()`,
+  )
+  return rows.map(r => ({
+    id: bufferToUuid(r.id),
+    clientId: bufferToUuid(r.client_id),
+    name: r.name,
+    scheduledAt: r.scheduled_at,
+  }))
 }
 
 export async function deleteMetaObjectsByCampaignId(campaignId) {

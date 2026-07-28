@@ -14,6 +14,7 @@ const SCOPES = [
   'instagram_content_publish',
   'business_management',
   'ads_management',
+  'pages_manage_ads',
 ]
 
 const AUTH_URL = `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth`

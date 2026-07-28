@@ -1,4 +1,5 @@
 import { META_CONFIG } from './meta-oauth.config.js';
+import { apiFetch } from '../utils/api-logger.js'
 
 export function generateOAuthUrl(state, platformCode = 'instagram') {
   const params = new URLSearchParams({
@@ -19,7 +20,7 @@ export async function exchangeCodeForToken(code) {
     code,
   });
 
-  const res = await fetch(`${META_CONFIG.tokenUrl}?${params.toString()}`);
+  const res = await apiFetch(`${META_CONFIG.tokenUrl}?${params.toString()}`, {}, { service: 'meta_auth', operation: 'exchange_code' })
   if (!res.ok) {
     const error = await res.text();
     throw new Error(`Token exchange failed: ${error}`);
@@ -36,7 +37,7 @@ export async function exchangeForLongLivedToken(shortLivedToken) {
     fb_exchange_token: shortLivedToken,
   });
 
-  const res = await fetch(`${META_CONFIG.graphUrl}/oauth/access_token?${params.toString()}`);
+  const res = await apiFetch(`${META_CONFIG.graphUrl}/oauth/access_token?${params.toString()}`, {}, { service: 'meta_auth', operation: 'long_lived_token' })
   if (!res.ok) {
     const error = await res.text();
     throw new Error(`Long-lived token exchange failed: ${error}`);
@@ -51,7 +52,7 @@ export async function debugToken(inputToken) {
     access_token: `${META_CONFIG.appId}|${META_CONFIG.appSecret}`,
   });
 
-  const res = await fetch(`${META_CONFIG.graphUrl}/debug_token?${params.toString()}`);
+  const res = await apiFetch(`${META_CONFIG.graphUrl}/debug_token?${params.toString()}`, {}, { service: 'meta_auth', operation: 'debug_token' })
   if (!res.ok) {
     const error = await res.text();
     throw new Error(`Token debug failed: ${error}`);
@@ -66,7 +67,7 @@ export async function refreshPageToken(pageId, userToken) {
     access_token: userToken,
   });
 
-  const res = await fetch(`${META_CONFIG.graphUrl}/${pageId}?${params.toString()}`);
+  const res = await apiFetch(`${META_CONFIG.graphUrl}/${pageId}?${params.toString()}`, {}, { service: 'meta_auth', operation: 'refresh_page_token' })
   if (!res.ok) {
     const error = await res.text();
     throw new Error(`Page token refresh failed: ${error}`);

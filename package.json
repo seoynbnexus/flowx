@@ -5,7 +5,9 @@
   "type": "module",
   "main": "app.js",
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "supertest": "^7.2.2",
+    "vitest": "^4.1.10"
   },
   "dependencies": {
     "@langchain/core": "^1.2.1",
@@ -44,6 +46,10 @@
     "migrate:list": "node shared/database/migrate.js list",
     "db:cleanup": "node shared/database/cleanup.js",
     "schema:sync": "node shared/database/schema-sync.js",
-    "tokens:refresh": "node src/jobs/refresh-tokens.js"
+    "tokens:refresh": "node src/jobs/refresh-tokens.js",
+    "campaigns:activate": "node src/jobs/activate-scheduled-campaigns.js",
+    "campaigns:sync-status": "node src/jobs/sync-meta-campaigns.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   }
 }

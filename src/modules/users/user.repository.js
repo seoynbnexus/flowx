@@ -1,4 +1,4 @@
-import { query, queryOne } from '../../../shared/database/connection.js';
+import { query, queryOne, transaction } from '../../../shared/database/connection.js';
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js';
 import { AppError } from '../../../shared/errors/AppError.js';
 
@@ -50,22 +50,24 @@ export async function updateProfile(userId, data) {
   if (data.timezone !== undefined) { fields.push('timezone = ?'); values.push(data.timezone); }
   if (data.metadata !== undefined) { fields.push('metadata = ?'); values.push(JSON.stringify(data.metadata)); }
 
-  if (fields.length > 0) {
-    values.push(uuidToBuffer(userId));
-    await query(
-      `UPDATE user_profiles SET ${fields.join(', ')} WHERE user_id = ?`,
-      values
-    );
-  }
+  return await transaction(async () => {
+    if (fields.length > 0) {
+      values.push(uuidToBuffer(userId));
+      await query(
+        `UPDATE user_profiles SET ${fields.join(', ')} WHERE user_id = ?`,
+        values
+      );
+    }
 
-  if (data.phone !== undefined) {
-    await query('UPDATE users SET phone = ? WHERE id = ?', [
-      data.phone || null,
-      uuidToBuffer(userId),
-    ]);
-  }
+    if (data.phone !== undefined) {
+      await query('UPDATE users SET phone = ? WHERE id = ?', [
+        data.phone || null,
+        uuidToBuffer(userId),
+      ]);
+    }
 
-  return findProfileByUserId(userId);
+    return findProfileByUserId(userId);
+  });
 }
 
 export async function listUsers({ page, limit, status, search }) {
@@ -182,11 +184,13 @@ export async function assignRole(userId, roleId) {
 export async function updateUserRole(userId, roleCode) {
   const role = await queryOne('SELECT id FROM roles WHERE code = ?', [roleCode]);
   if (!role) throw new AppError('Role not found', 404);
-  await query('DELETE FROM user_roles WHERE user_id = ?', [uuidToBuffer(userId)]);
-  await query(
-    'INSERT INTO user_roles (id, user_id, role_id) VALUES (?, ?, ?)',
-    [uuidToBuffer(generateUuid()), uuidToBuffer(userId), role.id]
-  );
+  return await transaction(async () => {
+    await query('DELETE FROM user_roles WHERE user_id = ?', [uuidToBuffer(userId)]);
+    await query(
+      'INSERT INTO user_roles (id, user_id, role_id) VALUES (?, ?, ?)',
+      [uuidToBuffer(generateUuid()), uuidToBuffer(userId), role.id]
+    );
+  });
 }
 
 export async function removeRole(userId, roleId) {

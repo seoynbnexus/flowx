@@ -1,5 +1,6 @@
 import { query, queryOne } from '../../../shared/database/connection.js';
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js';
+import { ValidationError } from '../../../shared/errors/AppError.js';
 
 function mapGeneratedRow(row) {
   if (!row) return null;
@@ -118,6 +119,14 @@ export async function findUserWalletCoins(userId) {
   return row ? row.coins : 0;
 }
 
+export async function findUserWalletCoinsForUpdate(userId) {
+  const row = await queryOne(
+    'SELECT coins FROM user_wallets WHERE user_id = ? FOR UPDATE',
+    [uuidToBuffer(userId)]
+  );
+  return row ? row.coins : 0;
+}
+
 export async function addCoins(userId, amount) {
   await query(
     'UPDATE user_wallets SET coins = coins + ? WHERE user_id = ?',
@@ -126,10 +135,13 @@ export async function addCoins(userId, amount) {
 }
 
 export async function deductCoins(userId, amount) {
-  await query(
+  const result = await query(
     'UPDATE user_wallets SET coins = coins - ? WHERE user_id = ? AND coins >= ?',
     [amount, uuidToBuffer(userId), amount]
   );
+  if (result.affectedRows === 0) {
+    throw new ValidationError('Insufficient wallet balance', null, 'INSUFFICIENT_COINS')
+  }
 }
 
 export async function createTransaction(id, userId, label, amount, type, referenceType = null, referenceId = null) {

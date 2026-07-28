@@ -1,7 +1,10 @@
 import mysql from 'mysql2/promise';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { dbConfig } from './config.js';
 
 let pool = null;
+
+const als = new AsyncLocalStorage();
 
 export function getPool() {
   if (!pool) {
@@ -21,7 +24,8 @@ export async function closePool() {
 }
 
 export async function query(sql, params) {
-  const conn = getPool();
+  const store = als.getStore();
+  const conn = store?.activeTransaction || getPool();
   const [rows] = await conn.execute(sql, params);
   return rows;
 }
@@ -32,17 +36,22 @@ export async function queryOne(sql, params) {
 }
 
 export async function transaction(callback) {
-  const conn = getPool();
-  const connection = await conn.getConnection();
-  try {
-    await connection.beginTransaction();
-    const result = await callback(connection);
-    await connection.commit();
-    return result;
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
-  }
+  const existing = als.getStore()?.activeTransaction;
+  if (existing) return await callback(existing);
+
+  const connection = await getPool().getConnection();
+  const store = { activeTransaction: connection };
+  return als.run(store, async () => {
+    try {
+      await connection.beginTransaction();
+      const result = await callback(connection);
+      await connection.commit();
+      return result;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  });
 }

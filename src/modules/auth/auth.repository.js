@@ -142,6 +142,16 @@ export async function deleteSession(id) {
   await query('DELETE FROM user_sessions WHERE id = ?', [uuidToBuffer(id)]);
 }
 
+export async function rotateSession(id, oldTokenHash, newTokenHash, expiresAt) {
+  const result = await query(
+    `UPDATE user_sessions
+     SET refresh_token_hash = ?, expires_at = ?
+     WHERE id = ? AND refresh_token_hash = ?`,
+    [newTokenHash, expiresAt, uuidToBuffer(id), oldTokenHash]
+  );
+  return result.affectedRows > 0;
+}
+
 export async function deleteUserSessions(userId) {
   await query('DELETE FROM user_sessions WHERE user_id = ?', [uuidToBuffer(userId)]);
 }

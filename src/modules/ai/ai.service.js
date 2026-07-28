@@ -8,6 +8,7 @@ import { calculateCost, calculateImageCost } from '../../../shared/ai/pricing.js
 import { AI_CONTENT_TYPES, getMarkupCoins, getImageBaseCost } from './ai.config.js';
 import { ValidationError, ForbiddenError } from '../../../shared/errors/AppError.js';
 import { getImageLLM } from '../../../shared/ai/image-provider.js';
+import { apiFetch, wrapSdkCall } from '../../../shared/utils/api-logger.js';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -53,10 +54,12 @@ export async function generateContent(userId, prompt, type, tone, language, targ
   }
   const userPrompt = buildPrompt(type, variables);
 
-  const response = await llm.invoke([
-    new SystemMessage(systemPrompt),
-    new HumanMessage(userPrompt),
-  ]);
+  const response = await wrapSdkCall({ service: 'ai_text', operation: 'generate_content' }, async () => {
+    return llm.invoke([
+      new SystemMessage(systemPrompt),
+      new HumanMessage(userPrompt),
+    ])
+  })
 
   const content = response.content;
   const tokenUsage = response.usage_metadata || { input_tokens: 0, output_tokens: 0 };
@@ -179,11 +182,11 @@ export async function generateImage(userId, prompt, size = '1024x1024', style) {
   const subService = await import('../subscriptions/subscription.service.js');
   await subService.canPerform(userId, 'ai_image');
 
-  const coinService = await import('../../../shared/services/coin.service.js');
-  await coinService.spend(userId, cost, 'ai_image', null, 'AI image generation');
-
   const provider = await getImageLLM();
   const imageUrl = await provider.generate(prompt, { size, style });
+
+  const coinService = await import('../../../shared/services/coin.service.js');
+  await coinService.spend(userId, cost, 'ai_image', null, 'AI image generation');
 
   await repo.logUsage(userId, prompt, 'image', false, null, 0, cost);
 
@@ -209,7 +212,7 @@ export async function saveImage(userId, prompt, imageUrl, style, size) {
   const fileName = `${imageId}.png`;
   const filePath = path.join(userDir, fileName);
 
-  const response = await fetch(imageUrl);
+  const response = await apiFetch(imageUrl, {}, { service: 'ai_image', operation: 'download_image' })
   if (!response.ok) {
     throw new Error('Failed to download generated image');
   }

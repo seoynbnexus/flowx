@@ -140,21 +140,23 @@ export async function verifyPayment(userId, razorpayOrderId, razorpayPaymentId, 
   const valid = razorpay.verifyPayment({ razorpayOrderId, razorpayPaymentId, razorpaySignature })
   if (!valid) throw new ValidationError('Payment verification failed. Invalid signature.')
 
-  const order = await repo.findOrderByRazorpayId(razorpayOrderId)
-  if (!order) throw new NotFoundError('Order not found')
-  if (order.userId !== userId) throw new ForbiddenError('Order does not belong to this user')
-  if (order.status !== PAYMENT_STATUS.PENDING) throw new ValidationError('Order already processed')
+  return await transaction(async () => {
+    const order = await repo.findOrderByRazorpayIdForUpdate(razorpayOrderId)
+    if (!order) throw new NotFoundError('Order not found')
+    if (order.userId !== userId) throw new ForbiddenError('Order does not belong to this user')
+    if (order.status !== PAYMENT_STATUS.PENDING) throw new ValidationError('Order already processed')
 
-  let result
-  if (order.type === PAYMENT_TYPES.SUBSCRIPTION) {
-    result = await processSubscriptionPayment(order, razorpayPaymentId)
-  } else if (order.type === PAYMENT_TYPES.TOPUP) {
-    result = await processTopupPayment(order, razorpayPaymentId)
-  } else {
-    throw new ValidationError('Unknown order type')
-  }
+    let result
+    if (order.type === PAYMENT_TYPES.SUBSCRIPTION) {
+      result = await processSubscriptionPayment(order, razorpayPaymentId)
+    } else if (order.type === PAYMENT_TYPES.TOPUP) {
+      result = await processTopupPayment(order, razorpayPaymentId)
+    } else {
+      throw new ValidationError('Unknown order type')
+    }
 
-  return result
+    return result
+  })
 }
 
 async function processSubscriptionPayment(order, razorpayPaymentId) {
@@ -390,33 +392,35 @@ export async function handleWebhook(event) {
       const sub = payload.subscription.entity
       const schedule = await repo.findScheduleByRazorpayId(sub.id)
       if (schedule) {
-        const invoiceId = generateUuid()
-        const now = new Date()
-        await repo.createInvoice({
-          id: invoiceId,
-          userId: schedule.userId,
-          userSubscriptionId: schedule.userSubscriptionId,
-          orderId: null,
-          periodStart: sub.current_start ? new Date(sub.current_start * 1000) : null,
-          periodEnd: sub.current_end ? new Date(sub.current_end * 1000) : null,
-          amount: sub.amount || 0,
-          currency: 'INR',
-          taxAmount: 0,
-          status: INVOICE_STATUS.PAID,
-        })
-        await repo.updateInvoice(invoiceId, { paidAt: now })
+        await transaction(async () => {
+          const invoiceId = generateUuid()
+          const now = new Date()
+          await repo.createInvoice({
+            id: invoiceId,
+            userId: schedule.userId,
+            userSubscriptionId: schedule.userSubscriptionId,
+            orderId: null,
+            periodStart: sub.current_start ? new Date(sub.current_start * 1000) : null,
+            periodEnd: sub.current_end ? new Date(sub.current_end * 1000) : null,
+            amount: sub.amount || 0,
+            currency: 'INR',
+            taxAmount: 0,
+            status: INVOICE_STATUS.PAID,
+          })
+          await repo.updateInvoice(invoiceId, { paidAt: now })
 
-        await repo.updateSchedule(schedule.id, {
-          currentStart: sub.current_start ? new Date(sub.current_start * 1000) : null,
-          currentEnd: sub.current_end ? new Date(sub.current_end * 1000) : null,
-        })
+          await repo.updateSchedule(schedule.id, {
+            currentStart: sub.current_start ? new Date(sub.current_start * 1000) : null,
+            currentEnd: sub.current_end ? new Date(sub.current_end * 1000) : null,
+          })
 
-        await subRepo.upsertUserSubscription(schedule.userId, schedule.planId, {
-          currentPeriodStart: sub.current_start ? new Date(sub.current_start * 1000) : new Date(),
-          currentPeriodEnd: sub.current_end ? new Date(sub.current_end * 1000) : null,
-        })
+          await subRepo.upsertUserSubscription(schedule.userId, schedule.planId, {
+            currentPeriodStart: sub.current_start ? new Date(sub.current_start * 1000) : new Date(),
+            currentPeriodEnd: sub.current_end ? new Date(sub.current_end * 1000) : null,
+          })
 
-        subService.clearCache(schedule.userId)
+          subService.clearCache(schedule.userId)
+        })
       }
       break
     }
@@ -434,9 +438,11 @@ export async function handleWebhook(event) {
       const completedSub = payload.subscription.entity
       const schedule = await repo.findScheduleByRazorpayId(completedSub.id)
       if (schedule) {
-        await repo.updateSchedule(schedule.id, { status: SCHEDULE_STATUS.COMPLETED })
-        await subRepo.upsertUserSubscription(schedule.userId, schedule.planId, { status: PLAN_STATUS.EXPIRED })
-        subService.clearCache(schedule.userId)
+        await transaction(async () => {
+          await repo.updateSchedule(schedule.id, { status: SCHEDULE_STATUS.COMPLETED })
+          await subRepo.upsertUserSubscription(schedule.userId, schedule.planId, { status: 'canceled' })
+          subService.clearCache(schedule.userId)
+        })
       }
       break
     }

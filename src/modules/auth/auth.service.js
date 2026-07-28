@@ -223,20 +223,23 @@ export async function login(email, password, deviceName, ipAddress, userAgent) {
     throw new AuthError('Invalid email or password', ERROR_CODES.AUTH_FAILED);
   }
 
-  await repo.resetFailedAttempts(user.id);
-  await repo.updateUserLogin(user.id);
-  await repo.createLoginHistory(generateUuid(), user.id, LOGIN_METHOD.EMAIL_PASSWORD, ipAddress, userAgent, true);
-
   user.roles = await repo.findUserRoles(user.id);
   user.permissions = await repo.findUserPermissions(user.id);
 
   const accessToken = generateAccessToken(user);
-  const { refreshToken } = await createSession(user.id, deviceName, ipAddress);
+
+  let createdSession;
+  await transaction(async () => {
+    await repo.resetFailedAttempts(user.id);
+    await repo.updateUserLogin(user.id);
+    await repo.createLoginHistory(generateUuid(), user.id, LOGIN_METHOD.EMAIL_PASSWORD, ipAddress, userAgent, true);
+    createdSession = await createSession(user.id, deviceName, ipAddress);
+  });
 
   return {
     user: sanitizeUser(user),
     accessToken,
-    refreshToken,
+    refreshToken: createdSession.refreshToken,
   };
 }
 
@@ -274,18 +277,23 @@ export async function refresh(refreshToken) {
     throw new AuthError('User account is not active', ERROR_CODES.ACCOUNT_INACTIVE);
   }
 
-  await repo.deleteSession(payload.sid);
-
   user.roles = await repo.findUserRoles(user.id);
   user.permissions = await repo.findUserPermissions(user.id);
 
   const accessToken = generateAccessToken(user);
-  const newSession = await createSession(user.id, session.device_name, null);
+  const newRefreshToken = generateRefreshToken(user.id, payload.sid);
+  const newRefreshTokenHash = hashToken(newRefreshToken);
+  const newExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+  const rotated = await repo.rotateSession(payload.sid, tokenHash, newRefreshTokenHash, newExpiresAt);
+  if (!rotated) {
+    throw new AuthError('Session has already been rotated', ERROR_CODES.SESSION_EXPIRED);
+  }
 
   return {
     user: sanitizeUser(user),
     accessToken,
-    refreshToken: newSession.refreshToken,
+    refreshToken: newRefreshToken,
   };
 }
 
@@ -328,13 +336,15 @@ export async function resetPassword(token, newPassword) {
   }
 
   const passwordHash = await hashPassword(newPassword);
-  await repo.usePasswordReset(tokenHash);
-  await repo.updateUserPassword(resetRecord.user_id, passwordHash);
-  await repo.deleteUserSessions(resetRecord.user_id);
-  await repo.createAuditLog(
-    generateUuid(), resetRecord.user_id, 'user', resetRecord.user_id,
-    'user.password_reset', null, { method: 'reset_token' }
-  );
+  await transaction(async () => {
+    await repo.usePasswordReset(tokenHash);
+    await repo.updateUserPassword(resetRecord.user_id, passwordHash);
+    await repo.deleteUserSessions(resetRecord.user_id);
+    await repo.createAuditLog(
+      generateUuid(), resetRecord.user_id, 'user', resetRecord.user_id,
+      'user.password_reset', null, { method: 'reset_token' }
+    );
+  });
 }
 
 export async function googleLogin(accessToken, ipAddress, userAgent, role) {
@@ -356,38 +366,6 @@ export async function googleLogin(accessToken, ipAddress, userAgent, role) {
     if (passwordRecord) {
       throw new ConflictError('An account with this email already exists. Please sign in with email and password.');
     }
-  } else {
-    const userId = generateUuid();
-    const names = (name || '').split(' ');
-    const firstName = names[0] || '';
-    const lastName = names.slice(1).join(' ') || '';
-
-    await repo.createUser(userId, email, USER_STATUS.ACTIVE);
-    await repo.createUserProfile(generateUuid(), userId, { firstName, lastName });
-    if (email_verified) {
-      await repo.updateUserStatus(userId, USER_STATUS.ACTIVE);
-      await query(
-        'UPDATE users SET email_verified_at = NOW() WHERE id = ?',
-        [uuidToBuffer(userId)]
-      );
-    }
-    const assignedRole = role || ROLE_CODES.CLIENT;
-    await repo.assignUserRole(userId, assignedRole);
-
-    if (assignedRole === ROLE_CODES.CLIENT) {
-      await query(
-        'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
-        [uuidToBuffer(userId), 10000]
-      );
-    }
-
-    user = await repo.findUserById(userId);
-
-    await repo.createAuditLog(
-      generateUuid(), userId, 'user', userId,
-      'user.registered', null,
-      { email, method: 'google', name, email_verified }
-    );
   }
 
   const provider = await repo.findOauthProviderByCode('google');
@@ -395,33 +373,71 @@ export async function googleLogin(accessToken, ipAddress, userAgent, role) {
     throw new Error('Google OAuth provider not configured');
   }
 
-  const oauthAccount = await repo.findOauthAccount(provider.id, sub);
+  let createdSession;
+  let accessTokenJwt;
+  await transaction(async () => {
+    if (!user) {
+      const userId = generateUuid();
+      const names = (name || '').split(' ');
+      const firstName = names[0] || '';
+      const lastName = names.slice(1).join(' ') || '';
 
-  if (!oauthAccount) {
-    await repo.createOauthAccount(
-      generateUuid(), user.id, provider.id, sub, email, name
-    );
+      await repo.createUser(userId, email, USER_STATUS.ACTIVE);
+      await repo.createUserProfile(generateUuid(), userId, { firstName, lastName });
+      if (email_verified) {
+        await repo.updateUserStatus(userId, USER_STATUS.ACTIVE);
+        await query(
+          'UPDATE users SET email_verified_at = NOW() WHERE id = ?',
+          [uuidToBuffer(userId)]
+        );
+      }
+      const assignedRole = role || ROLE_CODES.CLIENT;
+      await repo.assignUserRole(userId, assignedRole);
 
-    await repo.createAuditLog(
-      generateUuid(), user.id, 'oauth_account', user.id,
-      'oauth_account.linked', null,
-      { provider: 'google', provider_user_id: sub, email }
-    );
-  }
+      if (assignedRole === ROLE_CODES.CLIENT) {
+        await query(
+          'INSERT INTO user_wallets (user_id, coins) VALUES (?, ?) ON DUPLICATE KEY UPDATE coins = coins',
+          [uuidToBuffer(userId), 10000]
+        );
+      }
 
-  await repo.updateUserLogin(user.id);
-  await repo.createLoginHistory(generateUuid(), user.id, LOGIN_METHOD.GOOGLE, ipAddress, userAgent, true, provider.id);
+      user = await repo.findUserById(userId);
 
-  user.roles = await repo.findUserRoles(user.id);
-  user.permissions = await repo.findUserPermissions(user.id);
+      await repo.createAuditLog(
+        generateUuid(), userId, 'user', userId,
+        'user.registered', null,
+        { email, method: 'google', name, email_verified }
+      );
+    }
 
-  const accessTokenJwt = generateAccessToken(user);
-  const { refreshToken } = await createSession(user.id, null, ipAddress);
+    const oauthAccount = await repo.findOauthAccount(provider.id, sub);
+
+    if (!oauthAccount) {
+      await repo.createOauthAccount(
+        generateUuid(), user.id, provider.id, sub, email, name
+      );
+
+      await repo.createAuditLog(
+        generateUuid(), user.id, 'oauth_account', user.id,
+        'oauth_account.linked', null,
+        { provider: 'google', provider_user_id: sub, email }
+      );
+    }
+
+    await repo.updateUserLogin(user.id);
+    await repo.createLoginHistory(generateUuid(), user.id, LOGIN_METHOD.GOOGLE, ipAddress, userAgent, true, provider.id);
+
+    user.roles = await repo.findUserRoles(user.id);
+    user.permissions = await repo.findUserPermissions(user.id);
+
+    accessTokenJwt = generateAccessToken(user);
+    createdSession = await createSession(user.id, null, ipAddress);
+  });
 
   return {
     user: sanitizeUser(user),
     accessToken: accessTokenJwt,
-    refreshToken,
+    refreshToken: createdSession.refreshToken,
   };
 }
 
