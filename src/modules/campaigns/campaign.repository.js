@@ -42,6 +42,13 @@ function mapCreativeRow(row) {
     hashtags: row.hashtags,
     textBody: row.text_body,
     callToAction: row.call_to_action,
+    headline: row.headline || null,
+    description: row.description || null,
+    utmSource: row.utm_source || null,
+    utmMedium: row.utm_medium || null,
+    utmCampaign: row.utm_campaign || null,
+    utmContent: row.utm_content || null,
+    utmTerm: row.utm_term || null,
     createdAt: row.created_at,
   }
 }
@@ -58,6 +65,8 @@ function mapMetaSettingsRow(row) {
     budgetType: row.budget_type,
     budgetAmount: row.budget_amount ? Number(row.budget_amount) : null,
     billingEvent: row.billing_event || null,
+    spendCap: row.spend_cap ? Number(row.spend_cap) : null,
+    endTime: row.end_time || null,
     targeting: typeof row.targeting === 'string' ? JSON.parse(row.targeting) : row.targeting || {},
     platformPlacement: typeof row.platform_placement === 'string' ? JSON.parse(row.platform_placement) : row.platform_placement || {},
   }
@@ -284,10 +293,14 @@ export async function softDeleteCampaign(id) {
 
 export async function createCreative(id, campaignId, data) {
   await query(
-    `INSERT INTO campaign_creatives (id, campaign_id, media_url, caption, hashtags, text_body, call_to_action)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO campaign_creatives (id, campaign_id, media_url, caption, hashtags, text_body, call_to_action, headline, description, utm_source, utm_medium, utm_campaign, utm_content, utm_term)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE media_url = VALUES(media_url), caption = VALUES(caption),
-       hashtags = VALUES(hashtags), text_body = VALUES(text_body), call_to_action = VALUES(call_to_action)`,
+       hashtags = VALUES(hashtags), text_body = VALUES(text_body), call_to_action = VALUES(call_to_action),
+       headline = VALUES(headline), description = VALUES(description),
+       utm_source = VALUES(utm_source), utm_medium = VALUES(utm_medium),
+       utm_campaign = VALUES(utm_campaign), utm_content = VALUES(utm_content),
+       utm_term = VALUES(utm_term)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(campaignId),
@@ -296,6 +309,13 @@ export async function createCreative(id, campaignId, data) {
       data.hashtags || null,
       data.textBody || null,
       data.callToAction || null,
+      data.headline || null,
+      data.description || null,
+      data.utmSource || null,
+      data.utmMedium || null,
+      data.utmCampaign || null,
+      data.utmContent || null,
+      data.utmTerm || null,
     ]
   )
   return findCreativeByCampaignId(campaignId)
@@ -308,12 +328,13 @@ export async function findCreativeByCampaignId(campaignId) {
 
 export async function createMetaSettings(id, campaignId, data) {
   await query(
-    `INSERT INTO campaign_meta_settings (id, campaign_id, objective, ad_account_id, bid_strategy, optimization_goal, budget_type, budget_amount, billing_event, targeting, platform_placement)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO campaign_meta_settings (id, campaign_id, objective, ad_account_id, bid_strategy, optimization_goal, budget_type, budget_amount, billing_event, spend_cap, end_time, targeting, platform_placement)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE objective = VALUES(objective), ad_account_id = VALUES(ad_account_id),
        bid_strategy = VALUES(bid_strategy), optimization_goal = VALUES(optimization_goal),
        budget_type = VALUES(budget_type), budget_amount = VALUES(budget_amount),
-       billing_event = VALUES(billing_event), targeting = VALUES(targeting), platform_placement = VALUES(platform_placement)`,
+       billing_event = VALUES(billing_event), spend_cap = VALUES(spend_cap), end_time = VALUES(end_time),
+       targeting = VALUES(targeting), platform_placement = VALUES(platform_placement)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(campaignId),
@@ -324,6 +345,8 @@ export async function createMetaSettings(id, campaignId, data) {
       data.budgetType || null,
       data.budgetAmount || null,
       data.billingEvent || null,
+      data.spendCap || null,
+      data.endTime ? new Date(data.endTime).toISOString().slice(0, 19).replace('T', ' ') : null,
       JSON.stringify(data.targeting || {}),
       JSON.stringify(data.platformPlacement || {}),
     ]

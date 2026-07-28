@@ -141,6 +141,25 @@ export async function updateOAuthAccount(id, updates) {
   return findById(id);
 }
 
+export async function findByPlatformUserIdGlobally(platformId, platformUserId) {
+  const row = await queryOne(
+    'SELECT * FROM user_platform_accounts WHERE platform_id = ? AND platform_user_id = ?',
+    [uuidToBuffer(platformId), platformUserId]
+  );
+  return mapOAuthAccountRow(row);
+}
+
+export async function findAllPlatformUserIdsByPlatform(platformId, tokenType = null) {
+  let sql = 'SELECT platform_user_id FROM user_platform_accounts WHERE platform_id = ? AND platform_user_id IS NOT NULL'
+  const params = [uuidToBuffer(platformId)]
+  if (tokenType) {
+    sql += ' AND token_type = ?'
+    params.push(tokenType)
+  }
+  const rows = await query(sql, params)
+  return rows.map(r => r.platform_user_id)
+}
+
 export async function hardDeleteAccount(id) {
   await query('DELETE FROM user_platform_accounts WHERE id = ?', [uuidToBuffer(id)]);
 }

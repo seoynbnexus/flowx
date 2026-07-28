@@ -9,6 +9,7 @@ import {
   creativeSchema,
   metaSettingsSchema,
   campaignQuerySchema,
+  duplicateCampaignSchema,
 } from './campaign.validation.js'
 
 const router = Router()
@@ -25,5 +26,7 @@ router.get('/:id/creative', authenticate, requireRole('client', 'super_admin'), 
 router.put('/:id/meta-settings', authenticate, requireRole('client', 'super_admin'), validate(metaSettingsSchema), controller.saveMetaSettings)
 router.get('/:id/meta-settings', authenticate, requireRole('client', 'super_admin'), controller.getMetaSettings)
 router.post('/:id/confirm-adjustments', authenticate, requireRole('client', 'super_admin'), controller.confirmAdjustments)
+router.post('/:id/duplicate', authenticate, requireRole('client', 'super_admin'), validate(duplicateCampaignSchema), controller.duplicateCampaign)
+router.get('/:id/insights', authenticate, requireRole('client', 'super_admin'), controller.getCampaignInsights)
 
 export default router

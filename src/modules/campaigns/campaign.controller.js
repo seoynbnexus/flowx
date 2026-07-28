@@ -103,3 +103,22 @@ export async function getMetaSettings(req, res, next) {
     next(error)
   }
 }
+
+export async function duplicateCampaign(req, res, next) {
+  try {
+    const campaign = await service.duplicateCampaign(req.user.id, req.params.id, req.body)
+    return sendCreated(res, campaign, 'Campaign duplicated')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function getCampaignInsights(req, res, next) {
+  try {
+    const datePreset = req.query.datePreset || 'last_7d'
+    const insights = await service.getCampaignInsights(req.user.id, req.params.id, datePreset)
+    return sendSuccess(res, insights)
+  } catch (error) {
+    next(error)
+  }
+}

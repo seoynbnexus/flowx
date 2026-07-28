@@ -3,7 +3,7 @@ import { generateOAuthUrl as buildAuthUrl, exchangeCodeForToken, exchangeForLong
 import { getFacebookPages, getInstagramBusinessAccount, getInstagramProfile, getPageDetails, getPageAccessToken, getMe, getUserBusinesses, getBusinessOwnedPages, getBusinessClientPages, getBusinessOwnedInstagramAccounts, getBusinessClientInstagramAccounts } from '../../../shared/services/meta-graph.service.js';
 import { generateUuid } from '../../../shared/utils/uuid.utils.js';
 import { isMetaConfigured } from '../../../shared/services/meta-oauth.config.js';
-import { NotFoundError } from '../../../shared/errors/AppError.js';
+import { NotFoundError, ConflictError } from '../../../shared/errors/AppError.js';
 
 const STATE_MAP = new Map();
 
@@ -20,6 +20,11 @@ export async function generateOAuthUrl(userId, platformCode = 'instagram') {
 }
 
 async function upsertUserLevelToken(userId, platform, data) {
+  const globalExisting = await repo.findByPlatformUserIdGlobally(platform.id, data.platformUserId)
+  if (globalExisting && globalExisting.userId !== userId) {
+    throw new ConflictError('This Facebook account is already connected to another user. Please use a different Facebook account.')
+  }
+
   const existing = await repo.findUserLevelToken(userId, platform.id)
 
   const payload = {
@@ -52,6 +57,12 @@ async function upsertUserLevelToken(userId, platform, data) {
 }
 
 async function upsertPageAccount(userId, platform, data) {
+  const globalExisting = await repo.findByPlatformUserIdGlobally(platform.id, data.platformUserId)
+  if (globalExisting && globalExisting.userId !== userId) {
+    const label = platform.code === 'instagram' ? 'Instagram account' : 'Facebook Page'
+    throw new ConflictError(`This ${label} is already connected to another user.`)
+  }
+
   const existing = await repo.findExistingByUserAndPlatformUserId(userId, platform.id, data.platformUserId)
 
   const payload = {
@@ -124,6 +135,13 @@ export async function handleOAuthCallback(code, stateData) {
 
     // Store user-level token only — pages and IG are connected separately via discovery flow
     const fbUser = await getMe(accessToken)
+
+    // Check globally if this Meta account is already linked to another user
+    const globalUserToken = await repo.findByPlatformUserIdGlobally(fbPlatform.id, fbUser.id)
+    if (globalUserToken && globalUserToken.userId !== userId) {
+      return { success: false, error: 'This Facebook account is already connected to another user. Please use a different Facebook account.', errorType: 'conflict' }
+    }
+
     await upsertUserLevelToken(userId, fbPlatform, {
       profileUrl: `https://facebook.com/${fbUser.id}`,
       username: fbUser.name || null,
@@ -171,16 +189,13 @@ export async function getAvailablePages(userId) {
     }
   }
 
-  // Get already-connected active page IDs
-  const existingAccounts = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
-  const connectedPageIds = new Set(
-    existingAccounts
-      .filter(a => a.tokenType === 'page' && a.platformUserId)
-      .map(a => a.platformUserId)
+  // Get globally connected page IDs
+  const globallyConnectedPageIds = new Set(
+    await repo.findAllPlatformUserIdsByPlatform(fbPlatform.id, 'page')
   )
 
   const available = Array.from(allPages.values())
-    .filter(page => !connectedPageIds.has(page.id))
+    .filter(page => !globallyConnectedPageIds.has(page.id))
 
   return { pages: available }
 }
@@ -196,10 +211,13 @@ export async function addPage(userId, platformUserId) {
     throw new NotFoundError('No Facebook user-level token found. Please reconnect your Facebook account.')
   }
 
-  // Check not already connected
-  const existing = await repo.findExistingByUserAndPlatformUserId(userId, fbPlatform.id, platformUserId)
-  if (existing) {
-    throw new NotFoundError('This page is already connected.')
+  // Check not already connected globally
+  const globalExisting = await repo.findByPlatformUserIdGlobally(fbPlatform.id, platformUserId)
+  if (globalExisting) {
+    if (globalExisting.userId !== userId) {
+      throw new ConflictError('This Facebook Page is already connected to another user.')
+    }
+    throw new ConflictError('This page is already connected.')
   }
 
   const pageToken = await getPageAccessToken(platformUserId, userToken.accessToken)
@@ -238,12 +256,9 @@ export async function getAvailableInstagramAccounts(userId) {
 
   const accessToken = userToken.accessToken
 
-  // Get already-connected IG accounts
-  const existingIgAccounts = await repo.findAllByUserAndPlatform(userId, igPlatform.id)
-  const connectedIgIds = new Set(
-    existingIgAccounts
-      .filter(a => a.tokenType === 'page' && a.platformUserId)
-      .map(a => a.platformUserId)
+  // Get globally connected IG account IDs
+  const globallyConnectedIgIds = new Set(
+    await repo.findAllPlatformUserIdsByPlatform(igPlatform.id, 'page')
   )
 
   const available = new Map()
@@ -256,7 +271,7 @@ export async function getAvailableInstagramAccounts(userId) {
     try {
       const igAccount = await getInstagramBusinessAccount(page.platformUserId, page.accessToken)
       if (!igAccount) continue
-      if (connectedIgIds.has(igAccount.id)) continue
+      if (globallyConnectedIgIds.has(igAccount.id)) continue
       const key = igAccount.id
       if (!available.has(key)) {
         available.set(key, {
@@ -285,7 +300,7 @@ export async function getAvailableInstagramAccounts(userId) {
         try {
           const igAccount = await getInstagramBusinessAccount(page.id, page.access_token)
           if (!igAccount) continue
-          if (connectedIgIds.has(igAccount.id)) continue
+          if (globallyConnectedIgIds.has(igAccount.id)) continue
           const key = igAccount.id
           if (!available.has(key)) {
             available.set(key, {
@@ -310,7 +325,7 @@ export async function getAvailableInstagramAccounts(userId) {
         try {
           const igAccount = await getInstagramBusinessAccount(page.id, page.access_token)
           if (!igAccount) continue
-          if (connectedIgIds.has(igAccount.id)) continue
+          if (globallyConnectedIgIds.has(igAccount.id)) continue
           const key = igAccount.id
           if (!available.has(key)) {
             available.set(key, {
@@ -339,7 +354,7 @@ export async function getAvailableInstagramAccounts(userId) {
     for (const business of businesses) {
       const ownedIg = await getBusinessOwnedInstagramAccounts(business.id, accessToken)
       for (const ig of ownedIg) {
-        if (connectedIgIds.has(ig.id)) continue
+        if (globallyConnectedIgIds.has(ig.id)) continue
         const key = ig.id
         if (!available.has(key)) {
           available.set(key, {
@@ -356,7 +371,7 @@ export async function getAvailableInstagramAccounts(userId) {
       }
       const clientIg = await getBusinessClientInstagramAccounts(business.id, accessToken)
       for (const ig of clientIg) {
-        if (connectedIgIds.has(ig.id)) continue
+        if (globallyConnectedIgIds.has(ig.id)) continue
         const key = ig.id
         if (!available.has(key)) {
           available.set(key, {
@@ -456,9 +471,12 @@ export async function addInstagramAccount(userId, igBusinessAccountId) {
     throw new NotFoundError('No Facebook Page linked to this Instagram account was found.')
   }
 
-  const existing = await repo.findExistingByUserAndPlatformUserId(userId, igPlatform.id, matchedIgAccount.id)
-  if (existing) {
-    throw new NotFoundError('This Instagram account is already connected.')
+  const globalIgExisting = await repo.findByPlatformUserIdGlobally(igPlatform.id, matchedIgAccount.id)
+  if (globalIgExisting) {
+    if (globalIgExisting.userId !== userId) {
+      throw new ConflictError('This Instagram account is already connected to another user.')
+    }
+    throw new ConflictError('This Instagram account is already connected.')
   }
 
   const igProfile = await getInstagramProfile(matchedIgAccount.id, matchedPage.accessToken)
@@ -549,18 +567,12 @@ export async function getDiscoveredAssets(userId) {
     console.warn(`[Discover] Business pages failed: ${err.message}`)
   }
 
-  const existingFbAccounts = await repo.findAllByUserAndPlatform(userId, fbPlatform.id)
   const connectedPageIds = new Set(
-    existingFbAccounts
-      .filter(a => a.tokenType === 'page' && a.platformUserId)
-      .map(a => a.platformUserId)
+    await repo.findAllPlatformUserIdsByPlatform(fbPlatform.id, 'page')
   )
 
-  const existingIgAccounts = await repo.findAllByUserAndPlatform(userId, igPlatform?.id || '')
   const connectedIgIds = new Set(
-    existingIgAccounts
-      .filter(a => a.tokenType === 'page' && a.platformUserId)
-      .map(a => a.platformUserId)
+    igPlatform ? await repo.findAllPlatformUserIdsByPlatform(igPlatform.id, 'page') : []
   )
 
   // Discover Instagram via linked pages (from all page sources)
@@ -661,6 +673,29 @@ export async function connectSelectedAssets(userId, pageIds, igBusinessAccountId
   }
 
   const storedAccounts = []
+
+  // Pre-validate global uniqueness for all selected assets
+  const conflicts = []
+
+  for (const pageId of pageIds) {
+    const globalExisting = await repo.findByPlatformUserIdGlobally(fbPlatform.id, pageId)
+    if (globalExisting && globalExisting.userId !== userId) {
+      conflicts.push(`Facebook page "${globalExisting.platformDisplayName || pageId}"`)
+    }
+  }
+
+  if (igPlatform) {
+    for (const igId of igBusinessAccountIds) {
+      const globalExisting = await repo.findByPlatformUserIdGlobally(igPlatform.id, igId)
+      if (globalExisting && globalExisting.userId !== userId) {
+        conflicts.push(`Instagram account "${globalExisting.platformDisplayName || igId}"`)
+      }
+    }
+  }
+
+  if (conflicts.length > 0) {
+    throw new ConflictError(`The following assets are already connected to another user: ${conflicts.join(', ')}`)
+  }
 
   // Connect selected pages
   for (const pageId of pageIds) {

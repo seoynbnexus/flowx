@@ -47,15 +47,17 @@ async function graphGet(path, params = {}) {
   return res.json()
 }
 
-export async function createAdCampaign(adAccountId, name, objective, status = 'PAUSED', accessToken) {
-  const data = await graphPost(`act_${adAccountId}/campaigns`, {
+export async function createAdCampaign(adAccountId, name, objective, status = 'PAUSED', accessToken, extra = {}) {
+  const params = {
     access_token: accessToken,
     name,
     objective,
     status,
     special_ad_categories: [],
     is_adset_budget_sharing_enabled: false,
-  })
+  }
+  if (extra.spendCap) params.spend_cap = extra.spendCap
+  const data = await graphPost(`act_${adAccountId}/campaigns`, params)
   return data
 }
 
@@ -100,23 +102,30 @@ export async function createAdSet(adAccountId, campaignId, targeting, budget, sc
     if (placement.instagramPositions) params.instagram_positions = placement.instagramPositions
   }
 
+  if (budget.promotedPageId) params.promoted_object = { page_id: budget.promotedPageId }
+
+  if (placement?.adSchedule) params.ad_schedule = placement.adSchedule
+  if (placement?.frequencyControl) params.frequency_control_specs = placement.frequencyControl
+
   const data = await graphPost(`act_${adAccountId}/adsets`, params)
   return data
 }
 
-export async function createAdCreative(adAccountId, pageId, message, mediaUrl, callToAction, accessToken) {
+export async function createAdCreative(adAccountId, pageId, message, mediaUrl, callToAction, accessToken, extra = {}) {
   const objectStorySpec = {
     page_id: pageId,
   }
 
   if (mediaUrl) {
-    objectStorySpec.link_data = {
+    const linkData = {
       link: mediaUrl,
       message: message || '',
-      call_to_action: callToAction ? { type: callToAction } : undefined,
     }
-  } else {
-    objectStorySpec.page_id = pageId
+    if (callToAction) linkData.call_to_action = { type: callToAction }
+    if (extra.headline) linkData.name = extra.headline
+    if (extra.description) linkData.description = extra.description
+    if (extra.imageHash) linkData.image_hash = extra.imageHash
+    objectStorySpec.link_data = linkData
   }
 
   const params = {
@@ -153,14 +162,16 @@ export async function createAdCreativeFromPost(adAccountId, objectStoryId, name,
   return data
 }
 
-export async function createAd(adAccountId, adSetId, creativeId, name, accessToken, status = 'PAUSED') {
-  const data = await graphPost(`act_${adAccountId}/ads`, {
+export async function createAd(adAccountId, adSetId, creativeId, name, accessToken, status = 'PAUSED', extra = {}) {
+  const params = {
     access_token: accessToken,
     name: name || `Ad ${Date.now()}`,
     adset_id: adSetId,
     creative: { creative_id: creativeId },
     status,
-  })
+  }
+  if (extra.urlTags) params.url_tags = extra.urlTags
+  const data = await graphPost(`act_${adAccountId}/ads`, params)
   return data
 }
 

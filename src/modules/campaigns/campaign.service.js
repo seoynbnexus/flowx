@@ -16,6 +16,7 @@ import {
   updateAdStatus,
   getObjectStatus,
   getCampaignSpend,
+  getCampaignInsights as getCampaignInsightsFromMeta,
 } from '../../../shared/services/meta-ads.service.js'
 import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
 import { transaction, queryOne } from '../../../shared/database/connection.js'
@@ -35,6 +36,17 @@ export async function getCoinConversionRate() {
 
 export function invalidateCoinRateCache() {
   cachedCoinRate = null
+}
+
+function buildUrlTags(creative) {
+  if (!creative?.utmSource && !creative?.utmMedium && !creative?.utmCampaign) return null
+  const params = new URLSearchParams()
+  if (creative.utmSource) params.set('utm_source', creative.utmSource)
+  if (creative.utmMedium) params.set('utm_medium', creative.utmMedium)
+  if (creative.utmCampaign) params.set('utm_campaign', creative.utmCampaign)
+  if (creative.utmContent) params.set('utm_content', creative.utmContent)
+  if (creative.utmTerm) params.set('utm_term', creative.utmTerm)
+  return params.toString()
 }
 
 function assertValidTransition(current, next) {
@@ -278,12 +290,14 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
 
   try {
     const t0 = Date.now()
+    const spendCapInPaise = metaSettings?.spendCap ? Math.round(metaSettings.spendCap * coinRate * 100) : null
     const fbCampaign = await createAdCampaign(
       adAccountId,
       fbCampaignName,
       metaSettings?.objective || 'OUTCOME_TRAFFIC',
       'PAUSED',
       systemToken,
+      { spendCap: spendCapInPaise },
     )
     await repo.createMetaObject(campaignId, 'facebook_campaign', fbCampaign.id, null, 'PAUSED')
     await logMetaEvent({
@@ -296,12 +310,22 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
     delete targeting.gender
     delete targeting.country
 
+    if (targeting.geo_locations) {
+      delete targeting.geo_locations.location_types
+    }
+
     const geo = targeting.geo_locations
     if (geo?.countries?.length && (geo.regions?.length || geo.cities?.length || geo.zips?.length)) {
       delete geo.countries
     }
-    if (!targeting.geo_locations?.countries?.length) {
-      targeting.geo_locations = { countries: ['IN'] }
+    if (!geo?.countries?.length) {
+      if (!geo) targeting.geo_locations = { countries: ['IN'] }
+      else targeting.geo_locations.countries = ['IN']
+    }
+    if (geo?.custom_locations?.length) {
+      delete geo.regions
+      delete geo.cities
+      delete geo.zips
     }
 
     if (targeting.age_min && targeting.age_max && targeting.age_min > targeting.age_max) {
@@ -319,8 +343,14 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
         bidStrategy: metaSettings?.bidStrategy || 'LOWEST_COST_WITHOUT_CAP',
         optimizationGoal: metaSettings?.optimizationGoal || 'REACH',
         billingEvent: metaSettings?.billingEvent || null,
+        promotedPageId: pageId,
       },
-      campaign.scheduledAt ? { startTime: Math.floor(new Date(campaign.scheduledAt).getTime() / 1000) } : {},
+      (() => {
+        const s = {}
+        if (campaign.scheduledAt) s.startTime = Math.floor(new Date(campaign.scheduledAt).getTime() / 1000)
+        if (metaSettings?.endTime) s.endTime = Math.floor(new Date(metaSettings.endTime).getTime() / 1000)
+        return s
+      })(),
       metaSettings?.platformPlacement || {},
       systemToken,
     )
@@ -337,6 +367,7 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
       creative?.mediaUrl || null,
       creative?.callToAction || null,
       systemToken,
+      { headline: creative?.headline, description: creative?.description },
     )
     await repo.createMetaObject(campaignId, 'ad_creative', fbCreative.id, null, null)
     await logMetaEvent({
@@ -344,6 +375,7 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
     })
 
     const t3 = Date.now()
+    const urlTags = buildUrlTags(creative)
     const fbAd = await createAd(
       adAccountId,
       fbAdSet.id,
@@ -351,6 +383,7 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
       fbCampaignName,
       systemToken,
       'PAUSED',
+      { urlTags },
     )
     await repo.createMetaObject(campaignId, 'ad', fbAd.id, null, 'PAUSED')
     await logMetaEvent({
@@ -796,4 +829,74 @@ export async function getPublisherCategories(publisherId) {
 
 export async function getCampaignDetail(campaignId) {
   return getCampaign(null, campaignId, true)
+}
+
+export async function duplicateCampaign(userId, campaignId, data) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.clientId !== userId) throw new ForbiddenError('Not your campaign')
+
+  const newId = generateUuid()
+  const newName = data.name || `${campaign.name} (Copy)`
+
+  const newCampaign = await repo.createCampaign(newId, userId, {
+    name: newName,
+    type: campaign.type,
+    categoryId: campaign.categoryId,
+    scheduledAt: null,
+    publisherCount: campaign.publisherCount,
+    coinsPerPublisher: campaign.coinsPerPublisher,
+  })
+
+  const creative = await repo.findCreativeByCampaignId(campaignId)
+  if (creative) {
+    await repo.createCreative(generateUuid(), newId, {
+      mediaUrl: creative.mediaUrl,
+      caption: creative.caption,
+      hashtags: creative.hashtags,
+      textBody: creative.textBody,
+      callToAction: creative.callToAction,
+      headline: creative.headline,
+      description: creative.description,
+      utmSource: creative.utmSource,
+      utmMedium: creative.utmMedium,
+      utmCampaign: creative.utmCampaign,
+      utmContent: creative.utmContent,
+      utmTerm: creative.utmTerm,
+    })
+  }
+
+  const metaSettings = await repo.findMetaSettingsByCampaignId(campaignId)
+  if (metaSettings) {
+    await repo.createMetaSettings(generateUuid(), newId, {
+      objective: metaSettings.objective,
+      adAccountId: metaSettings.adAccountId,
+      bidStrategy: metaSettings.bidStrategy,
+      optimizationGoal: metaSettings.optimizationGoal,
+      budgetType: metaSettings.budgetType,
+      budgetAmount: metaSettings.budgetAmount,
+      billingEvent: metaSettings.billingEvent,
+      spendCap: metaSettings.spendCap,
+      endTime: metaSettings.endTime,
+      targeting: metaSettings.targeting,
+      platformPlacement: metaSettings.platformPlacement,
+    })
+  }
+
+  return newCampaign
+}
+
+export async function getCampaignInsights(userId, campaignId, datePreset = 'last_7d') {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.clientId !== userId) throw new ForbiddenError('Not your campaign')
+
+  const metaObjects = await repo.findMetaObjectsByCampaignId(campaignId)
+  const fbCampaignObj = metaObjects.find(o => o.objectType === 'facebook_campaign')
+  if (!fbCampaignObj) throw new ValidationError('Campaign has no Meta objects yet')
+
+  const systemToken = process.env.META_SYSTEM_USER_TOKEN
+  if (!systemToken) throw new ValidationError('Meta system token not configured')
+
+  return getCampaignInsightsFromMeta(fbCampaignObj.objectId, systemToken, datePreset)
 }
