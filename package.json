@@ -49,6 +49,7 @@
     "tokens:refresh": "node src/jobs/refresh-tokens.js",
     "campaigns:activate": "node src/jobs/activate-scheduled-campaigns.js",
     "campaigns:sync-status": "node src/jobs/sync-meta-campaigns.js",
+"campaigns:handle-awaiting": "node src/jobs/handle-awaiting-publishers.js",
     "test": "vitest run",
     "test:watch": "vitest"
   }

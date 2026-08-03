@@ -47,7 +47,25 @@ async function graphGet(path, params = {}) {
   return res.json()
 }
 
-export async function createAdCampaign(adAccountId, name, objective, status = 'PAUSED', accessToken, extra = {}) {
+export function extractMetaError(error) {
+  const message = error?.message || String(error)
+  const match = message.match(/failed: (\{.*\})/s)
+  if (!match) return null
+  try {
+    const parsed = JSON.parse(match[1])
+    return {
+      userMsg: parsed.error?.error_user_msg || null,
+      userTitle: parsed.error?.error_user_title || null,
+      code: parsed.error?.code || null,
+      subcode: parsed.error?.error_subcode || null,
+      raw: message,
+    }
+  } catch {
+    return null
+  }
+}
+
+export async function createAdCampaign(adAccountId, name, objective, status = 'PAUSED', accessToken, extra = {}, validateOnly = false) {
   const params = {
     access_token: accessToken,
     name,
@@ -57,6 +75,7 @@ export async function createAdCampaign(adAccountId, name, objective, status = 'P
     is_adset_budget_sharing_enabled: false,
   }
   if (extra.spendCap) params.spend_cap = extra.spendCap
+  if (validateOnly) params.execution_options = ['validate_only']
   const data = await graphPost(`act_${adAccountId}/campaigns`, params)
   return data
 }
@@ -74,7 +93,7 @@ const GOAL_BILLING_MAP = {
   VALUE: 'OFFSITE_CONVERSIONS',
 }
 
-export async function createAdSet(adAccountId, campaignId, targeting, budget, schedule, placement, accessToken) {
+export async function createAdSet(adAccountId, campaignId, targeting, budget, schedule, placement, accessToken, validateOnly = false) {
   const optimizationGoal = budget.optimizationGoal || 'REACH'
   const params = {
     access_token: accessToken,
@@ -107,11 +126,13 @@ export async function createAdSet(adAccountId, campaignId, targeting, budget, sc
   if (placement?.adSchedule) params.ad_schedule = placement.adSchedule
   if (placement?.frequencyControl) params.frequency_control_specs = placement.frequencyControl
 
+  if (validateOnly) params.execution_options = ['validate_only']
+
   const data = await graphPost(`act_${adAccountId}/adsets`, params)
   return data
 }
 
-export async function createAdCreative(adAccountId, pageId, message, mediaUrl, callToAction, accessToken, extra = {}) {
+export async function createAdCreative(adAccountId, pageId, message, mediaUrl, callToAction, accessToken, extra = {}, validateOnly = false) {
   const objectStorySpec = {
     page_id: pageId,
   }
@@ -133,6 +154,8 @@ export async function createAdCreative(adAccountId, pageId, message, mediaUrl, c
     name: `Creative ${Date.now()}`,
     object_story_spec: objectStorySpec,
   }
+
+  if (validateOnly) params.execution_options = ['validate_only']
 
   const data = await graphPost(`act_${adAccountId}/adcreatives`, params)
   return data
@@ -162,7 +185,7 @@ export async function createAdCreativeFromPost(adAccountId, objectStoryId, name,
   return data
 }
 
-export async function createAd(adAccountId, adSetId, creativeId, name, accessToken, status = 'PAUSED', extra = {}) {
+export async function createAd(adAccountId, adSetId, creativeId, name, accessToken, status = 'PAUSED', extra = {}, validateOnly = false) {
   const params = {
     access_token: accessToken,
     name: name || `Ad ${Date.now()}`,
@@ -171,6 +194,7 @@ export async function createAd(adAccountId, adSetId, creativeId, name, accessTok
     status,
   }
   if (extra.urlTags) params.url_tags = extra.urlTags
+  if (validateOnly) params.execution_options = ['validate_only']
   const data = await graphPost(`act_${adAccountId}/ads`, params)
   return data
 }

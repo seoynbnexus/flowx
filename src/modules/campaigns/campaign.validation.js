@@ -8,6 +8,7 @@ export const createCampaignSchema = z.object({
   scheduledAt: z.string().datetime().optional().nullable(),
   publisherCount: z.coerce.number().int().positive().optional().nullable(),
   coinsPerPublisher: z.coerce.number().positive().optional().nullable(),
+  runOnPublishers: z.boolean().optional().default(false),
 })
 
 export const updateCampaignSchema = z.object({
@@ -17,6 +18,7 @@ export const updateCampaignSchema = z.object({
   scheduledAt: z.string().datetime().optional().nullable(),
   publisherCount: z.coerce.number().int().positive().optional().nullable(),
   coinsPerPublisher: z.coerce.number().positive().optional().nullable(),
+  runOnPublishers: z.boolean().optional(),
 })
 
 export const creativeSchema = z.object({

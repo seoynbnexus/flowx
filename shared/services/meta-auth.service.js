@@ -82,3 +82,20 @@ export function computeExpiresAt(expiresInSeconds) {
   date.setSeconds(date.getSeconds() + expiresInSeconds);
   return date;
 }
+
+export async function revokeAppAuthorization(userAccessToken) {
+  const url = `${META_CONFIG.graphUrl}/me/permissions?access_token=${userAccessToken}`
+  try {
+    const res = await apiFetch(url, { method: 'DELETE' }, { service: 'meta_auth', operation: 'revoke_app' })
+    if (!res.ok) {
+      const error = await res.text()
+      console.warn(`[meta-auth] Revoke app failed: ${error}`)
+      return { success: false, error }
+    }
+    const data = await res.json()
+    return { success: data.success === true }
+  } catch (err) {
+    console.warn(`[meta-auth] Revoke app error: ${err.message}`)
+    return { success: false, error: err.message }
+  }
+}

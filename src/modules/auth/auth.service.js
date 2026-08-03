@@ -38,7 +38,7 @@ function generateAccessToken(user) {
 
 function generateRefreshToken(userId, sessionId) {
   return jwt.sign(
-    { sub: userId, sid: sessionId },
+    { sub: userId, sid: sessionId, jwtid: generateUuid() },
     JWT_REFRESH_SECRET,
     { expiresIn: TOKEN_EXPIRY.REFRESH }
   );

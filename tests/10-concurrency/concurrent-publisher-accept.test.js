@@ -66,7 +66,7 @@ describe('concurrent publisher accept', () => {
   it('should work sequentially', async () => {
     const requestId = await createRequest()
     const result = await campaignService.acceptPublisherRequest(publisherId, requestId)
-    expect(result.status).toBe('failed')
+    expect(result.status).toBe('accepted')
   })
 
   it('should only accept the same request once', async () => {

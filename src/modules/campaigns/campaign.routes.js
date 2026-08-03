@@ -21,11 +21,13 @@ router.get('/:id', authenticate, requireRole('client', 'super_admin'), controlle
 router.patch('/:id', authenticate, requireRole('client', 'super_admin'), validate(updateCampaignSchema), controller.updateCampaign)
 router.post('/:id/submit', authenticate, requireRole('client', 'super_admin'), controller.submitCampaign)
 router.post('/:id/cancel', authenticate, requireRole('client', 'super_admin'), controller.cancelCampaign)
+router.post('/:id/validate', authenticate, requireRole('client', 'super_admin'), controller.validateCampaign)
 router.put('/:id/creative', authenticate, requireRole('client', 'super_admin'), validate(creativeSchema), controller.saveCreative)
 router.get('/:id/creative', authenticate, requireRole('client', 'super_admin'), controller.getCreative)
 router.put('/:id/meta-settings', authenticate, requireRole('client', 'super_admin'), validate(metaSettingsSchema), controller.saveMetaSettings)
 router.get('/:id/meta-settings', authenticate, requireRole('client', 'super_admin'), controller.getMetaSettings)
 router.post('/:id/confirm-adjustments', authenticate, requireRole('client', 'super_admin'), controller.confirmAdjustments)
+router.get('/:id/publishers', authenticate, requireRole('client', 'super_admin'), controller.getPublisherProgress)
 router.post('/:id/duplicate', authenticate, requireRole('client', 'super_admin'), validate(duplicateCampaignSchema), controller.duplicateCampaign)
 router.get('/:id/insights', authenticate, requireRole('client', 'super_admin'), controller.getCampaignInsights)
 

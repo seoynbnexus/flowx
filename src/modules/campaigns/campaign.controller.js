@@ -1,5 +1,5 @@
 import * as service from './campaign.service.js'
-import { sendSuccess, sendCreated, sendNoContent, sendPaginated } from '../../../shared/utils/response.utils.js'
+import { sendSuccess, sendCreated, sendNoContent, sendPaginated, sendAccepted } from '../../../shared/utils/response.utils.js'
 
 export async function createCampaign(req, res, next) {
   try {
@@ -59,6 +59,15 @@ export async function cancelCampaign(req, res, next) {
   }
 }
 
+export async function validateCampaign(req, res, next) {
+  try {
+    const result = await service.validateCampaignDraft(req.user.id, req.params.id)
+    return sendSuccess(res, result)
+  } catch (error) {
+    next(error)
+  }
+}
+
 export async function saveCreative(req, res, next) {
   try {
     const creative = await service.saveCreative(req.user.id, req.params.id, req.body)
@@ -79,8 +88,11 @@ export async function saveMetaSettings(req, res, next) {
 
 export async function confirmAdjustments(req, res, next) {
   try {
-    const campaign = await service.confirmAdjustments(req.user.id, req.params.id)
-    return sendSuccess(res, campaign, 'Adjustments confirmed, publisher requests sent')
+    const result = await service.confirmAdjustments(req.user.id, req.params.id)
+    if (result?.queued) {
+      return sendAccepted(res, { jobId: result.jobId }, 'Adjustments confirmed — activation queued')
+    }
+    return sendSuccess(res, result, 'Adjustments confirmed, publisher requests sent')
   } catch (error) {
     next(error)
   }
@@ -99,6 +111,15 @@ export async function getMetaSettings(req, res, next) {
   try {
     const campaign = await service.getCampaign(req.user.id, req.params.id)
     return sendSuccess(res, campaign.metaSettings || null)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function getPublisherProgress(req, res, next) {
+  try {
+    const progress = await service.getPublisherProgress(req.params.id, req.user.id)
+    return sendSuccess(res, progress)
   } catch (error) {
     next(error)
   }

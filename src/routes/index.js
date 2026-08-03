@@ -22,6 +22,7 @@ import subscriptionRoutes from '../modules/subscriptions/subscription.routes.js'
 import adminSubscriptionRoutes from '../modules/subscriptions/admin.routes.js';
 import paymentRoutes from '../modules/payments/payment.routes.js';
 import adminPaymentRoutes from '../modules/payments/admin.routes.js';
+import notificationRoutes from '../modules/notifications/notifications.routes.js';
 
 const router = Router();
 
@@ -47,6 +48,7 @@ router.use('/subscriptions', subscriptionRoutes);
 router.use('/admin/subscriptions', adminSubscriptionRoutes);
 router.use('/payments', paymentRoutes);
 router.use('/admin/payments', adminPaymentRoutes);
+router.use('/notifications', notificationRoutes);
 router.use('/docs', swaggerMiddleware);
 
 router.get('/health', (_req, res) => {

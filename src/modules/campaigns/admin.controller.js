@@ -1,5 +1,5 @@
 import * as service from './campaign.service.js'
-import { sendSuccess, sendPaginated, sendError } from '../../../shared/utils/response.utils.js'
+import { sendSuccess, sendPaginated, sendError, sendAccepted } from '../../../shared/utils/response.utils.js'
 import { HTTP_STATUS } from '../../../shared/constants/httpStatus.js'
 import { query, queryOne } from '../../../shared/database/connection.js'
 import { generateUuid, uuidToBuffer } from '../../../shared/utils/uuid.utils.js'
@@ -28,8 +28,11 @@ export async function getCampaignDetail(req, res, next) {
 
 export async function approveCampaign(req, res, next) {
   try {
-    const campaign = await service.approveCampaign(req.user.id, req.params.id, req.body)
-    return sendSuccess(res, campaign, 'Campaign approved')
+    const result = await service.approveCampaign(req.user.id, req.params.id, req.body)
+    if (result?.queued) {
+      return sendAccepted(res, { jobId: result.jobId }, 'Campaign approved — activation queued')
+    }
+    return sendSuccess(res, result, 'Campaign approved')
   } catch (error) {
     next(error)
   }
@@ -46,8 +49,26 @@ export async function rejectCampaign(req, res, next) {
 
 export async function retryCampaignMeta(req, res, next) {
   try {
-    const result = await service.retryCampaignMeta(req.params.id)
-    return sendSuccess(res, result, result.success ? 'Meta ads created successfully' : 'Meta ad creation failed')
+    const job = await service.queueRetryMeta(req.params.id)
+    return sendAccepted(res, { jobId: job.jobId }, 'Meta ad creation queued')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function forceGoLive(req, res, next) {
+  try {
+    const job = await service.queueForceGoLive(req.user.id, req.params.id)
+    return sendAccepted(res, { jobId: job.jobId }, 'Force go-live queued')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function forceCancel(req, res, next) {
+  try {
+    const campaign = await service.forceCancelCampaign(req.user.id, req.params.id)
+    return sendSuccess(res, campaign, 'Campaign cancelled')
   } catch (error) {
     next(error)
   }

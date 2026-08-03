@@ -28,6 +28,10 @@ export function sendCreated(res, data = null, message = 'Created successfully') 
   return sendSuccess(res, data, message, HTTP_STATUS.CREATED);
 }
 
+export function sendAccepted(res, data = null, message = 'Accepted — job queued') {
+  return sendSuccess(res, data, message, HTTP_STATUS.ACCEPTED);
+}
+
 export function sendNoContent(res) {
   return res.status(HTTP_STATUS.NO_CONTENT).send();
 }

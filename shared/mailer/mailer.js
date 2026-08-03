@@ -53,6 +53,27 @@ function passwordResetHtml(token) {
 </html>`;
 }
 
+function newCampaignRequestHtml(publisherName, campaignName, coinsOffered, link) {
+  return `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:sans-serif;padding:24px;background:#f5f5f5">
+  <div style="max-width:480px;margin:auto;background:white;border-radius:8px;padding:32px">
+    <h2 style="margin-top:0">New Campaign Request</h2>
+    <p>Hi ${publisherName},</p>
+    <p>You have a new campaign partnership opportunity:</p>
+    <div style="padding:16px;background:#f0f4ff;border-radius:8px;margin:16px 0">
+      <p style="margin:0 0 4px"><strong>${campaignName}</strong></p>
+      <p style="margin:0;color:#666">Offering <strong>${coinsOffered.toLocaleString()} coins</strong></p>
+    </div>
+    <a href="${link}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:white;text-decoration:none;border-radius:6px;margin:8px 0">View Request</a>
+    <p style="color:#999;font-size:12px;margin-top:16px">Respond before this offer expires.</p>
+  </div>
+</body>
+</html>`
+}
+
 export async function sendOtpEmail(to, otp) {
   await transporter.sendMail({
     from,
@@ -68,5 +89,15 @@ export async function sendPasswordResetEmail(to, token) {
     to,
     subject: 'Reset your password',
     html: passwordResetHtml(token),
+  });
+}
+
+export async function sendNewCampaignRequestEmail(to, publisherName, campaignName, coinsOffered, frontendUrl) {
+  const link = `${frontendUrl}/publisher/requests`
+  await transporter.sendMail({
+    from,
+    to,
+    subject: `New Campaign Request: ${campaignName}`,
+    html: newCampaignRequestHtml(publisherName, campaignName, coinsOffered, link),
   });
 }

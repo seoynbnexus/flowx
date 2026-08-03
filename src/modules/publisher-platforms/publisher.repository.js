@@ -77,6 +77,21 @@ export async function hardDeleteAccount(id) {
   );
 }
 
+export async function findAllAccountsByUserId(userId) {
+  const rows = await query(
+    'SELECT * FROM user_platform_accounts WHERE user_id = ?',
+    [uuidToBuffer(userId)]
+  )
+  return rows.map(mapAccountRow)
+}
+
+export async function deleteAccountsByUser(userId) {
+  await query(
+    'DELETE FROM user_platform_accounts WHERE user_id = ?',
+    [uuidToBuffer(userId)]
+  )
+}
+
 export async function verifyAccount(id, status, adminId) {
   await query(
     `UPDATE user_platform_accounts

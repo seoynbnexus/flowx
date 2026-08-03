@@ -322,14 +322,14 @@ describe('refresh', () => {
     expect(refreshResult.refreshToken).toBeTruthy()
     expect(refreshResult.user).toBeDefined()
 
-    // Old token should no longer work
+    // Old token should no longer work — reuse detection revokes the session
     await expect(refresh(loginResult.refreshToken)).rejects.toThrow()
 
     const sessionsAfter = await query(
       'SELECT * FROM user_sessions WHERE user_id = ?',
       [userRow.id]
     )
-    expect(sessionsAfter.length).toBe(1)
+    expect(sessionsAfter.length).toBe(0)
   })
 
   it('should reject invalid refresh token', async () => {

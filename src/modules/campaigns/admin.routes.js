@@ -11,6 +11,8 @@ router.get('/:id', authenticate, requirePermission('campaigns.review'), adminCon
 router.post('/:id/approve', authenticate, requirePermission('campaigns.review'), validate(approveCampaignSchema), adminController.approveCampaign)
 router.post('/:id/reject', authenticate, requirePermission('campaigns.review'), validate(rejectCampaignSchema), adminController.rejectCampaign)
 router.post('/:id/retry-meta', authenticate, requirePermission('campaigns.review'), adminController.retryCampaignMeta)
+router.post('/:id/force-go-live', authenticate, requirePermission('campaigns.force-manage'), adminController.forceGoLive)
+router.post('/:id/force-cancel', authenticate, requirePermission('campaigns.force-manage'), adminController.forceCancel)
 router.put('/conversion-rate', authenticate, requirePermission('campaigns.review'), validate(coinConversionRateSchema), adminController.updateConversionRate)
 
 export default router

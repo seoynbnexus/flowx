@@ -26,7 +26,7 @@ describe('role service', () => {
   it('should create a role', async () => {
     const role = await roleService.create({
       code: `test_role_${dateTag}`,
-      name: 'Test Role',
+      name: `Test Role ${dateTag}`,
       description: 'A test role',
     })
     expect(role.code).toBe(`test_role_${dateTag}`)

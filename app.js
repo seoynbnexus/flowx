@@ -71,6 +71,10 @@ async function start() {
     await pool.getConnection();
     console.log('Database connected');
 
+    const { startCampaignJobWorker } = await import('./src/modules/campaigns/campaign.jobs.js');
+    startCampaignJobWorker();
+    console.log('Campaign job worker started');
+
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });

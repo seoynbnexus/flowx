@@ -29,6 +29,15 @@ export async function removeAccount(req, res, next) {
   }
 }
 
+export async function disconnectAll(req, res, next) {
+  try {
+    await service.disconnectAllAccounts(req.user.id);
+    return sendSuccess(res, null, 'All accounts disconnected');
+  } catch (error) {
+    next(error);
+  }
+}
+
 export async function listAllAccounts(req, res, next) {
   try {
     const result = await service.listAllAccounts({
@@ -55,6 +64,15 @@ export async function getInsights(req, res, next) {
   try {
     const data = await service.getAccountInsights(req.params.id);
     return sendSuccess(res, data);
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function adminRemoveAccount(req, res, next) {
+  try {
+    await service.adminRemoveAccount(req.user.id, req.params.id);
+    return sendSuccess(res, null, 'Account removed');
   } catch (error) {
     next(error);
   }

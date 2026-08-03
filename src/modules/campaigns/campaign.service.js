@@ -1,7 +1,7 @@
 import * as repo from './campaign.repository.js'
 import { generateUuid } from '../../../shared/utils/uuid.utils.js'
 import { NotFoundError, ValidationError, ForbiddenError } from '../../../shared/errors/AppError.js'
-import { CAMPAIGN_STATUS, VALID_TRANSITIONS, REVIEW_ACTIONS } from './campaign.model.js'
+import { CAMPAIGN_STATUS, VALID_TRANSITIONS, REVIEW_ACTIONS, CAMPAIGN_JOB_TYPES } from './campaign.model.js'
 import { addCoins, createTransaction } from '../ai/ai.repository.js'
 import { findActivePublishersByCategoryId } from './campaign.repository.js'
 import {
@@ -17,11 +17,38 @@ import {
   getObjectStatus,
   getCampaignSpend,
   getCampaignInsights as getCampaignInsightsFromMeta,
+  extractMetaError,
 } from '../../../shared/services/meta-ads.service.js'
 import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
 import { transaction, queryOne } from '../../../shared/database/connection.js'
 
 let cachedCoinRate = null
+
+export async function enqueueCampaignJob(campaignId, jobType, actorId = null, payload = {}) {
+  const jobId = generateUuid()
+  const enqueued = await repo.enqueueCampaignJob(jobId, campaignId, jobType, actorId, payload)
+  return { jobId, enqueued }
+}
+
+export async function markCampaignJobFailed(campaignId, jobType, message) {
+  try {
+    const campaign = await repo.findCampaignById(campaignId)
+    if (!campaign) return
+    const inFlight = [
+      CAMPAIGN_STATUS.PENDING_REVIEW,
+      CAMPAIGN_STATUS.APPROVED,
+      CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+      CAMPAIGN_STATUS.SCHEDULED,
+    ].includes(campaign.status)
+    if (inFlight) {
+      await repo.updateCampaign(campaignId, { metaStatus: 'failed', metaError: message })
+    }
+    await repo.createReviewLog(campaignId, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+      `Background job ${jobType} failed: ${message}`)
+  } catch (err) {
+    // best-effort — never let failure marking crash the worker
+  }
+}
 
 export async function getCoinConversionRate() {
   if (cachedCoinRate !== null) return cachedCoinRate
@@ -36,6 +63,36 @@ export async function getCoinConversionRate() {
 
 export function invalidateCoinRateCache() {
   cachedCoinRate = null
+}
+
+let cachedPublisherMultiplier = null
+let cachedDeadlineDays = null
+
+export async function getPublisherRequestMultiplier() {
+  if (cachedPublisherMultiplier !== null) return cachedPublisherMultiplier
+  try {
+    const row = await queryOne("SELECT config_value FROM app_config WHERE config_key = 'publisher_request_multiplier'")
+    cachedPublisherMultiplier = row ? JSON.parse(row.config_value) : 2
+    return cachedPublisherMultiplier
+  } catch {
+    return 2
+  }
+}
+
+export async function getPublisherResponseDeadlineDays() {
+  if (cachedDeadlineDays !== null) return cachedDeadlineDays
+  try {
+    const row = await queryOne("SELECT config_value FROM app_config WHERE config_key = 'publisher_response_deadline_days'")
+    cachedDeadlineDays = row ? JSON.parse(row.config_value) : 7
+    return cachedDeadlineDays
+  } catch {
+    return 7
+  }
+}
+
+export function invalidatePublisherConfigCache() {
+  cachedPublisherMultiplier = null
+  cachedDeadlineDays = null
 }
 
 function buildUrlTags(creative) {
@@ -200,39 +257,102 @@ export async function confirmAdjustments(userId, campaignId) {
   }
 
   const coinService = await import('../../../shared/services/coin.service.js')
-  let updated
-  await transaction(async () => {
-    await coinService.spend(userId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
-
-    updated = await repo.updateCampaignWithStatusGuard(campaignId, {
-      status: CAMPAIGN_STATUS.SCHEDULED,
-      escrowAmount: totalEscrow,
-      coinsEscrowedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
-      clientConfirmed: true,
-      clientConfirmedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
-    }, CAMPAIGN_STATUS.APPROVED)
-
-    await repo.createReviewLog(campaignId, userId, REVIEW_ACTIONS.CONFIRMED, CAMPAIGN_STATUS.APPROVED, 'Client confirmed admin adjustments')
-
-    if (campaign.categoryId && campaign.publisherCount && campaign.coinsPerPublisher) {
-      await createPublisherRequestsForCampaign(campaignId, campaign.categoryId, campaign.publisherCount, campaign.coinsPerPublisher)
-    }
-  })
-
-  const publishResult = await publishAdForClient(campaignId)
-  if (publishResult.success) {
-    const activateResult = await activateAllMetaObjects(campaignId)
-    if (activateResult.success) {
-      const scheduledAt = campaign.scheduledAt ? new Date(campaign.scheduledAt) : null
-      const isFutureSchedule = scheduledAt && scheduledAt.getTime() > Date.now()
-      const afterPublishStatus = isFutureSchedule ? CAMPAIGN_STATUS.SCHEDULED : CAMPAIGN_STATUS.RUNNING
-      await repo.updateCampaignWithStatusGuard(campaignId, { status: afterPublishStatus }, CAMPAIGN_STATUS.SCHEDULED)
-      await repo.createReviewLog(campaignId, userId, REVIEW_ACTIONS.CONFIRMED, CAMPAIGN_STATUS.SCHEDULED,
-        `Campaign ${afterPublishStatus === CAMPAIGN_STATUS.RUNNING ? 'is now running' : 'scheduled'}`)
-    }
+  const available = await coinService.getAvailable(userId)
+  if (available.total < totalDeduction) {
+    throw new ValidationError('Insufficient coins. You need to top up your wallet first.')
   }
 
-  return updated
+  let updated
+
+  // Publisher flow after adjustments — await publishers before Meta ads
+  if (campaign.categoryId && campaign.publisherCount && campaign.coinsPerPublisher) {
+    const multiplier = await getPublisherRequestMultiplier()
+    const deadlineDays = await getPublisherResponseDeadlineDays()
+    const deadlineAt = new Date()
+    deadlineAt.setDate(deadlineAt.getDate() + deadlineDays)
+
+    await transaction(async () => {
+      await coinService.spend(userId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
+
+      updated = await repo.updateCampaignWithStatusGuard(campaignId, {
+        status: CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+        escrowAmount: totalEscrow,
+        coinsEscrowedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+        publisherResponseDeadlineAt: deadlineAt.toISOString().slice(0, 19).replace('T', ' '),
+        clientConfirmed: true,
+        clientConfirmedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      }, CAMPAIGN_STATUS.APPROVED)
+
+      await repo.createReviewLog(campaignId, userId, REVIEW_ACTIONS.CONFIRMED, CAMPAIGN_STATUS.APPROVED,
+        `Client confirmed — awaiting ${campaign.publisherCount} publishers`)
+
+      await createPublisherRequestsForCampaign(campaignId, campaign.categoryId, campaign.publisherCount, campaign.coinsPerPublisher, multiplier)
+    })
+    return updated
+  }
+
+  const queuedJob = await enqueueCampaignJob(campaignId, CAMPAIGN_JOB_TYPES.CONFIRM_GO_LIVE, userId)
+  return { queued: true, jobId: queuedJob.jobId, campaign }
+}
+
+export async function confirmAndGoLive(campaignId, userId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (![CAMPAIGN_STATUS.APPROVED, CAMPAIGN_STATUS.SCHEDULED].includes(campaign.status)) {
+    throw new ValidationError('Campaign must be in approved status to confirm')
+  }
+  if (!campaign.adminNotes) {
+    throw new ValidationError('No admin adjustments to confirm')
+  }
+
+  const coinService = await import('../../../shared/services/coin.service.js')
+
+  if (campaign.status === CAMPAIGN_STATUS.APPROVED) {
+    const totalEscrow = calculateTotalEscrow(campaign)
+    const metaSettings = await repo.findMetaSettingsByCampaignId(campaignId)
+    const adBudgetCost = calculateAdBudget(metaSettings, campaign.publisherCount)
+    const totalDeduction = totalEscrow + adBudgetCost
+
+    const available = await coinService.getAvailable(campaign.clientId)
+    if (available.total < totalDeduction) {
+      throw new ValidationError('Insufficient coins. You need to top up your wallet first.')
+    }
+
+    await transaction(async () => {
+      await coinService.spend(campaign.clientId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
+
+      await repo.updateCampaignWithStatusGuard(campaignId, {
+        status: CAMPAIGN_STATUS.SCHEDULED,
+        escrowAmount: totalEscrow,
+        coinsEscrowedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+        clientConfirmed: true,
+        clientConfirmedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      }, CAMPAIGN_STATUS.APPROVED)
+
+      await repo.createReviewLog(campaignId, userId, REVIEW_ACTIONS.CONFIRMED, CAMPAIGN_STATUS.APPROVED, 'Client confirmed admin adjustments')
+    })
+  }
+
+  const publishResult = await publishAdForClient(campaignId)
+  if (!publishResult.success) {
+    throw new ValidationError(`Failed to publish campaign on Meta: ${publishResult.error}`)
+  }
+
+  const activateResult = await activateAllMetaObjects(campaignId)
+  if (!activateResult.success) {
+    throw new ValidationError(`Failed to activate Meta ads: ${activateResult.results.find(r => !r.success)?.error || 'unknown error'}`)
+  }
+
+  const scheduledAt = campaign.scheduledAt ? new Date(campaign.scheduledAt) : null
+  const isFutureSchedule = scheduledAt && scheduledAt.getTime() > Date.now()
+  const afterPublishStatus = isFutureSchedule ? CAMPAIGN_STATUS.SCHEDULED : CAMPAIGN_STATUS.RUNNING
+
+  if (afterPublishStatus === CAMPAIGN_STATUS.RUNNING) {
+    await repo.updateCampaignWithStatusGuard(campaignId, { status: CAMPAIGN_STATUS.RUNNING }, CAMPAIGN_STATUS.SCHEDULED)
+    await repo.createReviewLog(campaignId, userId, REVIEW_ACTIONS.CONFIRMED, CAMPAIGN_STATUS.SCHEDULED, 'Campaign is now running')
+  }
+
+  return repo.findCampaignById(campaignId)
 }
 
 function calculateTotalEscrow(campaign) {
@@ -245,12 +365,135 @@ function calculateAdBudget(metaSettings, publisherCount) {
   return (metaSettings?.budgetAmount || 1000) * ((publisherCount || 0) + 1)
 }
 
-async function createPublisherRequestsForCampaign(campaignId, categoryId, targetCount, coinsPerPublisher) {
+async function createPublisherRequestsForCampaign(campaignId, categoryId, targetCount, coinsPerPublisher, multiplier = 1) {
   const publishers = await findActivePublishersByCategoryId(categoryId)
-  const selected = publishers.slice(0, targetCount)
-  if (selected.length === 0) return
+  console.log(`[campaign] createPublisherRequests: campaign=${campaignId.substring(0,8)} category=${categoryId.substring(0,8)} publishersFound=${publishers.length} target=${targetCount}`)
+  const sendCount = Math.min(publishers.length, targetCount * multiplier)
+  const selected = publishers.slice(0, sendCount)
+  if (selected.length === 0) {
+    console.log(`[campaign] No publishers found for category ${categoryId.substring(0,8)} — skipping request creation`)
+    return
+  }
 
-  await repo.createPublisherRequests(campaignId, selected.map(p => p.publisherId), coinsPerPublisher)
+  const created = await repo.createPublisherRequests(campaignId, selected.map(p => p.publisherId), coinsPerPublisher)
+  console.log(`[campaign] Created ${created.length} publisher requests for campaign ${campaignId.substring(0,8)}`)
+
+  const campaign = await repo.findCampaignById(campaignId)
+  const { createAndSend } = await import('../notifications/notifications.service.js')
+  for (const item of created) {
+    const pub = selected.find(p => p.publisherId === item.publisherId)
+    if (!pub) continue
+    try {
+      await createAndSend(
+        item.publisherId,
+        'new_campaign_request',
+        'New Campaign Request',
+        `New request: "${campaign?.name || 'Campaign'}" — ${coinsPerPublisher.toLocaleString()} coins`,
+        { campaignId, campaignName: campaign?.name, coinsOffered: coinsPerPublisher, requestId: item.requestId },
+        pub.email,
+        pub.firstName,
+      )
+    } catch (err) {
+      console.warn(`[campaign] Failed to notify publisher ${item.publisherId}: ${err.message}`)
+    }
+  }
+}
+
+const MIN_BUDGET_INR = 100
+const MIN_DURATION_MS = 24 * 60 * 60 * 1000
+
+function buildMetaAdPayloads(campaign, creative, metaSettings, pageId, coinRate) {
+  const coinBudget = metaSettings?.budgetAmount || 1000
+  const budgetInINR = Math.round(coinBudget * coinRate)
+  const isDaily = metaSettings?.budgetType === 'daily' || !metaSettings?.budgetType
+  const minBudgetError = budgetInINR < MIN_BUDGET_INR
+    ? `Minimum ${isDaily ? 'daily' : 'lifetime'} budget is ₹${MIN_BUDGET_INR} (${Math.ceil(MIN_BUDGET_INR / coinRate)} coins at current conversion rate)`
+    : null
+
+  const now = Date.now()
+  const startTimeMs = campaign.scheduledAt ? new Date(campaign.scheduledAt).getTime() : null
+  const endTimeMs = metaSettings?.endTime ? new Date(metaSettings.endTime).getTime() : null
+  let scheduleError = null
+  if (startTimeMs !== null && Number.isFinite(startTimeMs) && startTimeMs <= now) {
+    scheduleError = 'Ad set start time must be in the future'
+  } else if (endTimeMs !== null && Number.isFinite(endTimeMs) && endTimeMs <= now) {
+    scheduleError = 'Ad set end time must be in the future'
+  } else if (startTimeMs !== null && endTimeMs !== null && Number.isFinite(endTimeMs) && endTimeMs <= startTimeMs) {
+    scheduleError = 'Ad set end time must be after start time'
+  } else if (!isDaily && endTimeMs === null) {
+    scheduleError = 'End time is required for lifetime budget'
+  } else if (isDaily && endTimeMs !== null && Number.isFinite(endTimeMs) && endTimeMs - (startTimeMs ?? now) <= MIN_DURATION_MS) {
+    scheduleError = 'Daily budget is only allowed for ad sets running longer than 24 hours'
+  }
+
+  const fbCampaignName = `FlowX-${campaign.name}-${campaign.id.substring(0, 8)}`
+
+  const targeting = metaSettings?.targeting || {}
+
+  delete targeting.age
+  delete targeting.gender
+  delete targeting.country
+
+  if (targeting.geo_locations) {
+    delete targeting.geo_locations.location_types
+  }
+
+  const geo = targeting.geo_locations
+  if (geo?.countries?.length && (geo.regions?.length || geo.cities?.length || geo.zips?.length)) {
+    delete geo.countries
+  }
+  if (!geo?.countries?.length && !geo?.custom_locations?.length) {
+    if (!geo) targeting.geo_locations = { countries: ['IN'] }
+    else targeting.geo_locations.countries = ['IN']
+  }
+  if (geo?.custom_locations?.length) {
+    delete geo.regions
+    delete geo.cities
+    delete geo.zips
+    delete geo.countries
+  }
+
+  if (targeting.age_min && targeting.age_max && targeting.age_min > targeting.age_max) {
+    targeting.age_max = targeting.age_min
+  }
+
+  const spendCapInPaise = metaSettings?.spendCap ? Math.round(metaSettings.spendCap * coinRate * 100) : null
+  const creativeMessage = creative?.caption || creative?.textBody || campaign.name
+  const creativeMediaUrl = creative?.mediaUrl || null
+  const creativeCallToAction = creative?.callToAction || null
+  const creativeExtra = { headline: creative?.headline, description: creative?.description }
+  const adSetBudget = {
+    budgetType: metaSettings?.budgetType || 'daily',
+    budgetAmount: budgetInINR,
+    bidStrategy: metaSettings?.bidStrategy || 'LOWEST_COST_WITHOUT_CAP',
+    optimizationGoal: metaSettings?.optimizationGoal || 'REACH',
+    billingEvent: metaSettings?.billingEvent || null,
+    promotedPageId: pageId,
+  }
+  const adSetSchedule = (() => {
+    const s = {}
+    if (campaign.scheduledAt) s.startTime = Math.floor(new Date(campaign.scheduledAt).getTime() / 1000)
+    if (metaSettings?.endTime) s.endTime = Math.floor(new Date(metaSettings.endTime).getTime() / 1000)
+    return s
+  })()
+
+  return {
+    budgetInINR,
+    isDaily,
+    minBudgetError,
+    scheduleError,
+    fbCampaignName,
+    targeting,
+    spendCapInPaise,
+    creativeMessage,
+    creativeMediaUrl,
+    creativeCallToAction,
+    creativeExtra,
+    adSetBudget,
+    adSetSchedule,
+    adSetPlacement: metaSettings?.platformPlacement || {},
+    campaignObjective: metaSettings?.objective || 'OUTCOME_TRAFFIC',
+  }
 }
 
 async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
@@ -274,127 +517,205 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
   }
 
   const coinRate = await getCoinConversionRate()
-  const coinBudget = metaSettings?.budgetAmount || 1000
-  const budgetInINR = Math.round(coinBudget * coinRate)
-  const isDaily = metaSettings?.budgetType === 'daily' || !metaSettings?.budgetType
-  const MIN_BUDGET_INR = 100
-  if (budgetInINR < MIN_BUDGET_INR) {
-    const label = isDaily ? 'daily' : 'lifetime'
-    const minCoins = Math.ceil(MIN_BUDGET_INR / coinRate)
-    const error = `Minimum ${label} budget is ₹${MIN_BUDGET_INR} (${minCoins} coins at current conversion rate)`
-    await logMetaEvent({ campaignId, userId, action: 'create_all', error })
-    return { success: false, error }
+  const payload = buildMetaAdPayloads(campaign, creative, metaSettings, pageId, coinRate)
+  if (payload.minBudgetError) {
+    await logMetaEvent({ campaignId, userId, action: 'create_all', error: payload.minBudgetError })
+    return { success: false, error: payload.minBudgetError }
+  }
+  if (payload.scheduleError) {
+    await logMetaEvent({ campaignId, userId, action: 'create_all', error: payload.scheduleError })
+    return { success: false, error: payload.scheduleError }
   }
 
-  const fbCampaignName = `FlowX-${campaign.name}-${campaignId.substring(0, 8)}`
+  const {
+    targeting, adSetBudget, adSetSchedule, adSetPlacement,
+    fbCampaignName, spendCapInPaise, campaignObjective,
+    creativeMessage, creativeMediaUrl, creativeCallToAction, creativeExtra,
+  } = payload
+
+  const existingUserObjects = await repo.findMetaObjectsForUser(campaignId, userId)
+  for (const obj of [...existingUserObjects].reverse()) {
+    try {
+      await META_ROLLBACK_FN[obj.objectType](obj.objectId, systemToken)
+      await logMetaEvent({
+        campaignId, userId, action: `delete_${obj.objectType}`, objectType: obj.objectType, objectId: obj.objectId,
+      })
+    } catch (err) {
+      await logMetaEvent({
+        campaignId, userId, action: `delete_${obj.objectType}`, objectType: obj.objectType, objectId: obj.objectId, error: err.message,
+      })
+    }
+  }
+  await repo.deleteMetaObjectsForUser(campaignId, userId)
+
+  const createdObjects = []
+
+  const validateStep = async (step, fn) => {
+    try {
+      await fn()
+      return null
+    } catch (error) {
+      const detail = extractMetaError(error)
+      const message = detail?.userMsg || error.message
+      await logMetaEvent({ campaignId, userId, action: step, error: message })
+      return message
+    }
+  }
 
   try {
-    const t0 = Date.now()
-    const spendCapInPaise = metaSettings?.spendCap ? Math.round(metaSettings.spendCap * coinRate * 100) : null
-    const fbCampaign = await createAdCampaign(
-      adAccountId,
-      fbCampaignName,
-      metaSettings?.objective || 'OUTCOME_TRAFFIC',
-      'PAUSED',
-      systemToken,
-      { spendCap: spendCapInPaise },
+    const creativeValidationError = await validateStep('validate_creative', () =>
+      createAdCreative(adAccountId, pageId, creativeMessage, creativeMediaUrl, creativeCallToAction, systemToken, creativeExtra, true),
     )
-    await repo.createMetaObject(campaignId, 'facebook_campaign', fbCampaign.id, null, 'PAUSED')
+    if (creativeValidationError) return { success: false, error: creativeValidationError }
+
+    const campaignValidationError = await validateStep('validate_campaign', () =>
+      createAdCampaign(adAccountId, fbCampaignName, campaignObjective, 'PAUSED', systemToken, { spendCap: spendCapInPaise }, true),
+    )
+    if (campaignValidationError) return { success: false, error: campaignValidationError }
+
+    const t0 = Date.now()
+    const fbCampaign = await createAdCampaign(adAccountId, fbCampaignName, campaignObjective, 'PAUSED', systemToken, { spendCap: spendCapInPaise })
+    createdObjects.push({ type: 'facebook_campaign', id: fbCampaign.id })
+    await repo.createMetaObject(campaignId, 'facebook_campaign', fbCampaign.id, null, 'PAUSED', userId)
     await logMetaEvent({
-      campaignId, userId, action: 'create_campaign', objectType: 'facebook_campaign', objectId: fbCampaign.id, params: { name: fbCampaignName, objective: metaSettings?.objective }, durationMs: Date.now() - t0,
+      campaignId, userId, action: 'create_campaign', objectType: 'facebook_campaign', objectId: fbCampaign.id, params: { name: fbCampaignName, objective: campaignObjective }, durationMs: Date.now() - t0,
     })
 
-    const targeting = metaSettings?.targeting || {}
-
-    delete targeting.age
-    delete targeting.gender
-    delete targeting.country
-
-    if (targeting.geo_locations) {
-      delete targeting.geo_locations.location_types
-    }
-
-    const geo = targeting.geo_locations
-    if (geo?.countries?.length && (geo.regions?.length || geo.cities?.length || geo.zips?.length)) {
-      delete geo.countries
-    }
-    if (!geo?.countries?.length) {
-      if (!geo) targeting.geo_locations = { countries: ['IN'] }
-      else targeting.geo_locations.countries = ['IN']
-    }
-    if (geo?.custom_locations?.length) {
-      delete geo.regions
-      delete geo.cities
-      delete geo.zips
-    }
-
-    if (targeting.age_min && targeting.age_max && targeting.age_min > targeting.age_max) {
-      targeting.age_max = targeting.age_min
+    const adSetValidationError = await validateStep('validate_ad_set', () =>
+      createAdSet(adAccountId, fbCampaign.id, targeting, adSetBudget, adSetSchedule, adSetPlacement, systemToken, true),
+    )
+    if (adSetValidationError) {
+      await rollbackMetaObjects(createdObjects, campaignId, systemToken, userId)
+      return { success: false, error: adSetValidationError }
     }
 
     const t1 = Date.now()
-    const fbAdSet = await createAdSet(
-      adAccountId,
-      fbCampaign.id,
-      targeting,
-      {
-        budgetType: metaSettings?.budgetType || 'daily',
-        budgetAmount: budgetInINR,
-        bidStrategy: metaSettings?.bidStrategy || 'LOWEST_COST_WITHOUT_CAP',
-        optimizationGoal: metaSettings?.optimizationGoal || 'REACH',
-        billingEvent: metaSettings?.billingEvent || null,
-        promotedPageId: pageId,
-      },
-      (() => {
-        const s = {}
-        if (campaign.scheduledAt) s.startTime = Math.floor(new Date(campaign.scheduledAt).getTime() / 1000)
-        if (metaSettings?.endTime) s.endTime = Math.floor(new Date(metaSettings.endTime).getTime() / 1000)
-        return s
-      })(),
-      metaSettings?.platformPlacement || {},
-      systemToken,
-    )
-    await repo.createMetaObject(campaignId, 'ad_set', fbAdSet.id, null, 'PAUSED')
+    const fbAdSet = await createAdSet(adAccountId, fbCampaign.id, targeting, adSetBudget, adSetSchedule, adSetPlacement, systemToken)
+    createdObjects.push({ type: 'ad_set', id: fbAdSet.id })
+    await repo.createMetaObject(campaignId, 'ad_set', fbAdSet.id, null, 'PAUSED', userId)
     await logMetaEvent({
       campaignId, userId, action: 'create_ad_set', objectType: 'ad_set', objectId: fbAdSet.id, params: { campaignId: fbCampaign.id }, durationMs: Date.now() - t1,
     })
 
     const t2 = Date.now()
-    const fbCreative = await createAdCreative(
-      adAccountId,
-      pageId,
-      creative?.caption || creative?.textBody || campaign.name,
-      creative?.mediaUrl || null,
-      creative?.callToAction || null,
-      systemToken,
-      { headline: creative?.headline, description: creative?.description },
-    )
-    await repo.createMetaObject(campaignId, 'ad_creative', fbCreative.id, null, null)
+    const fbCreative = await createAdCreative(adAccountId, pageId, creativeMessage, creativeMediaUrl, creativeCallToAction, systemToken, creativeExtra)
+    createdObjects.push({ type: 'ad_creative', id: fbCreative.id })
+    await repo.createMetaObject(campaignId, 'ad_creative', fbCreative.id, null, null, userId)
     await logMetaEvent({
       campaignId, userId, action: 'create_creative', objectType: 'ad_creative', objectId: fbCreative.id, params: { pageId }, durationMs: Date.now() - t2,
     })
 
+    const adValidationError = await validateStep('validate_ad', () =>
+      createAd(adAccountId, fbAdSet.id, fbCreative.id, fbCampaignName, systemToken, 'PAUSED', { urlTags: buildUrlTags(creative) }, true),
+    )
+    if (adValidationError) {
+      await rollbackMetaObjects(createdObjects, campaignId, systemToken, userId)
+      return { success: false, error: adValidationError }
+    }
+
     const t3 = Date.now()
     const urlTags = buildUrlTags(creative)
-    const fbAd = await createAd(
-      adAccountId,
-      fbAdSet.id,
-      fbCreative.id,
-      fbCampaignName,
-      systemToken,
-      'PAUSED',
-      { urlTags },
-    )
-    await repo.createMetaObject(campaignId, 'ad', fbAd.id, null, 'PAUSED')
+    const fbAd = await createAd(adAccountId, fbAdSet.id, fbCreative.id, fbCampaignName, systemToken, 'PAUSED', { urlTags })
+    createdObjects.push({ type: 'ad', id: fbAd.id })
+    await repo.createMetaObject(campaignId, 'ad', fbAd.id, null, 'PAUSED', userId)
     await logMetaEvent({
       campaignId, userId, action: 'create_ad', objectType: 'ad', objectId: fbAd.id, params: { adSetId: fbAdSet.id, creativeId: fbCreative.id }, durationMs: Date.now() - t3,
     })
 
     return { success: true }
   } catch (error) {
-    await logMetaEvent({ campaignId, userId, action: 'create_all', error: error.message })
-    return { success: false, error: error.message }
+    await rollbackMetaObjects(createdObjects, campaignId, systemToken, userId)
+    const detail = extractMetaError(error)
+    const message = detail?.userMsg || error.message
+    await logMetaEvent({ campaignId, userId, action: 'create_all', error: message })
+    return { success: false, error: message }
   }
+}
+
+const META_ROLLBACK_FN = {
+  facebook_campaign: deleteAdCampaign,
+  ad_set: deleteAdSet,
+  ad_creative: deleteAdCreative,
+  ad: deleteAd,
+}
+
+async function rollbackMetaObjects(createdObjects, campaignId, systemToken, userId) {
+  for (let i = createdObjects.length - 1; i >= 0; i--) {
+    const obj = createdObjects[i]
+    try {
+      await META_ROLLBACK_FN[obj.type](obj.id, systemToken)
+    } catch {
+      // best-effort rollback
+    }
+  }
+  await repo.deleteMetaObjectsForUser(campaignId, userId)
+}
+
+export async function validateCampaignDraft(userId, campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  console.log("from service log campaign : ", campaign)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.clientId !== userId) throw new ForbiddenError('Not your campaign')
+
+  if (![
+    CAMPAIGN_STATUS.DRAFT,
+    CAMPAIGN_STATUS.PENDING_REVIEW,
+    CAMPAIGN_STATUS.REJECTED,
+    CAMPAIGN_STATUS.CHANGES_REQUESTED,
+  ].includes(campaign.status)) {
+    throw new ValidationError(`Campaign cannot be validated in ${campaign.status} status`)
+  }
+
+  const adAccountId = process.env.META_AD_ACCOUNT_ID
+  const systemToken = process.env.META_SYSTEM_USER_TOKEN
+  if (!adAccountId || !systemToken) {
+    return { valid: false, checks: [], error: 'Meta Ads not configured' }
+  }
+
+  const page = await repo.findVerifiedFacebookPage(userId)
+  if (!page) {
+    return { valid: false, checks: [], error: 'You need a verified Facebook page connected to run Meta campaigns' }
+  }
+
+  const [creative, metaSettings] = await Promise.all([
+    repo.findCreativeByCampaignId(campaignId),
+    repo.findMetaSettingsByCampaignId(campaignId),
+  ])
+
+  const coinRate = await getCoinConversionRate()
+  const payload = buildMetaAdPayloads(campaign, creative, metaSettings, page.platformUserId, coinRate)
+  if (payload.minBudgetError) {
+    return { valid: false, checks: [], error: payload.minBudgetError }
+  }
+  if (payload.scheduleError) {
+    return { valid: false, checks: [], error: payload.scheduleError }
+  }
+
+  const checks = []
+  const run = async (object, fn) => {
+    try {
+      await fn()
+      checks.push({ object, ok: true })
+    } catch (error) {
+      const detail = extractMetaError(error)
+      checks.push({ object, ok: false, error: detail?.userMsg || error.message })
+    }
+  }
+
+  await run('creative', () =>
+    createAdCreative(adAccountId, page.platformUserId, payload.creativeMessage, payload.creativeMediaUrl, payload.creativeCallToAction, systemToken, payload.creativeExtra, true),
+  )
+  await run('campaign', () =>
+    createAdCampaign(adAccountId, payload.fbCampaignName, payload.campaignObjective, 'PAUSED', systemToken, { spendCap: payload.spendCapInPaise }, true),
+  )
+
+  const failed = checks.filter(c => !c.ok)
+  await logMetaEvent({
+    campaignId, userId, action: 'pre_validate',
+    error: failed.length ? failed.map(c => c.error).join('; ') : null,
+  })
+
+  return { valid: failed.length === 0, checks, error: failed[0]?.error || null }
 }
 
 async function publishAdForClient(campaignId) {
@@ -476,32 +797,40 @@ export async function approveCampaign(adminId, campaignId, data) {
     updateData.escrowAmount = escrowAmount
     updateData.coinsEscrowedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
 
-    const publishResult = await publishAdForClient(campaignId)
-    if (!publishResult.success) {
-      throw new ValidationError(`Failed to publish campaign on Meta: ${publishResult.error}`)
+    // Publisher flow — await publishers before creating Meta ads
+    if (campaign.categoryId && campaign.publisherCount && campaign.coinsPerPublisher) {
+      const multiplier = await getPublisherRequestMultiplier()
+      const deadlineDays = await getPublisherResponseDeadlineDays()
+      const deadlineAt = new Date()
+      deadlineAt.setDate(deadlineAt.getDate() + deadlineDays)
+
+      let updated
+      await transaction(async () => {
+        await coinService.spend(campaign.clientId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
+
+        updated = await repo.updateCampaignWithStatusGuard(campaignId, {
+          status: CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+          escrowAmount,
+          coinsEscrowedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+          publisherResponseDeadlineAt: deadlineAt.toISOString().slice(0, 19).replace('T', ' '),
+          reviewedBy: adminId,
+          reviewedAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+          reviewNotes: data.notes || null,
+          publisherCount: effectivePublisherCount,
+          coinsPerPublisher: data.coinsPerPublisher ?? campaign.coinsPerPublisher,
+        }, CAMPAIGN_STATUS.PENDING_REVIEW)
+
+        await repo.createReviewLog(campaignId, adminId, REVIEW_ACTIONS.APPROVED, campaign.status, `Approved — awaiting ${campaign.publisherCount} publishers`)
+
+        await createPublisherRequestsForCampaign(campaignId, campaign.categoryId, campaign.publisherCount, campaign.coinsPerPublisher, multiplier)
+      })
+      return updated
     }
 
-    const activateResult = await activateAllMetaObjects(campaignId)
-    if (!activateResult.success) {
-      throw new ValidationError(`Failed to activate Meta ads: ${activateResult.results.find(r => !r.success)?.error || 'unknown error'}`)
-    }
-
-    const scheduledAt = campaign.scheduledAt ? new Date(campaign.scheduledAt) : null
-    const isFutureSchedule = scheduledAt && scheduledAt.getTime() > Date.now()
-    const afterPublishStatus = isFutureSchedule ? CAMPAIGN_STATUS.SCHEDULED : CAMPAIGN_STATUS.RUNNING
-    updateData.status = afterPublishStatus
-
-    let updated
-    await transaction(async () => {
-      updated = await repo.updateCampaignWithStatusGuard(campaignId, updateData, CAMPAIGN_STATUS.PENDING_REVIEW)
-      await repo.createReviewLog(campaignId, adminId, REVIEW_ACTIONS.APPROVED, campaign.status, data.notes || null)
-      await coinService.spend(campaign.clientId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
-      if (campaign.categoryId && campaign.publisherCount && campaign.coinsPerPublisher) {
-        await createPublisherRequestsForCampaign(campaignId, campaign.categoryId, campaign.publisherCount, campaign.coinsPerPublisher)
-      }
+    const queuedJob = await enqueueCampaignJob(campaignId, CAMPAIGN_JOB_TYPES.APPROVE_GO_LIVE, adminId, {
+      notes: data.notes || null,
     })
-
-    return updated
+    return { queued: true, jobId: queuedJob.jobId, campaign }
   }
 
   let updated
@@ -509,6 +838,58 @@ export async function approveCampaign(adminId, campaignId, data) {
     updated = await repo.updateCampaignWithStatusGuard(campaignId, updateData, CAMPAIGN_STATUS.PENDING_REVIEW)
     await repo.createReviewLog(campaignId, adminId, REVIEW_ACTIONS.APPROVED, campaign.status, data.notes || null)
   })
+  return updated
+}
+
+export async function approveAndGoLive(campaignId, adminId, payload = {}) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.status !== CAMPAIGN_STATUS.PENDING_REVIEW) {
+    throw new ValidationError('Campaign must be in pending review status')
+  }
+
+  const escrowAmount = calculateTotalEscrow(campaign)
+  const metaSettings = await repo.findMetaSettingsByCampaignId(campaignId)
+  const adBudgetCost = calculateAdBudget(metaSettings, campaign.publisherCount)
+  const totalDeduction = escrowAmount + adBudgetCost
+
+  const coinService = await import('../../../shared/services/coin.service.js')
+  const available = await coinService.getAvailable(campaign.clientId)
+  if (available.total < totalDeduction) {
+    throw new ValidationError('Client has insufficient coins. Campaign cannot be approved.')
+  }
+
+  const publishResult = await publishAdForClient(campaignId)
+  if (!publishResult.success) {
+    throw new ValidationError(`Failed to publish campaign on Meta: ${publishResult.error}`)
+  }
+
+  const activateResult = await activateAllMetaObjects(campaignId)
+  if (!activateResult.success) {
+    throw new ValidationError(`Failed to activate Meta ads: ${activateResult.results.find(r => !r.success)?.error || 'unknown error'}`)
+  }
+
+  const scheduledAt = campaign.scheduledAt ? new Date(campaign.scheduledAt) : null
+  const isFutureSchedule = scheduledAt && scheduledAt.getTime() > Date.now()
+  const afterPublishStatus = isFutureSchedule ? CAMPAIGN_STATUS.SCHEDULED : CAMPAIGN_STATUS.RUNNING
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ')
+
+  let updated
+  await transaction(async () => {
+    updated = await repo.updateCampaignWithStatusGuard(campaignId, {
+      status: afterPublishStatus,
+      reviewedBy: adminId,
+      reviewedAt: now,
+      reviewNotes: payload.notes || null,
+      publisherCount: campaign.publisherCount,
+      coinsPerPublisher: campaign.coinsPerPublisher,
+      escrowAmount,
+      coinsEscrowedAt: now,
+    }, CAMPAIGN_STATUS.PENDING_REVIEW)
+    await repo.createReviewLog(campaignId, adminId, REVIEW_ACTIONS.APPROVED, CAMPAIGN_STATUS.PENDING_REVIEW, payload.notes || null)
+    await coinService.spend(campaign.clientId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
+  })
+
   return updated
 }
 
@@ -543,19 +924,6 @@ export async function listPublisherRequests(publisherId, query) {
   return repo.findPublisherRequestsByPublisherId(publisherId, query)
 }
 
-async function tryTransitionToRunning(campaignId) {
-  const publishedCount = await repo.countPublisherRequestsByStatus(campaignId, 'published')
-  if (publishedCount === 0) return
-
-  const pendingCount = await repo.countPublisherRequestsByStatus(campaignId, 'pending')
-  const acceptedCount = await repo.countPublisherRequestsByStatus(campaignId, 'accepted')
-
-  if (pendingCount === 0 && acceptedCount === 0) {
-    await repo.updateCampaignStatus(campaignId, CAMPAIGN_STATUS.RUNNING)
-    await repo.createReviewLog(campaignId, null, REVIEW_ACTIONS.SUBMITTED, CAMPAIGN_STATUS.SCHEDULED, 'Campaign is now running on publisher pages')
-  }
-}
-
 export async function acceptPublisherRequest(publisherId, requestId) {
   const request = await repo.findPublisherRequestById(requestId)
   if (!request) throw new NotFoundError('Request not found')
@@ -566,24 +934,12 @@ export async function acceptPublisherRequest(publisherId, requestId) {
   if (!campaign) throw new NotFoundError('Campaign not found')
 
   return await transaction(async () => {
+    await repo.lockCampaignById(request.campaignId)
     const acceptedCount = await repo.countPublisherRequestsByStatus(request.campaignId, 'accepted')
     if (acceptedCount >= (campaign.publisherCount || Infinity)) {
       throw new ValidationError('Publisher capacity reached for this campaign')
     }
     await repo.updatePublisherRequestStatusWithGuard(requestId, 'accepted', new Date().toISOString().slice(0, 19).replace('T', ' '), 'pending')
-
-    const page = await repo.findVerifiedFacebookPage(publisherId)
-    if (page) {
-      const result = await createMetaAdObjectsForUser(request.campaignId, publisherId, page.platformUserId)
-      if (result.success) {
-        await repo.updatePublisherRequestPublishedWithGuard(requestId, 'accepted')
-      } else {
-        await repo.updatePublisherRequestStatusWithGuard(requestId, 'failed', new Date().toISOString().slice(0, 19).replace('T', ' '), 'accepted')
-      }
-    } else {
-      console.warn(`Publisher ${publisherId} has no verified Facebook page — marking request as failed`)
-      await repo.updatePublisherRequestStatusWithGuard(requestId, 'failed', new Date().toISOString().slice(0, 19).replace('T', ' '), 'accepted')
-    }
 
     const newAcceptedCount = await repo.countPublisherRequestsByStatus(request.campaignId, 'accepted')
 
@@ -592,11 +948,61 @@ export async function acceptPublisherRequest(publisherId, requestId) {
       for (const p of pendingRequests) {
         await repo.updatePublisherRequestStatusWithGuard(p.id, 'rejected', new Date().toISOString().slice(0, 19).replace('T', ' '), 'pending')
       }
+
+      await enqueueCampaignJob(request.campaignId, CAMPAIGN_JOB_TYPES.PUBLISHER_GO_LIVE)
     }
 
-    await tryTransitionToRunning(request.campaignId)
-
     return repo.findPublisherRequestById(requestId)
+  })
+}
+
+export async function goLiveForFilledCampaign(campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.status !== CAMPAIGN_STATUS.AWAITING_PUBLISHERS) {
+    throw new ValidationError('Campaign must be in awaiting_publishers status')
+  }
+
+  return await transaction(async () => {
+    await repo.lockCampaignById(campaignId)
+
+    const clientResult = await publishAdForClient(campaignId)
+    if (!clientResult.success) {
+      throw new Error(`Failed to create Meta ads for client: ${clientResult.error}`)
+    }
+
+    const acceptedRequests = await repo.findAcceptedPublisherRequests(campaignId)
+    for (const ar of acceptedRequests) {
+      const page = await repo.findVerifiedFacebookPage(ar.publisherId)
+      if (page) {
+        const result = await createMetaAdObjectsForUser(campaignId, ar.publisherId, page.platformUserId)
+        if (result.success) {
+          await repo.updatePublisherRequestPublishedWithGuard(ar.id, 'accepted')
+        } else {
+          await repo.updatePublisherRequestStatusWithGuard(ar.id, 'failed', new Date().toISOString().slice(0, 19).replace('T', ' '), 'accepted')
+        }
+      }
+    }
+
+    const activateResult = await activateAllMetaObjects(campaignId)
+
+    if (!activateResult.success) {
+      const activationError = activateResult.results.find(r => !r.success)?.error || 'Meta activation failed'
+      await logMetaEvent({ campaignId, userId: campaign.clientId, action: 'activate_all', error: activationError })
+      await repo.updateCampaign(campaignId, { metaStatus: 'failed', metaError: activationError })
+      await repo.createReviewLog(campaignId, null, REVIEW_ACTIONS.SUBMITTED, CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+        `Meta activation failed — campaign stays awaiting publishers: ${activationError}`)
+      return repo.findCampaignById(campaignId)
+    }
+
+    const scheduledAt = campaign.scheduledAt ? new Date(campaign.scheduledAt) : null
+    const isFutureSchedule = scheduledAt && scheduledAt.getTime() > Date.now()
+    const afterPublishStatus = isFutureSchedule ? CAMPAIGN_STATUS.SCHEDULED : CAMPAIGN_STATUS.RUNNING
+    await repo.updateCampaignWithStatusGuard(campaignId, { status: afterPublishStatus }, CAMPAIGN_STATUS.AWAITING_PUBLISHERS)
+    await repo.createReviewLog(campaignId, null, REVIEW_ACTIONS.SUBMITTED, CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+      `All ${campaign.publisherCount} publisher slots filled — campaign ${afterPublishStatus === CAMPAIGN_STATUS.RUNNING ? 'is now running' : 'scheduled'}`)
+
+    return repo.findCampaignById(campaignId)
   })
 }
 
@@ -608,6 +1014,18 @@ export async function rejectPublisherRequest(publisherId, requestId) {
 
   await repo.updatePublisherRequestStatusWithGuard(requestId, 'rejected', new Date().toISOString().slice(0, 19).replace('T', ' '), 'pending')
   return repo.findPublisherRequestById(requestId)
+}
+
+export async function queueRetryMeta(campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+
+  if (!process.env.META_AD_ACCOUNT_ID || !process.env.META_SYSTEM_USER_TOKEN) {
+    throw new ValidationError('Meta Ads not configured — set META_AD_ACCOUNT_ID and META_SYSTEM_USER_TOKEN')
+  }
+
+  const queuedJob = await enqueueCampaignJob(campaignId, CAMPAIGN_JOB_TYPES.RETRY_META)
+  return { queued: true, jobId: queuedJob.jobId }
 }
 
 export async function retryCampaignMeta(campaignId) {
@@ -646,7 +1064,25 @@ export async function retryCampaignMeta(campaignId) {
   return await transaction(async () => {
     await repo.deleteMetaObjectsByCampaignId(campaignId)
     const result = await publishAdForClient(campaignId)
-    return result
+    if (!result.success) return result
+
+    const requests = await repo.findPublisherRequestsByCampaignId(campaignId)
+    for (const r of requests.filter(r => r.status === 'accepted' || r.status === 'published')) {
+      const page = await repo.findVerifiedFacebookPage(r.publisherId)
+      if (!page) continue
+      const pubResult = await createMetaAdObjectsForUser(campaignId, r.publisherId, page.platformUserId)
+      if (pubResult.success) {
+        if (r.status === 'accepted') {
+          await repo.updatePublisherRequestPublishedWithGuard(r.id, 'accepted')
+        }
+      } else {
+        await logMetaEvent({
+          campaignId, userId: r.publisherId, action: 'retry_publisher', error: pubResult.error,
+        })
+      }
+    }
+
+    return { success: true }
   })
 }
 
@@ -658,6 +1094,11 @@ export async function activateAllMetaObjects(campaignId) {
   }
 
   const objects = await repo.findMetaObjectsByCampaignId(campaignId)
+
+  if (!objects.length) {
+    await logMetaEvent({ campaignId, action: 'activate_all', error: 'No Meta objects to activate' })
+    return { success: false, error: 'No Meta objects to activate' }
+  }
 
   const activateOrder = ['facebook_campaign', 'ad_set', 'ad']
   const results = []
@@ -886,17 +1327,228 @@ export async function duplicateCampaign(userId, campaignId, data) {
   return newCampaign
 }
 
-export async function getCampaignInsights(userId, campaignId, datePreset = 'last_7d') {
+export async function handleExpiredAwaitingCampaigns() {
+  const expired = await repo.findExpiredAwaitingCampaigns()
+  const results = []
+
+  for (const campaign of expired) {
+    try {
+      await transaction(async () => {
+        // Cancel all pending publisher requests
+        const pendingRequests = await repo.findPublisherRequestsByStatus(campaign.id, 'pending')
+        for (const p of pendingRequests) {
+          await repo.updatePublisherRequestStatus(p.id, 'cancelled', new Date().toISOString().slice(0, 19).replace('T', ' '))
+        }
+
+        // Refund escrow to client
+        if (campaign.escrowAmount > 0) {
+          const coinService = await import('../../../shared/services/coin.service.js')
+          await coinService.refund(campaign.clientId, campaign.escrowAmount, 'campaign_escrow', campaign.id, `Refund: publisher deadline passed for ${campaign.name}`)
+        }
+
+        // Transition to failed
+        await repo.updateCampaignWithStatusGuard(campaign.id, {
+          status: CAMPAIGN_STATUS.FAILED,
+          metaError: `Publisher response deadline passed — only ${pendingRequests.length} pending publishers responded`,
+        }, CAMPAIGN_STATUS.AWAITING_PUBLISHERS)
+
+        await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+          'Publisher response deadline passed — campaign failed')
+      })
+      results.push({ campaignId: campaign.id, success: true })
+    } catch (err) {
+      results.push({ campaignId: campaign.id, success: false, error: err.message })
+    }
+  }
+
+  return results
+}
+
+export async function queueForceGoLive(adminId, campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.status !== CAMPAIGN_STATUS.AWAITING_PUBLISHERS) {
+    throw new ValidationError('Campaign must be in awaiting_publishers status')
+  }
+
+  const queuedJob = await enqueueCampaignJob(campaignId, CAMPAIGN_JOB_TYPES.FORCE_GO_LIVE, adminId)
+  return { queued: true, jobId: queuedJob.jobId }
+}
+
+export async function forceGoLiveCampaign(adminId, campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.status !== CAMPAIGN_STATUS.AWAITING_PUBLISHERS) {
+    throw new ValidationError('Campaign must be in awaiting_publishers status')
+  }
+
+  const acceptedRequests = await repo.findAcceptedPublisherRequests(campaignId)
+
+  return await transaction(async () => {
+    await repo.lockCampaignById(campaignId)
+    // Cancel remaining pending requests
+    const pendingRequests = await repo.findPublisherRequestsByStatus(campaignId, 'pending')
+    for (const p of pendingRequests) {
+      await repo.updatePublisherRequestStatus(p.id, 'cancelled', new Date().toISOString().slice(0, 19).replace('T', ' '))
+    }
+
+    // Refund escrow for unfilled slots
+    const unfilledSlots = (campaign.publisherCount || 0) - acceptedRequests.length
+    if (unfilledSlots > 0 && campaign.coinsPerPublisher) {
+      const refundAmount = unfilledSlots * campaign.coinsPerPublisher * 1.1
+      const coinService = await import('../../../shared/services/coin.service.js')
+      await coinService.refund(campaign.clientId, Math.round(refundAmount), 'campaign_escrow', campaignId,
+        `Refund for ${unfilledSlots} unfilled publisher slots`)
+    }
+
+    // Create client Meta ads
+    const clientResult = await publishAdForClient(campaignId)
+    if (!clientResult.success) {
+      throw new ValidationError(`Failed to create Meta ads for client: ${clientResult.error}`)
+    }
+
+    // Create Meta ads for each accepted or published publisher
+    const publisherRequests = await repo.findPublisherRequestsByCampaignId(campaignId)
+    for (const ar of publisherRequests.filter(r => r.status === 'accepted' || r.status === 'published')) {
+      const page = await repo.findVerifiedFacebookPage(ar.publisherId)
+      if (page) {
+        const result = await createMetaAdObjectsForUser(campaignId, ar.publisherId, page.platformUserId)
+        if (result.success) {
+          if (ar.status === 'accepted') {
+            await repo.updatePublisherRequestPublishedWithGuard(ar.id, 'accepted')
+          }
+        } else {
+          if (ar.status === 'accepted') {
+            await repo.updatePublisherRequestStatusWithGuard(ar.id, 'failed', new Date().toISOString().slice(0, 19).replace('T', ' '), 'accepted')
+          }
+          await logMetaEvent({
+            campaignId, userId: ar.publisherId, action: 'publish_publisher', error: result.error,
+          })
+        }
+      }
+    }
+
+    // Activate all Meta objects
+    const activateResult = await activateAllMetaObjects(campaignId)
+
+    if (!activateResult.success) {
+      const activationError = activateResult.results.find(r => !r.success)?.error || 'Meta activation failed'
+      await logMetaEvent({ campaignId, userId: campaign.clientId, action: 'activate_all', error: activationError })
+      await repo.updateCampaign(campaignId, { metaStatus: 'failed', metaError: activationError })
+      await repo.createReviewLog(campaignId, adminId, REVIEW_ACTIONS.APPROVED, CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+        `Meta activation failed — campaign stays awaiting publishers: ${activationError}`)
+      return repo.findCampaignById(campaignId)
+    }
+
+    // Transition to running/scheduled
+    const scheduledAt = campaign.scheduledAt ? new Date(campaign.scheduledAt) : null
+    const isFutureSchedule = scheduledAt && scheduledAt.getTime() > Date.now()
+    const afterPublishStatus = isFutureSchedule ? CAMPAIGN_STATUS.SCHEDULED : CAMPAIGN_STATUS.RUNNING
+    await repo.updateCampaignWithStatusGuard(campaignId, { status: afterPublishStatus }, CAMPAIGN_STATUS.AWAITING_PUBLISHERS)
+    await repo.createReviewLog(campaignId, adminId, REVIEW_ACTIONS.APPROVED, CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+      `Admin force go-live with ${acceptedRequests.length} publishers — campaign ${afterPublishStatus === CAMPAIGN_STATUS.RUNNING ? 'running' : 'scheduled'}`)
+
+    return repo.findCampaignById(campaignId)
+  })
+}
+
+export async function forceCancelCampaign(adminId, campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.status !== CAMPAIGN_STATUS.AWAITING_PUBLISHERS) {
+    throw new ValidationError('Campaign must be in awaiting_publishers status')
+  }
+
+  return await transaction(async () => {
+    // Cancel all publisher requests
+    const allRequests = await repo.findPublisherRequestsByCampaignId(campaignId)
+    for (const r of allRequests) {
+      if (r.status === 'pending') {
+        await repo.updatePublisherRequestStatus(r.id, 'cancelled', new Date().toISOString().slice(0, 19).replace('T', ' '))
+      }
+    }
+
+    // Refund full escrow
+    if (campaign.escrowAmount > 0) {
+      const coinService = await import('../../../shared/services/coin.service.js')
+      await coinService.refund(campaign.clientId, campaign.escrowAmount, 'campaign_escrow', campaignId,
+        `Refund: campaign cancelled by admin — ${campaign.name}`)
+    }
+
+    // Transition to cancelled
+    await repo.updateCampaignWithStatusGuard(campaignId, {
+      status: CAMPAIGN_STATUS.CANCELLED,
+      metaError: `Cancelled by admin while awaiting publishers`,
+    }, CAMPAIGN_STATUS.AWAITING_PUBLISHERS)
+
+    await repo.createReviewLog(campaignId, adminId, REVIEW_ACTIONS.CANCELLED, CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+      'Admin force cancelled campaign while awaiting publishers')
+
+    return repo.findCampaignById(campaignId)
+  })
+}
+
+export async function getPublisherProgress(campaignId, userId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.clientId !== userId) throw new ForbiddenError('Not your campaign')
+
+  const publisherRequests = await repo.findPublisherRequestsByCampaignId(campaignId)
+
+  const counts = {
+    totalRequested: campaign.publisherCount || 0,
+    accepted: publisherRequests.filter(r => r.status === 'accepted').length,
+    published: publisherRequests.filter(r => r.status === 'published').length,
+    pending: publisherRequests.filter(r => r.status === 'pending').length,
+    rejected: publisherRequests.filter(r => r.status === 'rejected').length,
+    failed: publisherRequests.filter(r => r.status === 'failed').length,
+    cancelled: publisherRequests.filter(r => r.status === 'cancelled').length,
+  }
+
+  return {
+    counts,
+    publishers: publisherRequests.map(r => ({
+      id: r.id,
+      publisherId: r.publisherId,
+      publisherEmail: r.publisherEmail,
+      publisherFirstName: r.publisherFirstName,
+      publisherLastName: r.publisherLastName,
+      coinsOffered: r.coinsOffered,
+      status: r.status,
+      respondedAt: r.respondedAt,
+      publishedAt: r.publishedAt,
+    })),
+  }
+}
+
+export async function getCampaignInsights(userId, campaignId, datePreset = 'last_30d') {
   const campaign = await repo.findCampaignById(campaignId)
   if (!campaign) throw new NotFoundError('Campaign not found')
   if (campaign.clientId !== userId) throw new ForbiddenError('Not your campaign')
 
   const metaObjects = await repo.findMetaObjectsByCampaignId(campaignId)
-  const fbCampaignObj = metaObjects.find(o => o.objectType === 'facebook_campaign')
-  if (!fbCampaignObj) throw new ValidationError('Campaign has no Meta objects yet')
+  const fbCampaignObjs = metaObjects.filter(o => o.objectType === 'facebook_campaign')
+  if (!fbCampaignObjs.length) throw new ValidationError('Campaign has no Meta objects yet')
 
   const systemToken = process.env.META_SYSTEM_USER_TOKEN
   if (!systemToken) throw new ValidationError('Meta system token not configured')
 
-  return getCampaignInsightsFromMeta(fbCampaignObj.objectId, systemToken, datePreset)
+  let insights = []
+  let triedObjectIds = []
+
+  for (const obj of fbCampaignObjs) {
+    triedObjectIds.push(obj.objectId)
+    insights = await getCampaignInsightsFromMeta(obj.objectId, systemToken, datePreset)
+    if (insights && insights.length > 0) break
+  }
+
+  if (!insights || insights.length === 0) {
+    await logMetaEvent({
+      campaignId, action: 'get_insights',
+      params: { objectIds: triedObjectIds, datePreset, resultCount: 0 },
+      error: 'Empty insights response from Meta for all facebook_campaign objects',
+    })
+  }
+
+  return insights
 }

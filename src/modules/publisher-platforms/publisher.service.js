@@ -51,7 +51,43 @@ export async function removeAccount(userId, accountId) {
   if (!account || account.userId !== userId) {
     throw new NotFoundError('Account not found');
   }
-  await repo.hardDeleteAccount(accountId);
+
+  if (account.tokenType === 'user') {
+    const { revokeAppAuthorization } = await import('../../../shared/services/meta-auth.service.js')
+    if (account.accessToken) {
+      await revokeAppAuthorization(account.accessToken)
+    }
+    await repo.deleteAccountsByUser(userId)
+  } else {
+    await repo.hardDeleteAccount(accountId);
+  }
+}
+
+export async function adminRemoveAccount(adminId, accountId) {
+  const account = await repo.findAccountById(accountId);
+  if (!account) {
+    throw new NotFoundError('Account not found');
+  }
+
+  if (account.tokenType === 'user') {
+    const { revokeAppAuthorization } = await import('../../../shared/services/meta-auth.service.js')
+    if (account.accessToken) {
+      await revokeAppAuthorization(account.accessToken)
+    }
+    await repo.deleteAccountsByUser(account.userId)
+  } else {
+    await repo.hardDeleteAccount(accountId);
+  }
+}
+
+export async function disconnectAllAccounts(userId) {
+  const accounts = await repo.findAllAccountsByUserId(userId)
+  const userLevel = accounts.find(a => a.tokenType === 'user')
+  if (userLevel && userLevel.accessToken) {
+    const { revokeAppAuthorization } = await import('../../../shared/services/meta-auth.service.js')
+    await revokeAppAuthorization(userLevel.accessToken)
+  }
+  await repo.deleteAccountsByUser(userId)
 }
 
 export async function listAllAccounts(filters) {
