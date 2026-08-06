@@ -1,6 +1,6 @@
 import { query, queryOne, transaction } from '../../../shared/database/connection.js'
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js'
-import { decrypt } from '../../../shared/utils/crypto.utils.js'
+import { encrypt, decrypt } from '../../../shared/utils/crypto.utils.js'
 import { ValidationError } from '../../../shared/errors/AppError.js'
 
 function mapCampaignRow(row) {
@@ -9,6 +9,7 @@ function mapCampaignRow(row) {
     id: bufferToUuid(row.id),
     clientId: bufferToUuid(row.client_id),
     categoryId: row.category_id ? bufferToUuid(row.category_id) : null,
+    adAccountDbId: row.ad_account_id ? bufferToUuid(row.ad_account_id) : null,
     name: row.name,
     type: row.type,
     status: row.status,
@@ -23,6 +24,10 @@ function mapCampaignRow(row) {
     metaError: row.meta_error || null,
     metaSpentPaise: row.meta_spent_paise ? Number(row.meta_spent_paise) : 0,
     lastMetaSyncAt: row.last_meta_sync_at || null,
+    chargedAdBudgetPaise: row.charged_ad_budget_paise ? Number(row.charged_ad_budget_paise) : 0,
+    lastInsightsSyncAt: row.last_insights_sync_at || null,
+    insightsError: row.insights_error || null,
+    settledAt: row.settled_at || null,
     clientConfirmed: !!row.client_confirmed,
     clientConfirmedAt: row.client_confirmed_at,
     adminNotes: row.admin_notes,
@@ -109,6 +114,7 @@ function mapPublisherRequestRow(row) {
     publisherId: bufferToUuid(row.publisher_id),
     coinsOffered: Number(row.coins_offered),
     status: row.status,
+    creativeSnapshot: row.creative_snapshot || null,
     respondedAt: row.responded_at,
     publishedAt: row.published_at,
     createdAt: row.created_at,
@@ -127,8 +133,8 @@ function mapPublisherCategoryRow(row) {
 
 export async function createCampaign(id, clientId, data) {
   await query(
-    `INSERT INTO campaigns (id, client_id, category_id, name, type, scheduled_at, publisher_count, coins_per_publisher, run_on_publishers)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO campaigns (id, client_id, category_id, name, type, scheduled_at, publisher_count, coins_per_publisher, run_on_publishers, ad_account_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(clientId),
@@ -139,6 +145,7 @@ export async function createCampaign(id, clientId, data) {
       data.publisherCount || null,
       data.coinsPerPublisher || null,
       data.runOnPublishers ? 1 : 0,
+      data.adAccountId ? uuidToBuffer(data.adAccountId) : null,
     ]
   )
   return findCampaignById(id)
@@ -247,6 +254,8 @@ export async function updateCampaign(id, data) {
   if (data.reviewedBy !== undefined) { fields.push('reviewed_by = ?'); params.push(data.reviewedBy ? uuidToBuffer(data.reviewedBy) : null) }
   if (data.reviewedAt !== undefined) { fields.push('reviewed_at = ?'); params.push(data.reviewedAt) }
   if (data.reviewNotes !== undefined) { fields.push('review_notes = ?'); params.push(data.reviewNotes) }
+  if (data.chargedAdBudgetPaise !== undefined) { fields.push('charged_ad_budget_paise = ?'); params.push(data.chargedAdBudgetPaise) }
+  if (data.adAccountId !== undefined) { fields.push('ad_account_id = ?'); params.push(data.adAccountId ? uuidToBuffer(data.adAccountId) : null) }
 
   if (fields.length === 0) return findCampaignById(id)
 
@@ -277,6 +286,7 @@ export async function updateCampaignWithStatusGuard(id, data, expectedStatus) {
   if (data.clientConfirmedAt !== undefined) { fields.push('client_confirmed_at = ?'); params.push(data.clientConfirmedAt) }
   if (data.metaStatus !== undefined) { fields.push('meta_status = ?'); params.push(data.metaStatus) }
   if (data.metaError !== undefined) { fields.push('meta_error = ?'); params.push(data.metaError) }
+  if (data.chargedAdBudgetPaise !== undefined) { fields.push('charged_ad_budget_paise = ?'); params.push(data.chargedAdBudgetPaise) }
   if (data.adminNotes !== undefined) { fields.push('admin_notes = ?'); params.push(data.adminNotes) }
   if (data.reviewedBy !== undefined) { fields.push('reviewed_by = ?'); params.push(data.reviewedBy ? uuidToBuffer(data.reviewedBy) : null) }
   if (data.reviewedAt !== undefined) { fields.push('reviewed_at = ?'); params.push(data.reviewedAt) }
@@ -381,22 +391,11 @@ export async function saveMetaSpend(campaignId, spentPaise) {
   )
 }
 
-export async function findSyncableCampaigns() {
-  const rows = await query(
-    `SELECT c.* FROM campaigns c
-     WHERE c.status IN ('running', 'paused')
-       AND EXISTS (SELECT 1 FROM campaign_meta_objects mo WHERE mo.campaign_id = c.id)
-     ORDER BY
-  c.last_meta_sync_at IS NOT NULL,
-  c.last_meta_sync_at ASC`
+export async function touchMetaSync(campaignId) {
+  await query(
+    'UPDATE campaigns SET last_meta_sync_at = NOW() WHERE id = ?',
+    [uuidToBuffer(campaignId)]
   )
-  // const rows = await query(
-  //   `SELECT c.* FROM campaigns c
-  //    WHERE c.status IN ('running', 'paused')
-  //      AND EXISTS (SELECT 1 FROM campaign_meta_objects mo WHERE mo.campaign_id = c.id)
-  //    ORDER BY c.last_meta_sync_at ASC NULLS FIRST`
-  // )
-  return rows.map(mapCampaignRow)
 }
 
 export async function createMetaObject(campaignId, objectType, objectId, platformAccountId, status, createdForUserId) {
@@ -588,6 +587,25 @@ export async function updatePublisherRequestStatus(id, status, respondedAt) {
     params.push(respondedAt)
   }
 
+  params.push(uuidToBuffer(id))
+  await query(
+    `UPDATE campaign_publisher_requests SET ${fields.join(', ')} WHERE id = ?`,
+    params
+  )
+}
+
+export async function updatePublisherRequest(id, data) {
+  const fields = []
+  const params = []
+  if (data.status !== undefined) {
+    fields.push('status = ?')
+    params.push(data.status)
+  }
+  if (data.creativeSnapshot !== undefined) {
+    fields.push('creative_snapshot = ?')
+    params.push(data.creativeSnapshot)
+  }
+  if (!fields.length) return
   params.push(uuidToBuffer(id))
   await query(
     `UPDATE campaign_publisher_requests SET ${fields.join(', ')} WHERE id = ?`,
@@ -801,8 +819,9 @@ function mapCampaignJobRow(row) {
   if (!row) return null
   return {
     id: bufferToUuid(row.id),
-    campaignId: bufferToUuid(row.campaign_id),
+    campaignId: row.campaign_id ? bufferToUuid(row.campaign_id) : null,
     jobType: row.job_type,
+    runKey: row.run_key || null,
     status: row.status,
     attempts: row.attempts,
     maxAttempts: row.max_attempts,
@@ -817,19 +836,35 @@ function mapCampaignJobRow(row) {
   }
 }
 
-export async function enqueueCampaignJob(id, campaignId, jobType, actorId = null, payload = {}) {
+export async function enqueueCampaignJob(id, campaignId, jobType, actorId = null, payload = {}, { runKey = null } = {}) {
   const result = await query(
-    `INSERT INTO campaign_jobs (id, campaign_id, job_type, status, run_after, actor_id, payload)
-     SELECT ?, ?, ?, 'queued', NOW(), ?, ?
+    `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, status, run_after, actor_id, payload)
+     SELECT ?, ?, ?, ?, 'queued', NOW(), ?, ?
+     FROM DUAL
      WHERE NOT EXISTS (
        SELECT 1 FROM campaign_jobs
        WHERE campaign_id = ? AND job_type = ? AND status IN ('queued', 'running')
-     )`,
+     )
+     ON DUPLICATE KEY UPDATE
+       status = 'queued',
+       attempts = 0,
+       error = NULL,
+       run_after = NOW(),
+       actor_id = ?,
+       payload = ?,
+       started_at = NULL,
+       finished_at = NULL`,
     [
-      uuidToBuffer(id), uuidToBuffer(campaignId), jobType,
+      uuidToBuffer(id),
+      campaignId ? uuidToBuffer(campaignId) : null,
+      jobType,
+      runKey,
       actorId ? uuidToBuffer(actorId) : null,
       JSON.stringify(payload),
-      uuidToBuffer(campaignId), jobType,
+      campaignId ? uuidToBuffer(campaignId) : null,
+      jobType,
+      actorId ? uuidToBuffer(actorId) : null,
+      JSON.stringify(payload),
     ]
   )
   return result.affectedRows > 0
@@ -891,4 +926,643 @@ export async function requeueStaleCampaignJobs(minutes = 10) {
      WHERE status = 'running' AND started_at IS NOT NULL AND started_at < NOW() - INTERVAL ? MINUTE`,
     [minutes]
   )
+}
+
+function mapDailyStatRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    campaignId: bufferToUuid(row.campaign_id),
+    statDate: row.stat_date,
+    impressions: Number(row.impressions),
+    reach: Number(row.reach),
+    frequency: Number(row.frequency),
+    clicks: Number(row.clicks),
+    uniqueClicks: Number(row.unique_clicks),
+    ctr: Number(row.ctr),
+    cpc: Number(row.cpc),
+    cpm: Number(row.cpm),
+    spendPaise: Number(row.spend_paise),
+    actions: typeof row.actions === 'string' ? JSON.parse(row.actions) : row.actions || {},
+    costPerActionType: typeof row.cost_per_action_type === 'string' ? JSON.parse(row.cost_per_action_type) : row.cost_per_action_type || {},
+  }
+}
+
+function mapBillingEntryRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    campaignId: bufferToUuid(row.campaign_id),
+    kind: row.kind,
+    paise: Number(row.paise),
+    coins: Number(row.coins),
+    rate: Number(row.rate),
+    paidFromMonthly: Number(row.paid_from_monthly),
+    paidFromWallet: Number(row.paid_from_wallet),
+    reason: row.reason || null,
+    createdAt: row.created_at,
+  }
+}
+
+export async function findCampaignsDueForStatusSync({ stalenessSeconds = 120, pausedStalenessSeconds = 3600, limit = 50 } = {}) {
+  const runningStale = Math.max(1, Math.floor(Number(stalenessSeconds)))
+  const pausedStale = Math.max(1, Math.floor(Number(pausedStalenessSeconds)))
+  const safeLimit = Math.max(1, Math.floor(Number(limit)))
+  const rows = await query(
+    `SELECT c.* FROM campaigns c
+     WHERE c.status IN ('running', 'paused')
+       AND c.meta_status <> 'archived'
+       AND EXISTS (SELECT 1 FROM campaign_meta_objects mo WHERE mo.campaign_id = c.id)
+       AND (c.last_meta_sync_at IS NULL OR c.last_meta_sync_at < DATE_SUB(NOW(), INTERVAL (CASE WHEN c.status = 'paused' THEN ${pausedStale} ELSE ${runningStale} END) SECOND))
+       AND NOT EXISTS (
+         SELECT 1 FROM campaign_jobs j
+         WHERE j.campaign_id = c.id AND j.job_type = 'sync_status' AND j.status IN ('queued', 'running')
+       )
+     ORDER BY c.last_meta_sync_at IS NOT NULL, c.last_meta_sync_at ASC
+     LIMIT ${safeLimit}`
+  )
+  return rows.map(mapCampaignRow)
+}
+
+export async function findCampaignsDueForInsightsSync({ stalenessSeconds = 3600, limit = 10 } = {}) {
+  const rows = await query(
+    `SELECT c.* FROM campaigns c
+     WHERE c.status IN ('running', 'paused', 'scheduled')
+       AND c.meta_status <> 'archived'
+       AND EXISTS (SELECT 1 FROM campaign_meta_objects mo WHERE mo.campaign_id = c.id AND mo.object_type = 'facebook_campaign')
+       AND (c.last_insights_sync_at IS NULL OR c.last_insights_sync_at < NOW() - INTERVAL ? SECOND)
+       AND NOT EXISTS (
+         SELECT 1 FROM campaign_jobs j
+         WHERE j.campaign_id = c.id AND j.job_type = 'sync_insights' AND j.status IN ('queued', 'running')
+       )
+     ORDER BY c.last_insights_sync_at IS NOT NULL, c.last_insights_sync_at ASC
+     LIMIT ?`,
+    [stalenessSeconds, String(limit)]
+  )
+  return rows.map(mapCampaignRow)
+}
+
+export async function findAutoJobByRunKey(runKey) {
+  const row = await queryOne(
+    `SELECT id FROM campaign_jobs WHERE run_key = ? AND status IN ('queued', 'running') LIMIT 1`,
+    [runKey]
+  )
+  return Boolean(row)
+}
+
+export async function requeueAutoJob(campaignId, jobType, payload = {}, { runAfterSeconds = 0, runKey = null } = {}) {
+  const result = await query(
+    `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, status, run_after, payload)
+     VALUES (?, ?, ?, ?, 'queued', DATE_ADD(NOW(), INTERVAL ? SECOND), ?)
+     ON DUPLICATE KEY UPDATE
+       status = 'queued',
+       attempts = 0,
+       error = NULL,
+       run_after = DATE_ADD(NOW(), INTERVAL ? SECOND),
+       payload = ?,
+       started_at = NULL,
+       finished_at = NULL`,
+    [
+      uuidToBuffer(generateUuid()),
+      campaignId ? uuidToBuffer(campaignId) : null,
+      jobType,
+      runKey,
+      runAfterSeconds,
+      JSON.stringify(payload),
+      runAfterSeconds,
+      JSON.stringify(payload),
+    ]
+  )
+  return result.affectedRows > 0
+}
+
+export async function findDueInsightsBatch({ stalenessSeconds = 3600, limit = 100, adAccountId, includeUnassigned = true } = {}) {
+  const params = [stalenessSeconds]
+  let accountClause = ''
+  if (adAccountId) {
+    accountClause = ' AND (c.ad_account_id = ? OR (c.ad_account_id IS NULL AND ?))'
+    params.push(uuidToBuffer(adAccountId), includeUnassigned ? 1 : 0)
+  }
+  params.push(String(limit))
+  const rows = await query(
+    `SELECT c.id AS campaign_id, c.status, c.scheduled_at, c.last_insights_sync_at, mo.object_id AS fb_object_id
+     FROM campaigns c
+     JOIN campaign_meta_objects mo ON mo.campaign_id = c.id AND mo.object_type = 'facebook_campaign'
+     WHERE c.status IN ('running', 'paused', 'scheduled')
+       AND c.meta_status <> 'archived'
+       AND (c.last_insights_sync_at IS NULL OR c.last_insights_sync_at < DATE_SUB(NOW(), INTERVAL ? SECOND))
+       AND NOT EXISTS (
+         SELECT 1 FROM campaign_jobs j
+         WHERE j.campaign_id = c.id AND j.job_type = 'sync_insights' AND j.status IN ('queued', 'running')
+       )
+       ${accountClause}
+     LIMIT ?`,
+    params
+  )
+  return rows.map(r => ({
+    campaignId: bufferToUuid(r.campaign_id),
+    status: r.status,
+    scheduledAt: r.scheduled_at,
+    lastInsightsSyncAt: r.last_insights_sync_at,
+    fbObjectId: r.fb_object_id,
+  }))
+}
+
+export async function findAllAdObjectSyncRows({ adAccountId, includeUnassigned = true } = {}) {
+  const params = []
+  let accountClause = ''
+  if (adAccountId) {
+    accountClause = ' AND (c.ad_account_id = ? OR (c.ad_account_id IS NULL AND ?))'
+    params.push(uuidToBuffer(adAccountId), includeUnassigned ? 1 : 0)
+  }
+  const rows = await query(
+    `SELECT c.id AS campaign_id, c.status, c.meta_spent_paise, mo.object_id, mo.status AS ad_status,
+            mc.object_id AS fb_campaign_id
+     FROM campaigns c
+     JOIN campaign_meta_objects mo ON mo.campaign_id = c.id AND mo.object_type = 'ad'
+     LEFT JOIN campaign_meta_objects mc ON mc.campaign_id = c.id AND mc.object_type = 'facebook_campaign'
+     WHERE c.status IN ('running', 'paused') AND c.meta_status <> 'archived'${accountClause}`,
+    params
+  )
+  return rows.map(r => ({
+    campaignId: bufferToUuid(r.campaign_id),
+    status: r.status,
+    metaSpentPaise: Number(r.meta_spent_paise) || 0,
+    objectId: r.object_id,
+    adStatus: r.ad_status || null,
+    fbCampaignId: r.fb_campaign_id || null,
+  }))
+}
+
+export async function findCampaignIdsByFbObjectIds(fbObjectIds) {
+  if (!fbObjectIds.length) return new Map()
+  const chunks = []
+  for (let i = 0; i < fbObjectIds.length; i += 100) {
+    chunks.push(fbObjectIds.slice(i, i + 100))
+  }
+  const map = new Map()
+  for (const chunk of chunks) {
+    const placeholders = chunk.map(() => '?').join(', ')
+    const rows = await query(
+      `SELECT campaign_id, object_id FROM campaign_meta_objects
+       WHERE object_type = 'facebook_campaign' AND object_id IN (${placeholders})`,
+      chunk
+    )
+    for (const row of rows) {
+      map.set(row.object_id, bufferToUuid(row.campaign_id))
+    }
+  }
+  return map
+}
+
+export async function getMetaSyncState(runKey) {
+  const row = await queryOne('SELECT state FROM meta_sync_state WHERE run_key = ?', [runKey])
+  if (!row) return null
+  const state = typeof row.state === 'string' ? JSON.parse(row.state) : row.state
+  return { ...state }
+}
+
+export async function saveMetaSyncState(runKey, state) {
+  await query(
+    `INSERT INTO meta_sync_state (run_key, state) VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE state = VALUES(state), updated_at = NOW()`,
+    [runKey, JSON.stringify(state)]
+  )
+}
+
+export async function clearMetaSyncState(runKey) {
+  await query('DELETE FROM meta_sync_state WHERE run_key = ?', [runKey])
+}
+
+export async function stampMetaSyncBackoff(campaignId, seconds) {
+  await query(
+    'UPDATE campaigns SET last_meta_sync_at = DATE_ADD(NOW(), INTERVAL ? SECOND) WHERE id = ?',
+    [seconds, uuidToBuffer(campaignId)]
+  )
+}
+
+export async function findFacebookCampaignObjectIds(campaignId) {
+  const rows = await query(
+    `SELECT object_id FROM campaign_meta_objects
+     WHERE campaign_id = ? AND object_type = 'facebook_campaign'`,
+    [uuidToBuffer(campaignId)]
+  )
+  return rows.map(r => r.object_id)
+}
+
+export async function upsertDailyStat(campaignId, snapshot) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO campaign_daily_stats
+       (id, campaign_id, stat_date, impressions, reach, frequency, clicks, unique_clicks, ctr, cpc, cpm, spend_paise, actions, cost_per_action_type)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       impressions = VALUES(impressions),
+       reach = VALUES(reach),
+       frequency = VALUES(frequency),
+       clicks = VALUES(clicks),
+       unique_clicks = VALUES(unique_clicks),
+       ctr = VALUES(ctr),
+       cpc = VALUES(cpc),
+       cpm = VALUES(cpm),
+       spend_paise = VALUES(spend_paise),
+       actions = VALUES(actions),
+       cost_per_action_type = VALUES(cost_per_action_type)`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(campaignId),
+      snapshot.statDate,
+      snapshot.impressions || 0,
+      snapshot.reach || 0,
+      snapshot.frequency || 0,
+      snapshot.clicks || 0,
+      snapshot.uniqueClicks || 0,
+      snapshot.ctr || 0,
+      snapshot.cpc || 0,
+      snapshot.cpm || 0,
+      snapshot.spendPaise || 0,
+      JSON.stringify(snapshot.actions || {}),
+      JSON.stringify(snapshot.costPerActionType || {}),
+    ]
+  )
+}
+
+export async function upsertSpendOnly(campaignId, statDate, spendPaise) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO campaign_daily_stats (id, campaign_id, stat_date, spend_paise)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE spend_paise = GREATEST(spend_paise, VALUES(spend_paise))`,
+    [uuidToBuffer(id), uuidToBuffer(campaignId), statDate, spendPaise]
+  )
+}
+
+export async function findDailyStats(campaignId, { from, to } = {}) {
+  const conditions = ['campaign_id = ?']
+  const params = [uuidToBuffer(campaignId)]
+  if (from) {
+    conditions.push('stat_date >= ?')
+    params.push(from)
+  }
+  if (to) {
+    conditions.push('stat_date <= ?')
+    params.push(to)
+  }
+  const rows = await query(
+    `SELECT * FROM campaign_daily_stats WHERE ${conditions.join(' AND ')} ORDER BY stat_date ASC`,
+    params
+  )
+  return rows.map(mapDailyStatRow)
+}
+
+export async function sumDailyStatsSpend(campaignId) {
+  const row = await queryOne(
+    'SELECT COALESCE(SUM(spend_paise), 0) as total FROM campaign_daily_stats WHERE campaign_id = ?',
+    [uuidToBuffer(campaignId)]
+  )
+  return row ? Number(row.total) : 0
+}
+
+export async function saveInsightsSyncState(campaignId, options = {}) {
+  const fields = []
+  const params = []
+  if (options.lastInsightsSyncAt !== undefined) {
+    fields.push('last_insights_sync_at = ?')
+    params.push(options.lastInsightsSyncAt)
+  }
+  if (options.insightsError !== undefined) {
+    fields.push('insights_error = ?')
+    params.push(options.insightsError)
+  }
+  if (fields.length === 0) return
+  params.push(uuidToBuffer(campaignId))
+  await query(`UPDATE campaigns SET ${fields.join(', ')} WHERE id = ?`, params)
+}
+
+export async function insertBillingEntry(campaignId, entry) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO campaign_billing_entries
+       (id, campaign_id, kind, paise, coins, rate, paid_from_monthly, paid_from_wallet, reason)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(campaignId),
+      entry.kind,
+      entry.paise || 0,
+      entry.coins || 0,
+      entry.rate || 0,
+      entry.paidFromMonthly || 0,
+      entry.paidFromWallet || 0,
+      entry.reason || null,
+    ]
+  )
+  return id
+}
+
+export async function findBillingEntries(campaignId) {
+  const rows = await query(
+    'SELECT * FROM campaign_billing_entries WHERE campaign_id = ? ORDER BY created_at ASC',
+    [uuidToBuffer(campaignId)]
+  )
+  return rows.map(mapBillingEntryRow)
+}
+
+export async function findCampaignCharge(campaignId) {
+  const row = await queryOne(
+    `SELECT * FROM campaign_billing_entries
+     WHERE campaign_id = ? AND kind = 'charge'
+     ORDER BY created_at ASC LIMIT 1`,
+    [uuidToBuffer(campaignId)]
+  )
+  return mapBillingEntryRow(row)
+}
+
+export async function markCampaignSettled(campaignId) {
+  await query(
+    'UPDATE campaigns SET settled_at = NOW() WHERE id = ?',
+    [uuidToBuffer(campaignId)]
+  )
+}
+
+export async function findEndableRunningCampaigns() {
+  const rows = await query(
+    `SELECT c.* FROM campaigns c
+     JOIN campaign_meta_settings ms ON ms.campaign_id = c.id
+     WHERE c.status IN ('running', 'paused')
+       AND ms.end_time IS NOT NULL
+       AND ms.end_time <= NOW()
+     LIMIT 20`
+  )
+  return rows.map(mapCampaignRow)
+}
+
+export async function insertAccountSnapshot(snapshot) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO meta_account_snapshots (id, ad_account_id, balance_paise, currency, account_status, disable_reason)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [
+      uuidToBuffer(id),
+      snapshot.adAccountId,
+      snapshot.balancePaise,
+      snapshot.currency || null,
+      snapshot.accountStatus || null,
+      snapshot.disableReason || null,
+    ]
+  )
+}
+
+export async function findLatestAccountSnapshot() {
+  const row = await queryOne(
+    'SELECT * FROM meta_account_snapshots ORDER BY created_at DESC LIMIT 1'
+  )
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    adAccountId: row.ad_account_id,
+    balancePaise: Number(row.balance_paise),
+    currency: row.currency,
+    accountStatus: row.account_status,
+    disableReason: row.disable_reason,
+    createdAt: row.created_at,
+  }
+}
+
+export async function findStaleRunningCampaigns({ stalenessMinutes = 30, limit = 20 } = {}) {
+  const rows = await query(
+    `SELECT c.* FROM campaigns c
+     WHERE c.status IN ('running', 'paused')
+       AND EXISTS (SELECT 1 FROM campaign_meta_objects mo WHERE mo.campaign_id = c.id)
+       AND (c.last_meta_sync_at IS NULL OR c.last_meta_sync_at < NOW() - INTERVAL ? MINUTE)
+     ORDER BY c.last_meta_sync_at ASC
+     LIMIT ?`,
+    [stalenessMinutes, String(limit)]
+  )
+  return rows.map(mapCampaignRow)
+}
+
+export async function countFailedJobsByType() {
+  const rows = await query(
+    `SELECT job_type, status, COUNT(*) as count
+     FROM campaign_jobs
+     WHERE status IN ('failed', 'dead')
+     GROUP BY job_type, status`
+  )
+  return rows.map(r => ({ jobType: r.job_type, status: r.status, count: r.count }))
+}
+
+export async function countUnsettledCampaigns() {
+  const row = await queryOne(
+    `SELECT COUNT(*) as count FROM campaigns
+     WHERE charged_ad_budget_paise > 0 AND settled_at IS NULL`
+  )
+  return row ? Number(row.count) : 0
+}
+
+export async function countRunningCampaigns() {
+  const row = await queryOne(
+    `SELECT COUNT(*) as count FROM campaigns WHERE status = 'running'`
+  )
+  return row ? Number(row.count) : 0
+}
+
+export async function countPausedCampaigns() {
+  const row = await queryOne(
+    `SELECT COUNT(*) as count FROM campaigns WHERE status = 'paused'`
+  )
+  return row ? Number(row.count) : 0
+}
+
+function mapMetaAdAccountRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    metaAccountId: row.account_id,
+    name: row.name || null,
+    accessToken: row.token_encrypted ? decrypt(row.token_encrypted) : null,
+    monthlyCapPaise: Number(row.monthly_cap_paise) || 0,
+    isPrimary: !!row.is_primary,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+export async function listMetaAdAccounts({ activeOnly = false } = {}) {
+  const where = activeOnly ? "WHERE status = 'active'" : ''
+  const rows = await query(
+    `SELECT * FROM meta_ad_accounts ${where} ORDER BY is_primary DESC, created_at ASC`
+  )
+  return rows.map(mapMetaAdAccountRow)
+}
+
+export async function findMetaAdAccountById(id) {
+  const row = await queryOne('SELECT * FROM meta_ad_accounts WHERE id = ?', [uuidToBuffer(id)])
+  return mapMetaAdAccountRow(row)
+}
+
+export async function findMetaAdAccountByMetaId(metaAccountId) {
+  const row = await queryOne('SELECT * FROM meta_ad_accounts WHERE account_id = ?', [metaAccountId])
+  return mapMetaAdAccountRow(row)
+}
+
+export async function findPrimaryMetaAdAccount() {
+  const row = await queryOne('SELECT * FROM meta_ad_accounts WHERE is_primary = 1 LIMIT 1')
+  return mapMetaAdAccountRow(row)
+}
+
+export async function createMetaAdAccount({ metaAccountId, name = null, token = null, monthlyCapPaise = 0, isPrimary = false, status = 'active' }) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO meta_ad_accounts (id, account_id, name, token_encrypted, monthly_cap_paise, is_primary, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE name = VALUES(name), token_encrypted = COALESCE(VALUES(token_encrypted), token_encrypted),
+       monthly_cap_paise = VALUES(monthly_cap_paise), is_primary = VALUES(is_primary), status = VALUES(status)`,
+    [
+      uuidToBuffer(id),
+      metaAccountId,
+      name || null,
+      token ? encrypt(token) : null,
+      monthlyCapPaise || 0,
+      isPrimary ? 1 : 0,
+      status,
+    ]
+  )
+  return findMetaAdAccountByMetaId(metaAccountId)
+}
+
+export async function updateMetaAdAccount(id, data) {
+  const fields = []
+  const params = []
+  if (data.name !== undefined) {
+    fields.push('name = ?')
+    params.push(data.name || null)
+  }
+  if (data.status !== undefined) {
+    fields.push('status = ?')
+    params.push(data.status)
+  }
+  if (data.monthlyCapPaise !== undefined) {
+    fields.push('monthly_cap_paise = ?')
+    params.push(Number(data.monthlyCapPaise) || 0)
+  }
+  if (data.isPrimary !== undefined) {
+    fields.push('is_primary = ?')
+    params.push(data.isPrimary ? 1 : 0)
+  }
+  if (data.token !== undefined && data.token !== null && data.token !== '') {
+    fields.push('token_encrypted = ?')
+    params.push(encrypt(data.token))
+  }
+  if (fields.length > 0) {
+    params.push(uuidToBuffer(id))
+    await query(`UPDATE meta_ad_accounts SET ${fields.join(', ')} WHERE id = ?`, params)
+  }
+  return findMetaAdAccountById(id)
+}
+
+export async function deleteMetaAdAccount(id) {
+  await query('DELETE FROM meta_ad_accounts WHERE id = ?', [uuidToBuffer(id)])
+}
+
+export async function clearPrimaryMetaAccounts(exceptId) {
+  const params = []
+  let where = ''
+  if (exceptId) {
+    where = 'WHERE id <> ?'
+    params.push(uuidToBuffer(exceptId))
+  }
+  await query(`UPDATE meta_ad_accounts SET is_primary = 0 ${where}`, params)
+}
+
+export async function findCampaignAdAccount(campaignId) {
+  const row = await queryOne(
+    `SELECT ma.* FROM campaigns c
+     JOIN meta_ad_accounts ma ON ma.id = c.ad_account_id
+     WHERE c.id = ?`,
+    [uuidToBuffer(campaignId)]
+  )
+  return mapMetaAdAccountRow(row)
+}
+
+export async function countCampaignsByAccount() {
+  const rows = await query(
+    `SELECT ad_account_id, COUNT(*) AS count FROM campaigns
+     WHERE ad_account_id IS NOT NULL AND deleted_at IS NULL
+     GROUP BY ad_account_id`
+  )
+  const map = {}
+  for (const r of rows) {
+    map[r.ad_account_id ? bufferToUuid(r.ad_account_id) : null] = Number(r.count)
+  }
+  return map
+}
+
+export async function sumChargedBudgetByAccount() {
+  const rows = await query(
+    `SELECT c.ad_account_id, SUM(c.charged_ad_budget_paise) AS paise FROM campaigns c
+     WHERE c.ad_account_id IS NOT NULL AND c.status IN ('scheduled', 'running', 'paused', 'approved', 'awaiting_publishers')
+     GROUP BY c.ad_account_id`
+  )
+  const map = {}
+  for (const r of rows) {
+    map[r.ad_account_id ? bufferToUuid(r.ad_account_id) : null] = Number(r.paise) || 0
+  }
+  return map
+}
+
+export async function findRunningCampaignsByAccount(adAccountDbId) {
+  const rows = await query(
+    `SELECT * FROM campaigns WHERE ad_account_id = ? AND status = 'running'`,
+    [uuidToBuffer(adAccountDbId)]
+  )
+  return rows.map(mapCampaignRow)
+}
+
+export async function recordWebhookEvent({ id, accountId, eventType, payload }) {
+  await query(
+    `INSERT IGNORE INTO meta_webhook_events (id, account_id, event_type, payload, processed_at)
+     VALUES (?, ?, ?, ?, NOW())`,
+    [id, accountId, eventType, payload]
+  )
+}
+
+export async function isWebhookEventProcessed(id) {
+  const row = await queryOne('SELECT id FROM meta_webhook_events WHERE id = ?', [id])
+  return !!row
+}
+
+export async function claimSchedulerLease(leaseName, ownerId, ttlSeconds) {
+  const expiresAt = new Date(Date.now() + Number(ttlSeconds) * 1000)
+  const update = await query(
+    `UPDATE scheduler_leases SET owner_id = ?, expires_at = ?
+     WHERE lease_name = ? AND (owner_id = ? OR expires_at < NOW())`,
+    [ownerId, expiresAt, leaseName, ownerId]
+  )
+  if (update && update.affectedRows > 0) return true
+
+  const insert = await query(
+    'INSERT IGNORE INTO scheduler_leases (lease_name, owner_id, expires_at) VALUES (?, ?, ?)',
+    [leaseName, ownerId, expiresAt]
+  )
+  if (insert && insert.affectedRows > 0) return true
+
+  const row = await queryOne('SELECT owner_id FROM scheduler_leases WHERE lease_name = ?', [leaseName])
+  return row?.owner_id === ownerId
+}
+
+export async function releaseSchedulerLease(leaseName, ownerId) {
+  await query('DELETE FROM scheduler_leases WHERE lease_name = ? AND owner_id = ?', [leaseName, ownerId])
+}
+
+export async function getSchedulerLease(leaseName) {
+  const row = await queryOne('SELECT * FROM scheduler_leases WHERE lease_name = ?', [leaseName])
+  if (!row) return null
+  return {
+    leaseName: row.lease_name,
+    ownerId: row.owner_id,
+    expiresAt: row.expires_at,
+    updatedAt: row.updated_at,
+  }
 }

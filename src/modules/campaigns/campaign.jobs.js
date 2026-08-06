@@ -2,10 +2,15 @@ import * as repo from './campaign.repository.js'
 import * as service from './campaign.service.js'
 import { AppError } from '../../../shared/errors/AppError.js'
 import { CAMPAIGN_JOB_TYPES } from './campaign.model.js'
+import { isRateLimited } from '../../../shared/services/meta-rate-limiter.js'
+import os from 'node:os'
 
-const JOB_CONCURRENCY = 2
+const JOB_CONCURRENCY = Number(process.env.CAMPAIGN_JOB_CONCURRENCY) || 10
 const STALE_JOB_MINUTES = 10
 const MAX_BACKOFF_SECONDS = 3600
+const SCHEDULER_LEASE_NAME = 'meta_sync_scheduler'
+const SCHEDULER_LEASE_TTL_SECONDS = 30
+const instanceId = process.env.INSTANCE_ID || `${os.hostname()}:${process.pid}`
 
 const HANDLERS = {
   [CAMPAIGN_JOB_TYPES.FORCE_GO_LIVE]: (campaignId, actorId) => service.forceGoLiveCampaign(actorId, campaignId),
@@ -13,6 +18,11 @@ const HANDLERS = {
   [CAMPAIGN_JOB_TYPES.APPROVE_GO_LIVE]: (campaignId, actorId, payload) => service.approveAndGoLive(campaignId, actorId, payload),
   [CAMPAIGN_JOB_TYPES.CONFIRM_GO_LIVE]: (campaignId, actorId) => service.confirmAndGoLive(campaignId, actorId),
   [CAMPAIGN_JOB_TYPES.RETRY_META]: (campaignId) => service.retryCampaignMeta(campaignId),
+  [CAMPAIGN_JOB_TYPES.SYNC_STATUS]: (campaignId) => service.syncCampaignStatusJob(campaignId),
+  [CAMPAIGN_JOB_TYPES.SYNC_INSIGHTS]: (campaignId) => service.syncCampaignInsightsJob(campaignId),
+  [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_STATUS]: (campaignId, actorId, payload) => service.syncAccountStatusJob(payload?.adAccountId ?? undefined),
+  [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_INSIGHTS]: (campaignId, actorId, payload) => service.syncAccountInsightsJob(payload?.adAccountId ?? undefined),
+  [CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN]: (campaignId) => service.settleCampaignJob(campaignId),
 }
 
 function isPermanentError(error) {
@@ -20,6 +30,7 @@ function isPermanentError(error) {
 }
 
 export async function processDueJobs() {
+  if (isRateLimited()) return 0
   await repo.requeueStaleCampaignJobs(STALE_JOB_MINUTES)
   const jobs = await repo.claimDueCampaignJobs(JOB_CONCURRENCY)
   if (!jobs.length) return 0
@@ -74,5 +85,41 @@ export function stopCampaignJobWorker() {
   if (workerTimer) {
     clearInterval(workerTimer)
     workerTimer = null
+  }
+}
+
+let syncSchedulerTimer = null
+let balanceTick = 0
+
+async function tickSyncScheduler() {
+  const isLeader = await repo.claimSchedulerLease(SCHEDULER_LEASE_NAME, instanceId, SCHEDULER_LEASE_TTL_SECONDS)
+  if (!isLeader) return
+  try {
+    await service.scheduleCampaignSyncs()
+    balanceTick += 1
+    if (balanceTick % 12 === 0) {
+      balanceTick = 0
+      if (!isRateLimited()) {
+        await service.pollAccountBalance()
+      }
+    }
+  } catch (err) {
+    console.error('Meta sync scheduler tick error:', err?.message)
+  }
+}
+
+export function startMetaSyncScheduler() {
+  if (syncSchedulerTimer) return syncSchedulerTimer
+  syncSchedulerTimer = setInterval(() => {
+    tickSyncScheduler().catch((err) => console.error('Meta sync scheduler error:', err?.message))
+  }, 5000)
+  syncSchedulerTimer.unref?.()
+  return syncSchedulerTimer
+}
+
+export function stopMetaSyncScheduler() {
+  if (syncSchedulerTimer) {
+    clearInterval(syncSchedulerTimer)
+    syncSchedulerTimer = null
   }
 }

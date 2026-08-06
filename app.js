@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import morgan from 'morgan';
 import { getPool } from './shared/database/connection.js';
 import { errorHandler } from './shared/middleware/error.middleware.js';
+import { logger, httpLogger } from './shared/utils/logger.js';
 import routes from './src/routes/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -17,10 +18,24 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.set('trust proxy', 1);
 
+app.use('/api/v1/meta/webhook', (req, res, next) => {
+  if (req.method !== 'POST') return next();
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    req.rawBody = Buffer.concat(chunks);
+    req._body = true;
+    next();
+  });
+  req.on('error', next);
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
-if (process.env.NODE_ENV !== 'production') {
+if (process.env.NODE_ENV === 'production') {
+  app.use(httpLogger);
+} else {
   app.use(morgan('dev'));
 }
 
@@ -69,23 +84,24 @@ async function start() {
   try {
     const pool = getPool();
     await pool.getConnection();
-    console.log('Database connected');
+    logger.info('Database connected');
 
-    const { startCampaignJobWorker } = await import('./src/modules/campaigns/campaign.jobs.js');
+    const { startCampaignJobWorker, startMetaSyncScheduler } = await import('./src/modules/campaigns/campaign.jobs.js');
     startCampaignJobWorker();
-    console.log('Campaign job worker started');
+    startMetaSyncScheduler();
+    logger.info('Campaign job worker + Meta sync scheduler started');
 
     app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
+      logger.info({ port: PORT }, 'FlowX API listening');
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    logger.error({ err: error }, 'Failed to start server');
     process.exit(1);
   }
 }
 
 process.on('SIGTERM', async () => {
-  console.log('Shutting down...');
+  logger.info('Shutting down');
   const { closePool } = await import('./shared/database/connection.js');
   await closePool();
   process.exit(0);

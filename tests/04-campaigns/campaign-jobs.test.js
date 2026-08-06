@@ -28,7 +28,6 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
     deleteAdCampaign: vi.fn().mockResolvedValue({}),
     searchMeta: vi.fn().mockResolvedValue([]),
     getObjectStatus: vi.fn().mockResolvedValue({ status: 'ACTIVE', effective_status: 'ACTIVE' }),
-    getCampaignSpend: vi.fn().mockResolvedValue({ spend: '0.00' }),
   }
   metaMocks = mocks
   return mocks

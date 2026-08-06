@@ -136,8 +136,7 @@ export async function duplicateCampaign(req, res, next) {
 
 export async function getCampaignInsights(req, res, next) {
   try {
-    const datePreset = req.query.datePreset || 'last_7d'
-    const insights = await service.getCampaignInsights(req.user.id, req.params.id, datePreset)
+    const insights = await service.getCampaignInsights(req.user.id, req.params.id, req.query)
     return sendSuccess(res, insights)
   } catch (error) {
     next(error)

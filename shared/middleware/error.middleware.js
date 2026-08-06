@@ -2,13 +2,11 @@ import { sendError } from '../utils/response.utils.js';
 import { AppError } from '../errors/AppError.js';
 import { HTTP_STATUS } from '../constants/httpStatus.js';
 import { ERROR_CODES } from '../errors/errorCodes.js';
-
-const LOG_LEVELS = {};
+import { logger } from '../utils/logger.js';
 
 function logError(level, statusCode, code, req, err) {
+  const log = req.log || logger;
   const entry = {
-    level,
-    timestamp: new Date().toISOString(),
     method: req.method,
     url: req.url,
     statusCode,
@@ -18,11 +16,7 @@ function logError(level, statusCode, code, req, err) {
   if (process.env.NODE_ENV === 'development') {
     entry.stack = err.stack;
   }
-  if (level === 'error') {
-    console.error(JSON.stringify(entry));
-  } else {
-    console.warn(JSON.stringify(entry));
-  }
+  log[level](entry);
 }
 
 export function errorHandler(err, req, res, _next) {

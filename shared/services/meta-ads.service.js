@@ -1,5 +1,33 @@
 import { META_CONFIG } from './meta-oauth.config.js'
 import { apiFetch } from '../utils/api-logger.js'
+import { recordUsage } from './meta-rate-limiter.js'
+
+const RATE_LIMIT_CODES = new Set([80004, 613, 4, 17])
+const RATE_LIMIT_SUBCODE = 2446079
+
+function accountKeyFromPath(path) {
+  const match = String(path).match(/^act_[A-Za-z0-9]+/)
+  return match ? match[0] : undefined
+}
+
+async function maybeEnterCooldown(res, errorText, accountId) {
+  if (res.status === 429) {
+    const { setCooldown } = await import('./meta-rate-limiter.js')
+    setCooldown(120, accountId)
+    return
+  }
+  let parsed = null
+  try {
+    parsed = JSON.parse(errorText)
+  } catch {
+    return
+  }
+  const err = parsed?.error
+  if (err && (RATE_LIMIT_CODES.has(Number(err.code)) || Number(err.error_subcode) === RATE_LIMIT_SUBCODE)) {
+    const { setCooldown } = await import('./meta-rate-limiter.js')
+    setCooldown(120, accountId)
+  }
+}
 
 async function graphPost(path, params = {}) {
   const query = new URLSearchParams({ access_token: params.access_token })
@@ -12,9 +40,12 @@ async function graphPost(path, params = {}) {
     }
   }
 
+  const accountId = accountKeyFromPath(path)
   const res = await apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_ads', operation: `POST ${path}` })
+  recordUsage(res.headers, accountId)
   if (!res.ok) {
     const error = await res.text()
+    await maybeEnterCooldown(res, error, accountId)
     throw new Error(`Graph API POST ${path} failed: ${error}`)
   }
   return res.json()
@@ -22,9 +53,12 @@ async function graphPost(path, params = {}) {
 
 async function graphDelete(path, accessToken) {
   const url = `${META_CONFIG.graphUrl}/${path}?access_token=${accessToken}`
+  const accountId = accountKeyFromPath(path)
   const res = await apiFetch(url, { method: 'DELETE' }, { service: 'meta_ads', operation: `DELETE ${path}` })
+  recordUsage(res.headers, accountId)
   if (!res.ok) {
     const error = await res.text()
+    await maybeEnterCooldown(res, error, accountId)
     throw new Error(`Graph API DELETE ${path} failed: ${error}`)
   }
   return res.json()
@@ -39,9 +73,12 @@ async function graphGet(path, params = {}) {
   }
   qs.append('access_token', params.access_token)
   const url = `${META_CONFIG.graphUrl}/${path}?${qs.toString()}`
+  const accountId = accountKeyFromPath(path)
   const res = await apiFetch(url, {}, { service: 'meta_ads', operation: `GET ${path}` })
+  recordUsage(res.headers, accountId)
   if (!res.ok) {
     const error = await res.text()
+    await maybeEnterCooldown(res, error, accountId)
     throw new Error(`Graph API GET ${path} failed: ${error}`)
   }
   return res.json()
@@ -270,6 +307,37 @@ export async function getCampaignInsights(campaignId, accessToken, datePreset = 
   return data.data || []
 }
 
+export const INSIGHTS_FIELDS = 'impressions,reach,frequency,clicks,unique_clicks,ctr,cpc,cpm,spend,actions,cost_per_action_type'
+
+export async function createInsightsReport(adAccountId, { accessToken, level = 'campaign', timeIncrement = 1, since, until, fields = INSIGHTS_FIELDS, filtering } = {}) {
+  const params = {
+    access_token: accessToken,
+    level,
+    time_increment: timeIncrement,
+    fields,
+    limit: 1000,
+  }
+  if (since) params.since = since
+  if (until) params.until = until
+  if (filtering) params.filtering = filtering
+  const data = await graphPost(`act_${adAccountId}/insights`, params)
+  return data
+}
+
+export async function getInsightsReport(reportRunId, accessToken) {
+  const data = await graphGet(reportRunId, {
+    access_token: accessToken,
+  })
+  return data
+}
+
+export async function getInsightsReportData(reportRunId, accessToken) {
+  const data = await graphGet(`${reportRunId}/insights`, {
+    access_token: accessToken,
+  })
+  return data.data || []
+}
+
 export async function deleteAdCampaign(campaignId, accessToken) {
   return graphDelete(campaignId, accessToken)
 }
@@ -302,12 +370,49 @@ export async function getObjectStatus(objectId, accessToken) {
   return data
 }
 
-export async function getCampaignSpend(campaignId, accessToken) {
-  const data = await graphGet(campaignId, {
+export async function listAccountAds(adAccountId, accessToken, limit = 100) {
+  const rows = []
+  let after = null
+  let truncated = false
+  let endedFull = false
+  for (let page = 0; page < 10; page += 1) {
+    const params = {
+      access_token: accessToken,
+      fields: 'id,status,effective_status',
+      limit,
+    }
+    if (after) params.after = after
+    const data = await graphGet(`act_${adAccountId}/ads`, params)
+    const pageRows = data.data || []
+    rows.push(...pageRows)
+    if (pageRows.length) endedFull = pageRows.length === limit
+    after = data.paging?.cursors?.after || null
+    if (!after) {
+      if (endedFull) truncated = true
+      break
+    }
+    if (page === 9) truncated = true
+  }
+  return { rows, truncated }
+}
+
+export async function getCampaignStatusesBatch(adAccountId, accessToken, fbCampaignIds) {
+  if (!fbCampaignIds.length) return {}
+  const ids = fbCampaignIds.join(',')
+  const data = await graphGet('', {
     access_token: accessToken,
-    fields: 'spend',
+    ids,
+    fields: 'effective_status,status',
   })
-  return data
+  const result = {}
+  for (const [id, campaign] of Object.entries(data || {})) {
+    if (campaign?.effective_status) {
+      result[id] = campaign.effective_status
+    } else if (campaign?.status) {
+      result[id] = campaign.status
+    }
+  }
+  return result
 }
 
 export async function searchMeta(params) {

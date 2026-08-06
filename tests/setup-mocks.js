@@ -5,6 +5,11 @@ vi.mock('../shared/mailer/mailer.js', () => ({
   sendPasswordResetEmail: vi.fn().mockResolvedValue(true),
 }))
 
+vi.mock('../shared/mailer/alert.mailer.js', () => ({
+  sendAdminAlert: vi.fn().mockResolvedValue(true),
+  sendPublisherRepublishNotification: vi.fn().mockResolvedValue(true),
+}))
+
 vi.mock('disposable-email-domains/index.js', () => ({
   default: ['tempmail.com', 'throwaway.com', 'mailinator.com'],
 }))

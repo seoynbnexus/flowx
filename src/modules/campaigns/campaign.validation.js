@@ -129,3 +129,20 @@ export const coinConversionRateSchema = z.object({
 export const publisherRequestActionSchema = z.object({
   requestId: z.string().uuid('Invalid request ID'),
 })
+
+export const metaAdAccountSchema = z.object({
+  metaAccountId: z.string().min(1, 'Meta account ID is required').max(64),
+  name: z.string().max(255).optional().nullable(),
+  token: z.string().max(512).optional().nullable(),
+  monthlyCapPaise: z.coerce.number().int().nonnegative().optional().default(0),
+  isPrimary: z.boolean().optional().default(false),
+  status: z.enum(['active', 'disabled']).optional().default('active'),
+})
+
+export const metaAdAccountUpdateSchema = z.object({
+  name: z.string().max(255).optional().nullable(),
+  token: z.string().max(512).optional(),
+  monthlyCapPaise: z.coerce.number().int().nonnegative().optional(),
+  isPrimary: z.boolean().optional(),
+  status: z.enum(['active', 'disabled']).optional(),
+})

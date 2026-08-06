@@ -25,6 +25,7 @@ export async function getAvailable(userId) {
 }
 
 export async function spend(userId, amount, resourceType, resourceId, notes) {
+  let split = { fromMonthly: 0, fromWallet: 0 }
   await transaction(async () => {
     const monthlyUsage = await subService.getUsage(userId, 'monthly_coins')
     const topupBalance = await aiRepo.findUserWalletCoinsForUpdate(userId)
@@ -45,18 +46,38 @@ export async function spend(userId, amount, resourceType, resourceId, notes) {
       const fromMonthly = Math.min(remaining, monthlyRemaining)
       await subService.consumeUsage(userId, 'monthly_coins', resourceType || 'spend', resourceId || null, notes || null, fromMonthly)
       remaining -= fromMonthly
+      split.fromMonthly = fromMonthly
     }
 
     if (remaining > 0) {
       await aiRepo.deductCoins(userId, remaining)
+      split.fromWallet = remaining
     }
 
     if (amount > 0) {
       await aiRepo.createTransaction(generateUuid(), userId, notes || 'Coin spend', amount, 'debit', resourceType || 'spend', resourceId || null)
     }
   })
+  return split
+}
+
+export async function spendWithDetail(userId, amount, resourceType, resourceId, notes) {
+  return spend(userId, amount, resourceType, resourceId, notes)
 }
 
 export async function refund(userId, amount, resourceType, resourceId, notes) {
-  await subService.refundUsage(userId, 'monthly_coins', resourceType || 'spend', resourceId || null, notes || null, amount)
+  await refundWithDetail(userId, amount, resourceType, resourceId, notes, {})
+}
+
+export async function refundWithDetail(userId, amount, resourceType, resourceId, notes, { fromMonthly = 0, fromWallet = 0 } = {}) {
+  await transaction(async () => {
+    const monthlyRefund = fromMonthly > 0 ? fromMonthly : amount - fromWallet
+    if (monthlyRefund > 0) {
+      await subService.refundUsage(userId, 'monthly_coins', resourceType || 'spend', resourceId || null, notes || null, monthlyRefund)
+    }
+    if (fromWallet > 0) {
+      await aiRepo.addCoins(userId, fromWallet)
+      await aiRepo.createTransaction(generateUuid(), userId, notes || 'Coin refund', fromWallet, 'credit', resourceType || 'spend', resourceId || null)
+    }
+  })
 }

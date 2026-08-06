@@ -6,6 +6,7 @@ import * as campaignRepo from '../../src/modules/campaigns/campaign.repository.j
 import * as subRepo from '../../src/modules/subscriptions/subscription.repository.js'
 import { queryOne, query } from '../../shared/database/connection.js'
 import { drainCampaignJobs } from '../../src/modules/campaigns/campaign.jobs.js'
+import { sendPublisherRepublishNotification } from '../../shared/mailer/alert.mailer.js'
 
 var metaMocks
 vi.mock('../../shared/services/meta-ads.service.js', async () => {
@@ -28,7 +29,6 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
     deleteAdCampaign: vi.fn().mockResolvedValue({}),
     searchMeta: vi.fn().mockResolvedValue([]),
     getObjectStatus: vi.fn().mockResolvedValue({ status: 'ACTIVE', effective_status: 'ACTIVE' }),
-    getCampaignSpend: vi.fn().mockResolvedValue({ spend: '0.00' }),
   }
   metaMocks = mocks
   return mocks
@@ -189,6 +189,62 @@ describe('campaign lifecycle', () => {
     ).rejects.toThrow(/current status/i)
   })
 
+  it('should allow editing failed campaign, reset to draft, and propagate to publishers', async () => {
+    const failedUser = await createTestUser({
+      email: `camp-failed-${dateTag}@flowx-test.com`,
+      password: 'Test@123',
+      coins: 5000,
+    })
+    await ensurePlan(failedUser.id)
+
+    const failedCampaign = await campaignService.createCampaign(failedUser.id, {
+      name: `Failed Edit ${dateTag}`,
+      type: 'post',
+    })
+    await campaignRepo.createCreative(generateUuid(), failedCampaign.id, { caption: 'Failed caption', mediaUrl: 'https://example.com/f.jpg' })
+
+    const publisher = await createTestUser({
+      email: `camp-failed-pub-${dateTag}@flowx-test.com`,
+      password: 'Test@123',
+      coins: 100,
+    })
+
+    await campaignRepo.createPublisherRequests(failedCampaign.id, [publisher.id], 100)
+    const requests = await campaignRepo.findPublisherRequestsByCampaignId(failedCampaign.id)
+    const requestId = requests[0].id
+    await campaignRepo.updatePublisherRequestStatus(requestId, 'accepted', new Date())
+    await campaignRepo.updatePublisherRequestPublished(requestId)
+
+    await campaignRepo.updateCampaign(failedCampaign.id, { status: 'failed' })
+    await campaignRepo.updateCampaign(failedCampaign.id, { metaStatus: 'failed' })
+
+    const updated = await campaignService.updateCampaign(failedUser.id, failedCampaign.id, { name: 'Failed Edited' })
+    expect(updated.name).toBe('Failed Edited')
+    expect(updated.status).toBe('draft')
+
+    const afterRequests = await campaignRepo.findPublisherRequestsByCampaignId(failedCampaign.id)
+    expect(afterRequests[0].status).toBe('pending_republish')
+    expect(afterRequests[0].creativeSnapshot).toBeTruthy()
+    expect(sendPublisherRepublishNotification).toHaveBeenCalledWith(publisher.id, failedCampaign.id, expect.any(String))
+  })
+
+  it('should reject editing archived campaign', async () => {
+    const archivedUser = await createTestUser({
+      email: `camp-archived-${dateTag}@flowx-test.com`,
+      password: 'Test@123',
+      coins: 5000,
+    })
+    await ensurePlan(archivedUser.id)
+    const archivedCampaign = await campaignService.createCampaign(archivedUser.id, {
+      name: `Archived Block ${dateTag}`,
+      type: 'post',
+    })
+    await campaignRepo.updateCampaign(archivedCampaign.id, { status: 'archived' })
+    await expect(
+      campaignService.updateCampaign(archivedUser.id, archivedCampaign.id, { name: 'Blocked' })
+    ).rejects.toThrow(/current status/i)
+  })
+
   it('should cancel a campaign', async () => {
     const cancelUser = await createTestUser({
       email: `camp-cancel-${dateTag}@flowx-test.com`,
@@ -235,7 +291,7 @@ describe('campaign lifecycle', () => {
 
     metaMocks.getObjectStatus.mockResolvedValue({ status: 'PAUSED', effective_status: 'PAUSED' })
 
-    const result = await campaignService.syncCampaignMetaStatus(campaign.id)
+    const result = await campaignService.syncCampaignStatusJob(campaign.id)
     expect(result.success).toBe(true)
     expect(result.result.statusAfter).toBe('paused')
     expect(result.result.statusChanged).toBe(true)
@@ -257,16 +313,14 @@ describe('campaign lifecycle', () => {
     await drainCampaignJobs()
 
     metaMocks.getObjectStatus.mockResolvedValue({ status: 'PAUSED', effective_status: 'PAUSED' })
-    metaMocks.getCampaignSpend.mockResolvedValue({ spend: '0.00' })
-    await campaignService.syncCampaignMetaStatus(campaign.id)
+    await campaignService.syncCampaignStatusJob(campaign.id)
 
     const paused = await campaignRepo.findCampaignById(campaign.id)
     expect(paused.status).toBe('paused')
 
     metaMocks.getObjectStatus.mockResolvedValue({ status: 'ACTIVE', effective_status: 'ACTIVE' })
-    metaMocks.getCampaignSpend.mockResolvedValue({ spend: '15.50' })
 
-    const result = await campaignService.syncCampaignMetaStatus(campaign.id)
+    const result = await campaignService.syncCampaignStatusJob(campaign.id)
     expect(result.success).toBe(true)
     expect(result.result.statusAfter).toBe('running')
     expect(result.result.statusChanged).toBe(true)
@@ -850,6 +904,33 @@ describe('campaign lifecycle', () => {
 
       const rows = await query('SELECT * FROM campaign_meta_objects WHERE campaign_id = ?', [uuidToBuffer(campaign.id)])
       expect(rows).toHaveLength(8)
+    })
+
+    it('aborts rebuild when cleanup delete fails with a rate limit — no duplicate objects are created', async () => {
+      const { campaign, publishers, requestIds } = await createAwaitingCampaign(2)
+      await campaignService.acceptPublisherRequest(publishers[0].id, requestIds[0])
+
+      metaMocks.updateAdStatus.mockRejectedValue(new Error('Object cannot be activated'))
+      let updated = await campaignService.forceGoLiveCampaign(admin?.id ?? null, campaign.id)
+      expect(updated.status).toBe('awaiting_publishers')
+      expect(updated.metaStatus).toBe('failed')
+
+      const beforeRows = await query('SELECT * FROM campaign_meta_objects WHERE campaign_id = ?', [uuidToBuffer(campaign.id)])
+      const beforeCampaignIds = beforeRows.filter(r => r.object_type === 'facebook_campaign').map(r => r.object_id).sort()
+
+      metaMocks.updateAdStatus.mockReset().mockResolvedValue({ success: true })
+      metaMocks.deleteAdCampaign.mockRejectedValue(
+        new Error('Graph API DELETE 120249122041740055 failed: {"error":{"message":"too many calls","code":80004,"type":"OAuthException","error_subcode":2446079}}')
+      )
+
+      await expect(campaignService.forceGoLiveCampaign(admin?.id ?? null, campaign.id))
+        .rejects.toThrow(/not cleaned up/)
+
+      const afterRows = await query('SELECT * FROM campaign_meta_objects WHERE campaign_id = ?', [uuidToBuffer(campaign.id)])
+      expect(afterRows.filter(r => r.object_type === 'facebook_campaign').map(r => r.object_id).sort()).toEqual(beforeCampaignIds)
+      expect(afterRows).toHaveLength(beforeRows.length)
+
+      metaMocks.deleteAdCampaign.mockReset().mockResolvedValue({})
     })
 
     it('partial publisher failure rolls back only that publisher while the client still goes live', async () => {

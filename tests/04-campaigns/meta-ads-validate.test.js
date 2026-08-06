@@ -5,6 +5,7 @@ import {
   createAdSet,
   createAdCreative,
   createAd,
+  listAccountAds,
 } from '../../shared/services/meta-ads.service.js'
 
 vi.mock('../../shared/utils/api-logger.js', () => ({
@@ -62,6 +63,51 @@ describe('meta ads validate_only support', () => {
     await createAd('act_1', 'adset_1', 'creative_1', 'Ad', 'tok', 'PAUSED', {})
     const [, options] = apiFetch.mock.calls[0]
     expect(options.body).not.toContain('execution_options')
+  })
+})
+
+describe('listAccountAds pagination', () => {
+  const ad = (i) => ({ id: `120249${String(i).padStart(10, '0')}`, status: 'PAUSED', effective_status: 'PAUSED' })
+
+  it('should mark truncated when a full page is followed by an empty ghost page', async () => {
+    const full = { data: Array.from({ length: 100 }, (_, i) => ad(i)), paging: { cursors: { after: 'cursor-2' } } }
+    const ghost = { data: [] }
+    apiFetch
+      .mockResolvedValueOnce(okJson(full))
+      .mockResolvedValueOnce(okJson(ghost))
+    const result = await listAccountAds('1390021406359848', 'tok')
+    expect(result.rows).toHaveLength(100)
+    expect(result.truncated).toBe(true)
+  })
+
+  it('should NOT mark truncated when a partial page is followed by an empty ghost page', async () => {
+    const partial = { data: Array.from({ length: 34 }, (_, i) => ad(i)), paging: { cursors: { after: 'cursor-2' } } }
+    const ghost = { data: [] }
+    apiFetch
+      .mockResolvedValueOnce(okJson(partial))
+      .mockResolvedValueOnce(okJson(ghost))
+    const result = await listAccountAds('1390021406359848', 'tok')
+    expect(result.rows).toHaveLength(34)
+    expect(result.truncated).toBe(false)
+  })
+
+  it('should NOT mark truncated on a clean multi-page end with a partial last page', async () => {
+    const first = { data: Array.from({ length: 100 }, (_, i) => ad(i)), paging: { cursors: { after: 'cursor-2' } } }
+    const second = { data: Array.from({ length: 50 }, (_, i) => ad(100 + i)) }
+    apiFetch
+      .mockResolvedValueOnce(okJson(first))
+      .mockResolvedValueOnce(okJson(second))
+    const result = await listAccountAds('1390021406359848', 'tok')
+    expect(result.rows).toHaveLength(150)
+    expect(result.truncated).toBe(false)
+  })
+
+  it('should mark truncated when a full page ends without a next cursor', async () => {
+    const full = { data: Array.from({ length: 100 }, (_, i) => ad(i)) }
+    apiFetch.mockResolvedValueOnce(okJson(full))
+    const result = await listAccountAds('1390021406359848', 'tok')
+    expect(result.rows).toHaveLength(100)
+    expect(result.truncated).toBe(true)
   })
 })
 

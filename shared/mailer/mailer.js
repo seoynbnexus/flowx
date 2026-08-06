@@ -101,3 +101,30 @@ export async function sendNewCampaignRequestEmail(to, publisherName, campaignNam
     html: newCampaignRequestHtml(publisherName, campaignName, coinsOffered, link),
   });
 }
+
+export async function sendPublisherRepublishEmail(to, publisherName, campaignName, frontendUrl) {
+  const link = `${frontendUrl}/publisher/requests`
+  await transporter.sendMail({
+    from,
+    to,
+    subject: `Campaign updated — republish required: ${campaignName}`,
+    html: publisherRepublishHtml(publisherName, campaignName, link),
+  });
+}
+
+function publisherRepublishHtml(publisherName, campaignName, link) {
+  return `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:sans-serif;padding:24px;background:#f5f5f5">
+  <div style="max-width:480px;margin:auto;background:white;border-radius:8px;padding:32px">
+    <h2 style="margin-top:0">Campaign Updated — Republish Required</h2>
+    <p>Hi ${publisherName},</p>
+    <p>The campaign <strong>${campaignName}</strong> you published has been updated by the client. Please review the new creative and republish your post.</p>
+    <a href="${link}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:white;text-decoration:none;border-radius:6px;margin:8px 0">View Request</a>
+    <p style="color:#999;font-size:12px;margin-top:16px">Your existing post will remain until you republish with the updated creative.</p>
+  </div>
+</body>
+</html>`
+}

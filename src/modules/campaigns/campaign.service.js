@@ -1,7 +1,7 @@
 import * as repo from './campaign.repository.js'
 import { generateUuid } from '../../../shared/utils/uuid.utils.js'
 import { NotFoundError, ValidationError, ForbiddenError } from '../../../shared/errors/AppError.js'
-import { CAMPAIGN_STATUS, VALID_TRANSITIONS, REVIEW_ACTIONS, CAMPAIGN_JOB_TYPES } from './campaign.model.js'
+import { CAMPAIGN_STATUS, VALID_TRANSITIONS, REVIEW_ACTIONS, CAMPAIGN_JOB_TYPES, META_STATUS, BILLING_ENTRY_KINDS } from './campaign.model.js'
 import { addCoins, createTransaction } from '../ai/ai.repository.js'
 import { findActivePublishersByCategoryId } from './campaign.repository.js'
 import {
@@ -15,12 +15,18 @@ import {
   deleteAdCampaign,
   updateAdStatus,
   getObjectStatus,
-  getCampaignSpend,
-  getCampaignInsights as getCampaignInsightsFromMeta,
+  listAccountAds,
+  getCampaignStatusesBatch,
+  getAdAccount,
+  createInsightsReport,
+  getInsightsReport,
+  getInsightsReportData,
   extractMetaError,
 } from '../../../shared/services/meta-ads.service.js'
 import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
 import { transaction, queryOne } from '../../../shared/database/connection.js'
+import { isRateLimited, isSoftThrottled, getRateLimitState, getAllRateLimitStates } from '../../../shared/services/meta-rate-limiter.js'
+import { sendAdminAlert, sendPublisherRepublishNotification } from '../../../shared/mailer/alert.mailer.js'
 
 let cachedCoinRate = null
 
@@ -63,6 +69,64 @@ export async function getCoinConversionRate() {
 
 export function invalidateCoinRateCache() {
   cachedCoinRate = null
+}
+
+function envTokenFor(account) {
+  if (account?.metaAccountId === process.env.META_AD_ACCOUNT_ID && process.env.META_SYSTEM_USER_TOKEN) {
+    return process.env.META_SYSTEM_USER_TOKEN
+  }
+  return account?.accessToken || null
+}
+
+export async function resolveAccountContext(metaAccountId) {
+  if (metaAccountId) {
+    const account = await repo.findMetaAdAccountByMetaId(metaAccountId)
+    if (account?.id) {
+      return { accountId: account.metaAccountId, accessToken: envTokenFor(account), accountDbId: account.id }
+    }
+    return { accountId: metaAccountId, accessToken: process.env.META_SYSTEM_USER_TOKEN || null, accountDbId: null }
+  }
+  const primary = await repo.findPrimaryMetaAdAccount()
+  if (primary?.id) {
+    return { accountId: primary.metaAccountId, accessToken: envTokenFor(primary), accountDbId: primary.id }
+  }
+  return { accountId: process.env.META_AD_ACCOUNT_ID || null, accessToken: process.env.META_SYSTEM_USER_TOKEN || null, accountDbId: null }
+}
+
+export async function getCampaignAccountContext(campaignId) {
+  const account = await repo.findCampaignAdAccount(campaignId)
+  if (account?.id) {
+    return { accountId: account.metaAccountId, accessToken: envTokenFor(account), accountDbId: account.id }
+  }
+  return resolveAccountContext(process.env.META_AD_ACCOUNT_ID)
+}
+
+export async function getSyncableAccounts() {
+  const accounts = await repo.listMetaAdAccounts({ activeOnly: true })
+  if (accounts.length) {
+    return accounts.map(a => ({ accountId: a.metaAccountId, accountDbId: a.id }))
+  }
+  if (process.env.META_AD_ACCOUNT_ID) {
+    return [{ accountId: process.env.META_AD_ACCOUNT_ID, accountDbId: null }]
+  }
+  return []
+}
+
+async function pickAdAccountForAssignment() {
+  const accounts = await repo.listMetaAdAccounts({ activeOnly: true })
+  if (!accounts.length) return null
+  const charges = await repo.sumChargedBudgetByAccount()
+  const counts = await repo.countCampaignsByAccount()
+  const scored = accounts.map(a => {
+    const spent = charges[a.id] || 0
+    const ratio = a.monthlyCapPaise > 0 ? spent / a.monthlyCapPaise : 0
+    const eligible = a.monthlyCapPaise === 0 || spent < a.monthlyCapPaise
+    return { account: a, ratio, eligible, count: counts[a.id] || 0 }
+  })
+  const pool = scored.filter(s => s.eligible)
+  const candidates = (pool.length ? pool : scored).slice()
+  candidates.sort((a, b) => (a.ratio - b.ratio) || (a.count - b.count) || (a.account.isPrimary ? -1 : 1))
+  return candidates[0].account
 }
 
 let cachedPublisherMultiplier = null
@@ -115,7 +179,8 @@ function assertValidTransition(current, next) {
 
 export async function createCampaign(userId, data) {
   const id = generateUuid()
-  const campaign = await repo.createCampaign(id, userId, data)
+  const account = await pickAdAccountForAssignment()
+  const campaign = await repo.createCampaign(id, userId, { ...data, adAccountId: account?.id || null })
   return campaign
 }
 
@@ -147,14 +212,17 @@ export async function updateCampaign(userId, campaignId, data) {
   if (!campaign) throw new NotFoundError('Campaign not found')
   if (campaign.clientId !== userId) throw new ForbiddenError('Not your campaign')
 
-  if ([
+  const originalStatus = campaign.status
+  const blockedStatuses = [
     CAMPAIGN_STATUS.APPROVED,
     CAMPAIGN_STATUS.SCHEDULED,
     CAMPAIGN_STATUS.RUNNING,
     CAMPAIGN_STATUS.COMPLETED,
     CAMPAIGN_STATUS.CANCELLED,
-    CAMPAIGN_STATUS.FAILED,
-  ].includes(campaign.status)) {
+    CAMPAIGN_STATUS.ARCHIVED,
+    CAMPAIGN_STATUS.AWAITING_PUBLISHERS,
+  ]
+  if (blockedStatuses.includes(campaign.status)) {
     throw new ValidationError('Cannot edit campaign in its current status')
   }
 
@@ -165,6 +233,25 @@ export async function updateCampaign(userId, campaignId, data) {
       const updated = await repo.updateCampaign(campaignId, data)
       const subService = await import('../subscriptions/subscription.service.js')
       await subService.refundUsage(userId, 'campaigns', 'campaign', campaignId)
+
+      if (originalStatus === CAMPAIGN_STATUS.FAILED) {
+        const pubRequests = await repo.findPublisherRequestsByCampaignId(campaignId)
+        const creative = await repo.findCreativeByCampaignId(campaignId)
+        for (const req of pubRequests) {
+          if (req.status === 'published') {
+            await repo.updatePublisherRequest(req.id, {
+              status: 'pending_republish',
+              creativeSnapshot: creative ? JSON.stringify(creative) : null,
+            })
+            await sendPublisherRepublishNotification(req.publisherId, campaignId, campaign.name)
+          } else {
+            await repo.updatePublisherRequest(req.id, {
+              creativeSnapshot: creative ? JSON.stringify(creative) : null,
+            })
+          }
+        }
+      }
+
       return updated
     })
   }
@@ -319,7 +406,7 @@ export async function confirmAndGoLive(campaignId, userId) {
     }
 
     await transaction(async () => {
-      await coinService.spend(campaign.clientId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
+      const spendSplit = await coinService.spend(campaign.clientId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
 
       await repo.updateCampaignWithStatusGuard(campaignId, {
         status: CAMPAIGN_STATUS.SCHEDULED,
@@ -330,6 +417,21 @@ export async function confirmAndGoLive(campaignId, userId) {
       }, CAMPAIGN_STATUS.APPROVED)
 
       await repo.createReviewLog(campaignId, userId, REVIEW_ACTIONS.CONFIRMED, CAMPAIGN_STATUS.APPROVED, 'Client confirmed admin adjustments')
+
+      if (adBudgetCost > 0) {
+        const coinRate = await getCoinConversionRate()
+        const chargedPaise = Math.round(adBudgetCost * coinRate * 100)
+        await repo.updateCampaign(campaignId, { chargedAdBudgetPaise: chargedPaise })
+        await repo.insertBillingEntry(campaignId, {
+          kind: BILLING_ENTRY_KINDS.CHARGE,
+          paise: chargedPaise,
+          coins: adBudgetCost,
+          rate: coinRate,
+          paidFromMonthly: spendSplit.fromMonthly,
+          paidFromWallet: spendSplit.fromWallet,
+          reason: `Meta ad budget charge: ${campaign.name}`,
+        })
+      }
     })
   }
 
@@ -497,14 +599,6 @@ function buildMetaAdPayloads(campaign, creative, metaSettings, pageId, coinRate)
 }
 
 async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
-  const adAccountId = process.env.META_AD_ACCOUNT_ID
-  const systemToken = process.env.META_SYSTEM_USER_TOKEN
-
-  if (!adAccountId || !systemToken) {
-    await logMetaEvent({ campaignId, userId, action: 'create_all', error: 'Meta Ads not configured' })
-    return { success: false, error: 'Meta Ads not configured' }
-  }
-
   const [campaign, creative, metaSettings] = await Promise.all([
     repo.findCampaignById(campaignId),
     repo.findCreativeByCampaignId(campaignId),
@@ -514,6 +608,12 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
   if (!campaign) {
     await logMetaEvent({ campaignId, userId, action: 'create_all', error: 'Campaign not found' })
     return { success: false, error: 'Campaign not found' }
+  }
+
+  const { accountId: adAccountId, accessToken: systemToken } = await getCampaignAccountContext(campaignId)
+  if (!adAccountId || !systemToken) {
+    await logMetaEvent({ campaignId, userId, action: 'create_all', error: 'Meta Ads not configured' })
+    return { success: false, error: 'Meta Ads not configured' }
   }
 
   const coinRate = await getCoinConversionRate()
@@ -534,6 +634,7 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
   } = payload
 
   const existingUserObjects = await repo.findMetaObjectsForUser(campaignId, userId)
+  let cleanupError = null
   for (const obj of [...existingUserObjects].reverse()) {
     try {
       await META_ROLLBACK_FN[obj.objectType](obj.objectId, systemToken)
@@ -541,10 +642,24 @@ async function createMetaAdObjectsForUser(campaignId, userId, pageId) {
         campaignId, userId, action: `delete_${obj.objectType}`, objectType: obj.objectType, objectId: obj.objectId,
       })
     } catch (err) {
+      const cleanupDetail = extractMetaError(err)
+      if (cleanupDetail?.code === 100) {
+        await logMetaEvent({
+          campaignId, userId, action: `delete_${obj.objectType}`, objectType: obj.objectType, objectId: obj.objectId, error: 'already deleted',
+        })
+        continue
+      }
+      cleanupError = err
       await logMetaEvent({
         campaignId, userId, action: `delete_${obj.objectType}`, objectType: obj.objectType, objectId: obj.objectId, error: err.message,
       })
+      break
     }
+  }
+  if (cleanupError) {
+    const message = `Existing Meta objects not cleaned up — aborting create: ${cleanupError.message}`
+    await logMetaEvent({ campaignId, userId, action: 'create_all', error: message })
+    return { success: false, error: message }
   }
   await repo.deleteMetaObjectsForUser(campaignId, userId)
 
@@ -666,8 +781,7 @@ export async function validateCampaignDraft(userId, campaignId) {
     throw new ValidationError(`Campaign cannot be validated in ${campaign.status} status`)
   }
 
-  const adAccountId = process.env.META_AD_ACCOUNT_ID
-  const systemToken = process.env.META_SYSTEM_USER_TOKEN
+  const { accountId: adAccountId, accessToken: systemToken } = await resolveAccountContext()
   if (!adAccountId || !systemToken) {
     return { valid: false, checks: [], error: 'Meta Ads not configured' }
   }
@@ -887,7 +1001,21 @@ export async function approveAndGoLive(campaignId, adminId, payload = {}) {
       coinsEscrowedAt: now,
     }, CAMPAIGN_STATUS.PENDING_REVIEW)
     await repo.createReviewLog(campaignId, adminId, REVIEW_ACTIONS.APPROVED, CAMPAIGN_STATUS.PENDING_REVIEW, payload.notes || null)
-    await coinService.spend(campaign.clientId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
+    const spendSplit = await coinService.spend(campaign.clientId, totalDeduction, 'campaign_escrow', campaignId, `Campaign escrow: ${campaign.name}`)
+    if (adBudgetCost > 0) {
+      const coinRate = await getCoinConversionRate()
+      const chargedPaise = Math.round(adBudgetCost * coinRate * 100)
+      await repo.updateCampaign(campaignId, { chargedAdBudgetPaise: chargedPaise })
+      await repo.insertBillingEntry(campaignId, {
+        kind: BILLING_ENTRY_KINDS.CHARGE,
+        paise: chargedPaise,
+        coins: adBudgetCost,
+        rate: coinRate,
+        paidFromMonthly: spendSplit.fromMonthly,
+        paidFromWallet: spendSplit.fromWallet,
+        reason: `Meta ad budget charge: ${campaign.name}`,
+      })
+    }
   })
 
   return updated
@@ -1020,8 +1148,9 @@ export async function queueRetryMeta(campaignId) {
   const campaign = await repo.findCampaignById(campaignId)
   if (!campaign) throw new NotFoundError('Campaign not found')
 
-  if (!process.env.META_AD_ACCOUNT_ID || !process.env.META_SYSTEM_USER_TOKEN) {
-    throw new ValidationError('Meta Ads not configured — set META_AD_ACCOUNT_ID and META_SYSTEM_USER_TOKEN')
+  const { accountId, accessToken } = await getCampaignAccountContext(campaignId)
+  if (!accountId || !accessToken) {
+    throw new ValidationError('Meta Ads not configured — add a meta ad account or set META_AD_ACCOUNT_ID and META_SYSTEM_USER_TOKEN')
   }
 
   const queuedJob = await enqueueCampaignJob(campaignId, CAMPAIGN_JOB_TYPES.RETRY_META)
@@ -1032,11 +1161,10 @@ export async function retryCampaignMeta(campaignId) {
   const campaign = await repo.findCampaignById(campaignId)
   if (!campaign) throw new NotFoundError('Campaign not found')
 
-  const adAccountId = process.env.META_AD_ACCOUNT_ID
-  const systemToken = process.env.META_SYSTEM_USER_TOKEN
+  const { accountId: adAccountId, accessToken: systemToken } = await getCampaignAccountContext(campaignId)
 
   if (!adAccountId || !systemToken) {
-    throw new ValidationError('Meta Ads not configured — set META_AD_ACCOUNT_ID and META_SYSTEM_USER_TOKEN')
+    throw new ValidationError('Meta Ads not configured — add a meta ad account or set META_AD_ACCOUNT_ID and META_SYSTEM_USER_TOKEN')
   }
 
   const existingObjects = await repo.findMetaObjectsByCampaignId(campaignId)
@@ -1046,17 +1174,22 @@ export async function retryCampaignMeta(campaignId) {
     const objects = existingObjects.filter(o => o.objectType === objType)
     for (const obj of objects) {
       try {
-        if (objType === 'ad') await deleteAd(obj.objectId, systemToken)
-        else if (objType === 'ad_creative') await deleteAdCreative(obj.objectId, systemToken)
-        else if (objType === 'ad_set') await deleteAdSet(obj.objectId, systemToken)
-        else if (objType === 'facebook_campaign') await deleteAdCampaign(obj.objectId, systemToken)
+        await META_ROLLBACK_FN[objType](obj.objectId, systemToken)
         await logMetaEvent({
           campaignId, action: `delete_${objType}`, objectType: objType, objectId: obj.objectId,
         })
       } catch (err) {
+        const cleanupDetail = extractMetaError(err)
+        if (cleanupDetail?.code === 100) {
+          await logMetaEvent({
+            campaignId, action: `delete_${objType}`, objectType: objType, objectId: obj.objectId, error: 'already deleted',
+          })
+          continue
+        }
         await logMetaEvent({
           campaignId, action: `delete_${objType}`, objectType: objType, objectId: obj.objectId, error: err.message,
         })
+        throw new Error(`Existing Meta objects not cleaned up — aborting retry: ${err.message}`)
       }
     }
   }
@@ -1087,25 +1220,40 @@ export async function retryCampaignMeta(campaignId) {
 }
 
 export async function activateAllMetaObjects(campaignId) {
-  const systemToken = process.env.META_SYSTEM_USER_TOKEN
+  const { accessToken: systemToken } = await getCampaignAccountContext(campaignId)
   if (!systemToken) {
-    await logMetaEvent({ campaignId, action: 'activate_all', error: 'META_SYSTEM_USER_TOKEN not configured' })
+    await logMetaEvent({ campaignId, action: 'activate_all', error: 'Meta system token not configured' })
     return { success: false, error: 'Meta system token not configured' }
   }
 
   const objects = await repo.findMetaObjectsByCampaignId(campaignId)
 
-  if (!objects.length) {
-    await logMetaEvent({ campaignId, action: 'activate_all', error: 'No Meta objects to activate' })
+  const groups = new Map()
+  for (const obj of objects) {
+    const key = obj.createdForUserId || 'none'
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(obj)
+  }
+
+  const chains = []
+  for (const group of groups.values()) {
+    const resolved = resolveMetaObjects(group)
+    if (resolved.facebook_campaign && resolved.ad_set && resolved.ad) {
+      chains.push({ facebook_campaign: resolved.facebook_campaign, ad_set: resolved.ad_set, ad: resolved.ad })
+    }
+  }
+
+  if (!chains.length) {
+    await logMetaEvent({ campaignId, action: 'activate_all', error: 'No complete Meta object chains to activate' })
     return { success: false, error: 'No Meta objects to activate' }
   }
 
   const activateOrder = ['facebook_campaign', 'ad_set', 'ad']
   const results = []
 
-  for (const objType of activateOrder) {
-    const items = objects.filter(o => o.objectType === objType)
-    for (const item of items) {
+  for (const chain of chains) {
+    for (const objType of activateOrder) {
+      const item = chain[objType]
       try {
         const t0 = Date.now()
         await updateAdStatus(item.objectId, 'ACTIVE', systemToken)
@@ -1144,99 +1292,6 @@ export async function completePublisherRequest(requestId) {
   })
 
   return repo.findPublisherRequestById(requestId)
-}
-
-export async function syncCampaignMetaStatus(campaignId) {
-  const systemToken = process.env.META_SYSTEM_USER_TOKEN
-  const adAccountId = process.env.META_AD_ACCOUNT_ID
-
-  if (!systemToken || !adAccountId) {
-    await logMetaEvent({ campaignId, action: 'sync', error: 'Meta not configured' })
-    return { success: false, error: 'Meta not configured' }
-  }
-
-  const campaign = await repo.findCampaignById(campaignId)
-  if (!campaign) return { success: false, error: 'Campaign not found' }
-  if (!['running', 'paused'].includes(campaign.status)) return { success: false, error: 'Campaign not syncable' }
-
-  const metaObjects = await repo.findMetaObjectsByCampaignId(campaignId)
-  const ad = metaObjects.find(o => o.objectType === 'ad')
-  const fbCampaign = metaObjects.find(o => o.objectType === 'facebook_campaign')
-
-  if (!ad) return { success: false, error: 'No Meta ad object to sync' }
-
-  const result = {
-    campaignId,
-    statusBefore: campaign.status,
-    statusAfter: campaign.status,
-    statusChanged: false,
-    metaSpendPaise: campaign.metaSpentPaise || 0,
-    spendUpdated: false,
-    errors: [],
-  }
-
-  try {
-    const adStatusData = await getObjectStatus(ad.objectId, systemToken)
-    const metaAdStatus = adStatusData.effective_status || adStatusData.status || 'UNKNOWN'
-
-    if (metaAdStatus !== ad.status) {
-      await repo.saveMetaObjectStatus(ad.objectId, metaAdStatus)
-      result.metaStatus = metaAdStatus
-    }
-
-    if (metaAdStatus === 'PAUSED' && campaign.status === 'running') {
-      await repo.updateCampaignStatus(campaignId, 'paused')
-      await repo.createReviewLog(campaignId, null, 'submitted', 'running', 'Campaign paused from Meta')
-      result.statusAfter = 'paused'
-      result.statusChanged = true
-    } else if (metaAdStatus === 'ACTIVE' && campaign.status === 'paused') {
-      await repo.updateCampaignStatus(campaignId, 'running')
-      await repo.createReviewLog(campaignId, null, 'submitted', 'paused', 'Campaign resumed from Meta')
-      result.statusAfter = 'running'
-      result.statusChanged = true
-    }
-  } catch (err) {
-      result.errors.push(`Status sync failed: ${err.message}`)
-  }
-
-  if (fbCampaign) {
-    try {
-      const spendData = await getCampaignSpend(fbCampaign.objectId, systemToken)
-      if (spendData && spendData.spend !== undefined) {
-        const spendPaise = Math.round(parseFloat(spendData.spend || '0') * 100)
-        if (spendPaise > 0 && spendPaise !== (campaign.metaSpentPaise || 0)) {
-          await repo.saveMetaSpend(campaignId, spendPaise)
-          result.metaSpendPaise = spendPaise
-          result.spendUpdated = true
-        }
-      }
-    } catch (err) {
-      result.errors.push(`Spend sync failed: ${err.message}`)
-    }
-  }
-
-  await logMetaEvent({
-    campaignId, action: 'sync',
-    params: { statusBefore: result.statusBefore, statusAfter: result.statusAfter, statusChanged: result.statusChanged, spendPaise: result.metaSpendPaise },
-  })
-
-  return { success: true, result }
-}
-
-export async function syncAllActiveCampaigns() {
-  const campaigns = await repo.findSyncableCampaigns()
-  const results = []
-
-  for (const campaign of campaigns) {
-    try {
-      const syncResult = await syncCampaignMetaStatus(campaign.id)
-      results.push(syncResult)
-    } catch (err) {
-      results.push({ campaignId: campaign.id, success: false, error: err.message })
-    }
-  }
-
-  return results
 }
 
 export async function activateDueScheduledCampaigns() {
@@ -1521,34 +1576,906 @@ export async function getPublisherProgress(campaignId, userId) {
   }
 }
 
-export async function getCampaignInsights(userId, campaignId, datePreset = 'last_30d') {
+export async function getCampaignInsights(userId, campaignId, query = {}) {
   const campaign = await repo.findCampaignById(campaignId)
   if (!campaign) throw new NotFoundError('Campaign not found')
   if (campaign.clientId !== userId) throw new ForbiddenError('Not your campaign')
 
+  if (query?.refresh) {
+    const enqueued = await repo.requeueAutoJob(campaignId, CAMPAIGN_JOB_TYPES.SYNC_INSIGHTS)
+    return { queued: true, enqueued }
+  }
+
+  const from = query?.from || null
+  const to = query?.to || null
+  const rows = await repo.findDailyStats(campaignId, { from, to })
+
+  return {
+    cached: true,
+    campaignId,
+    rows,
+    totalSpendPaise: rows.reduce((sum, r) => sum + r.spendPaise, 0),
+    liveSpendPaise: campaign.metaSpentPaise || 0,
+    chargedAdBudgetPaise: campaign.chargedAdBudgetPaise || 0,
+    lastInsightsSyncAt: campaign.lastInsightsSyncAt || null,
+    insightsError: campaign.insightsError || null,
+  }
+}
+
+export async function enqueueAutoJob(campaignId, jobType, payload = {}, options = {}) {
+  const enqueued = await repo.requeueAutoJob(campaignId, jobType, payload, options)
+  return { enqueued }
+}
+
+export async function queueManualSettle(campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.settledAt) return { queued: false, alreadySettled: true }
+  const jobId = generateUuid()
+  const enqueued = await repo.enqueueCampaignJob(jobId, campaignId, CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN)
+  return { queued: true, jobId, enqueued }
+}
+
+const STATUS_SYNC_STALENESS_SECONDS = 120
+const STATUS_SYNC_PAUSED_STALENESS_SECONDS = 3600
+const INSIGHTS_SYNC_STALENESS_SECONDS = 3600
+const SYNC_BATCH_LIMIT = 50
+const ACCOUNT_SYNC_RUN_KEY_PREFIX = 'status:'
+const ACCOUNT_INSIGHTS_RUN_KEY_PREFIX = 'insights:'
+const RATE_LIMIT_BACKOFF_SECONDS = 300
+const INSIGHTS_POLL_MIN_INTERVAL_MS = 60 * 1000
+
+export async function scheduleCampaignSyncs() {
+  if (isRateLimited()) {
+    return { skipped: true, reason: 'rate_limited' }
+  }
+  const softThrottled = isSoftThrottled()
+  const shedLimit = Number(process.env.META_SHED_ACCOUNT_LIMIT) || 3
+
+  let accounts = await getSyncableAccounts()
+  if (!accounts.length) return { skipped: true, reason: 'meta_not_configured' }
+
+  let shedAccounts = []
+  if (softThrottled) {
+    if (accounts.length <= shedLimit) {
+      return { skipped: true, reason: 'soft_throttled' }
+    }
+    const charges = await repo.sumChargedBudgetByAccount()
+    const dbAccounts = await repo.listMetaAdAccounts({ activeOnly: true })
+    const capMap = new Map(dbAccounts.map(a => [a.id, a.monthlyCapPaise]))
+    accounts = accounts.map(a => ({
+      ...a,
+      ratio: capMap.get(a.accountDbId) > 0 ? (charges[a.accountDbId] || 0) / capMap.get(a.accountDbId) : 0,
+    }))
+    accounts.sort((x, y) => y.ratio - x.ratio)
+    shedAccounts = accounts.slice(shedLimit)
+    accounts = accounts.slice(0, shedLimit)
+  }
+
+  const statusDue = await repo.findCampaignsDueForStatusSync({
+    stalenessSeconds: STATUS_SYNC_STALENESS_SECONDS,
+    pausedStalenessSeconds: STATUS_SYNC_PAUSED_STALENESS_SECONDS,
+    limit: SYNC_BATCH_LIMIT,
+  })
+
+  const insightsBatch = await repo.findDueInsightsBatch({
+    stalenessSeconds: INSIGHTS_SYNC_STALENESS_SECONDS,
+    limit: 100,
+  })
+
+  let statusEnqueued = 0
+  let insightsEnqueued = 0
+  for (const account of accounts) {
+    if (statusDue.length > 0) {
+      const runKey = `${ACCOUNT_SYNC_RUN_KEY_PREFIX}${account.accountId}`
+      const pending = await repo.findAutoJobByRunKey(runKey)
+      if (!pending) {
+        const jitter = Math.floor(Math.random() * 60)
+        await repo.requeueAutoJob(null, CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_STATUS, { adAccountId: account.accountId }, {
+          runKey,
+          runAfterSeconds: jitter,
+        })
+        statusEnqueued += 1
+      }
+    }
+
+    if (insightsBatch.length > 0) {
+      const runKey = `${ACCOUNT_INSIGHTS_RUN_KEY_PREFIX}${account.accountId}`
+      const pending = await repo.findAutoJobByRunKey(runKey)
+      const state = await repo.getMetaSyncState(runKey)
+      const pollBlocked = state?.reportRunId && state?.nextPollAt && Date.now() < Number(state.nextPollAt)
+      if (!pending && !pollBlocked) {
+        const jitter = Math.floor(Math.random() * 60)
+        await repo.requeueAutoJob(null, CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_INSIGHTS, { adAccountId: account.accountId }, {
+          runKey,
+          runAfterSeconds: jitter,
+        })
+        insightsEnqueued += 1
+      }
+    }
+  }
+
+  return {
+    statusEnqueued,
+    insightsEnqueued,
+    statusDue: statusDue.length,
+    insightsDue: insightsBatch.length,
+    accounts: accounts.length,
+    shed: shedAccounts.length ? shedAccounts.map(a => a.accountId) : undefined,
+  }
+}
+
+function resolveMetaObjects(rows) {
+  const sorted = [...rows].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+  const byType = {}
+  for (const row of sorted) {
+    if (!byType[row.objectType]) byType[row.objectType] = row
+  }
+  return byType
+}
+
+export async function syncCampaignStatusJob(campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) return { success: false, error: 'Campaign not found' }
+  if (![CAMPAIGN_STATUS.RUNNING, CAMPAIGN_STATUS.PAUSED].includes(campaign.status)) {
+    return { success: false, error: 'Campaign not syncable' }
+  }
+
+  const { accountId: adAccountId, accessToken: systemToken } = await getCampaignAccountContext(campaignId)
+
+  if (!systemToken || !adAccountId) {
+    await logMetaEvent({ campaignId, action: 'sync', error: 'Meta not configured' })
+    return { success: false, error: 'Meta not configured' }
+  }
+
   const metaObjects = await repo.findMetaObjectsByCampaignId(campaignId)
-  const fbCampaignObjs = metaObjects.filter(o => o.objectType === 'facebook_campaign')
-  if (!fbCampaignObjs.length) throw new ValidationError('Campaign has no Meta objects yet')
+  const { ad: adObj, facebook_campaign: fbCampaignObj } = resolveMetaObjects(metaObjects)
+  const ad = adObj
+  const fbCampaign = fbCampaignObj
 
-  const systemToken = process.env.META_SYSTEM_USER_TOKEN
-  if (!systemToken) throw new ValidationError('Meta system token not configured')
+  if (!ad) return { success: false, error: 'No Meta ad object to sync' }
 
-  let insights = []
-  let triedObjectIds = []
-
-  for (const obj of fbCampaignObjs) {
-    triedObjectIds.push(obj.objectId)
-    insights = await getCampaignInsightsFromMeta(obj.objectId, systemToken, datePreset)
-    if (insights && insights.length > 0) break
+  const result = {
+    campaignId,
+    statusBefore: campaign.status,
+    statusAfter: campaign.status,
+    statusChanged: false,
+    metaSpendPaise: campaign.metaSpentPaise || 0,
+    spendUpdated: false,
+    archived: false,
+    errors: [],
   }
 
-  if (!insights || insights.length === 0) {
-    await logMetaEvent({
-      campaignId, action: 'get_insights',
-      params: { objectIds: triedObjectIds, datePreset, resultCount: 0 },
-      error: 'Empty insights response from Meta for all facebook_campaign objects',
+  let syncError = null
+
+  try {
+    const adStatusData = await getObjectStatus(ad.objectId, systemToken)
+    const metaAdStatus = adStatusData.effective_status || adStatusData.status || 'UNKNOWN'
+
+    if (metaAdStatus !== ad.status) {
+      await repo.saveMetaObjectStatus(ad.objectId, metaAdStatus)
+    }
+
+    const transition = await applyMetaStatusTransition(campaign, metaAdStatus)
+    result.statusAfter = transition.statusAfter
+    result.statusChanged = transition.statusChanged
+  } catch (err) {
+    const detail = extractMetaError(err)
+    if (detail && detail.code === 100) {
+      result.archived = true
+      await repo.updateCampaign(campaignId, { metaStatus: META_STATUS.ARCHIVED, metaError: detail.userMsg || err.message })
+      await repo.createReviewLog(campaignId, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+        `Meta ad object deleted — manual review required: ${detail.userMsg || err.message}`)
+      await sendAdminAlert('Meta campaign archived', `Campaign ${campaign.name} (${campaignId}) has a deleted Meta object. Review and settle manually: ${detail.userMsg || err.message}`)
+    } else {
+      result.errors.push(`Status sync failed: ${err.message}`)
+      syncError = err
+    }
+  }
+
+  if (!syncError && !result.archived && fbCampaign) {
+    try {
+      const spend = await applySpendFromDailyStats(campaign)
+      if (spend.updated) {
+        result.metaSpendPaise = spend.metaSpendPaise
+        result.spendUpdated = true
+      }
+      if (spend.error) result.errors.push(spend.error)
+    } catch (err) {
+      result.errors.push(`Spend sync failed: ${err.message}`)
+    }
+  }
+
+  if (syncError) {
+    const detail = extractMetaError(syncError)
+    if (detail?.code === 80004 || isRateLimited()) {
+      await repo.stampMetaSyncBackoff(campaignId, RATE_LIMIT_BACKOFF_SECONDS)
+    } else {
+      await repo.touchMetaSync(campaignId)
+    }
+    throw syncError
+  }
+
+  await repo.touchMetaSync(campaignId)
+
+  await logMetaEvent({
+    campaignId, action: 'sync',
+    params: {
+      statusBefore: result.statusBefore,
+      statusAfter: result.statusAfter,
+      statusChanged: result.statusChanged,
+      spendPaise: result.metaSpendPaise,
+      archived: result.archived,
+    },
+  })
+
+  return { success: true, result }
+}
+
+async function applyMetaStatusTransition(campaign, metaAdStatus) {
+  const status = String(metaAdStatus || '').toUpperCase()
+  let statusChanged = false
+  let metaStatusChanged = false
+  let newStatus = campaign.status
+  let newMetaStatus = campaign.metaStatus
+
+  if (['DISAPPROVED', 'REJECTED'].includes(status)
+    && [CAMPAIGN_STATUS.RUNNING, CAMPAIGN_STATUS.PAUSED].includes(campaign.status)) {
+    await repo.updateCampaignWithStatusGuard(campaign.id, {
+      status: CAMPAIGN_STATUS.FAILED,
+      metaStatus: META_STATUS.FAILED,
+      metaError: 'Ad disapproved by Meta',
+    }, campaign.status)
+    await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+      'Ad disapproved by Meta')
+    newStatus = CAMPAIGN_STATUS.FAILED
+    newMetaStatus = META_STATUS.FAILED
+    statusChanged = true
+    metaStatusChanged = true
+  } else if (status === 'ARCHIVED' || status === 'DELETED') {
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.ARCHIVED, metaError: `Meta campaign ${status.toLowerCase()}` })
+    await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+      `Meta campaign ${status.toLowerCase()} — manual review required`)
+    await repo.requeueAutoJob(campaign.id, CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN)
+    await sendAdminAlert('Meta campaign archived via sync',
+      `Campaign ${campaign.name} (${campaign.id}) was ${status.toLowerCase()} on Meta. Review and settle manually.`)
+    newMetaStatus = META_STATUS.ARCHIVED
+    metaStatusChanged = true
+  } else if (status === 'PAUSED' && campaign.status === CAMPAIGN_STATUS.RUNNING) {
+    await repo.updateCampaignStatus(campaign.id, CAMPAIGN_STATUS.PAUSED)
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PAUSED })
+    await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, CAMPAIGN_STATUS.RUNNING, 'Campaign paused from Meta')
+    newStatus = CAMPAIGN_STATUS.PAUSED
+    newMetaStatus = META_STATUS.PAUSED
+    statusChanged = true
+    metaStatusChanged = true
+  } else if (status === 'ACTIVE' && campaign.status === CAMPAIGN_STATUS.PAUSED) {
+    await repo.updateCampaignStatus(campaign.id, CAMPAIGN_STATUS.RUNNING)
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.ACTIVE })
+    await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, CAMPAIGN_STATUS.PAUSED, 'Campaign resumed from Meta')
+    newStatus = CAMPAIGN_STATUS.RUNNING
+    newMetaStatus = META_STATUS.ACTIVE
+    statusChanged = true
+    metaStatusChanged = true
+  } else if (status === 'ACTIVE') {
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.ACTIVE })
+    newMetaStatus = META_STATUS.ACTIVE
+    metaStatusChanged = true
+  } else if (status === 'PAUSED') {
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PAUSED })
+    newMetaStatus = META_STATUS.PAUSED
+    metaStatusChanged = true
+  } else if (status === 'PENDING_REVIEW') {
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PENDING_REVIEW })
+    newMetaStatus = META_STATUS.PENDING_REVIEW
+    metaStatusChanged = true
+  } else if (status === 'PENDING_BILLING_INFO') {
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PENDING_BILLING_INFO })
+    await sendAdminAlert('Meta campaign billing info required',
+      `Campaign ${campaign.name} (${campaign.id}) requires billing info on Meta.`)
+    newMetaStatus = META_STATUS.PENDING_BILLING_INFO
+    metaStatusChanged = true
+  } else if (status === 'WITH_ISSUES') {
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.WITH_ISSUES })
+    await sendAdminAlert('Meta campaign has issues',
+      `Campaign ${campaign.name} (${campaign.id}) has policy issues on Meta.`)
+    newMetaStatus = META_STATUS.WITH_ISSUES
+    metaStatusChanged = true
+  } else if (status === 'PREAPPROVED') {
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PREAPPROVED })
+    newMetaStatus = META_STATUS.PREAPPROVED
+    metaStatusChanged = true
+  }
+
+  return { statusAfter: newStatus, metaStatusAfter: newMetaStatus, statusChanged, metaStatusChanged }
+}
+
+async function applySpendFromDailyStats(campaign) {
+  const spendPaise = await repo.sumDailyStatsSpend(campaign.id)
+  if (spendPaise > 0 && spendPaise > (campaign.metaSpentPaise || 0)) {
+    await repo.saveMetaSpend(campaign.id, spendPaise)
+    return { updated: true, metaSpendPaise: spendPaise }
+  }
+  if (spendPaise > 0 && spendPaise < (campaign.metaSpentPaise || 0)) {
+    const error = `Spend went backwards: ${spendPaise} < ${campaign.metaSpentPaise}`
+    await logMetaEvent({ campaignId: campaign.id, action: 'sync', error })
+    return { updated: false, error }
+  }
+  return { updated: false }
+}
+
+async function enforceAccountBudgetCap(dbAccount) {
+  if (!dbAccount || !(Number(dbAccount.monthlyCapPaise) > 0)) {
+    return { success: true, checked: false }
+  }
+
+  const charges = await repo.sumChargedBudgetByAccount()
+  const spent = charges[dbAccount.id] || 0
+  const cap = Number(dbAccount.monthlyCapPaise)
+  const ratio = spent / cap
+
+  if (ratio < 1) {
+    const state = await repo.getMetaSyncState(`cap_alert:${dbAccount.id}`)
+    const lastAlert = state?.alertedAt ? Number(state.alertedAt) : 0
+    if (ratio >= 0.95 && Date.now() - lastAlert > 24 * 60 * 60 * 1000) {
+      await sendAdminAlert('Meta ad account near monthly cap',
+        `Ad account ${dbAccount.metaAccountId} (${dbAccount.name || 'unnamed'}) has charged ${spent} paise of its ${cap} paise monthly cap (${Math.round(ratio * 100)}%).`)
+      await repo.saveMetaSyncState(`cap_alert:${dbAccount.id}`, { alertedAt: Date.now() })
+    }
+    return { success: true, checked: true, ratio }
+  }
+
+  const running = await repo.findRunningCampaignsByAccount(dbAccount.id)
+  const { accessToken: systemToken } = await resolveAccountContext(dbAccount.metaAccountId)
+  const paused = []
+  for (const campaign of running) {
+    try {
+      const metaObjects = await repo.findMetaObjectsByCampaignId(campaign.id)
+      const ad = metaObjects.find(o => o.objectType === 'ad')
+      if (ad?.objectId && systemToken) {
+        await updateAdStatus(ad.objectId, 'PAUSED', systemToken)
+        await repo.saveMetaObjectStatus(ad.objectId, 'PAUSED')
+      }
+      await applyMetaStatusTransition(campaign, 'PAUSED')
+      await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+        `Paused by budget cap — account charged ${spent} of ${cap} paise`)
+      paused.push(campaign.id)
+    } catch (err) {
+      await logMetaEvent({ campaignId: campaign.id, action: 'budget_cap', error: err.message })
+    }
+  }
+
+  await repo.saveMetaSyncState(`cap_pause:${dbAccount.id}`, { pausedAt: Date.now(), pausedCount: paused.length })
+  return { success: true, checked: true, ratio, atCap: true, paused }
+}
+
+export async function syncAccountStatusJob(adAccountId = process.env.META_AD_ACCOUNT_ID) {
+  const { accessToken: systemToken, accountDbId } = await resolveAccountContext(adAccountId)
+  if (!systemToken || !adAccountId) {
+    return { success: false, error: 'Meta not configured' }
+  }
+
+  const dbAccount = accountDbId ? await repo.findMetaAdAccountById(accountDbId) : null
+  const includeUnassigned = !dbAccount || dbAccount.isPrimary || adAccountId === process.env.META_AD_ACCOUNT_ID
+
+  const budget = await enforceAccountBudgetCap(dbAccount)
+
+  const rows = await repo.findAllAdObjectSyncRows({
+    adAccountId: dbAccount?.id || undefined,
+    includeUnassigned,
+  })
+  if (!rows.length) return { success: true, skipped: true }
+
+  const { rows: ads, truncated } = await listAccountAds(adAccountId, systemToken)
+  const byObjectId = new Map(rows.map(r => [r.objectId, r]))
+  const seen = new Set()
+  const results = []
+
+  for (const ad of ads) {
+    const row = byObjectId.get(ad.id)
+    if (!row) continue
+    seen.add(ad.id)
+    try {
+      const campaign = await repo.findCampaignById(row.campaignId)
+      if (!campaign) continue
+      const metaAdStatus = ad.effective_status || ad.status || 'UNKNOWN'
+      if (metaAdStatus !== row.adStatus) {
+        await repo.saveMetaObjectStatus(ad.id, metaAdStatus)
+      }
+      const transition = await applyMetaStatusTransition(campaign, metaAdStatus)
+      const spend = await applySpendFromDailyStats(campaign)
+      await repo.touchMetaSync(campaign.id)
+      results.push({ campaignId: campaign.id, ...transition, spendUpdated: spend.updated })
+    } catch (err) {
+      const detail = extractMetaError(err)
+      if (detail && detail.code === 100) {
+        await repo.updateCampaign(row.campaignId, { metaStatus: META_STATUS.ARCHIVED, metaError: detail.userMsg || err.message })
+        await repo.createReviewLog(row.campaignId, null, REVIEW_ACTIONS.SUBMITTED, row.status,
+          `Meta ad object deleted — manual review required: ${detail.userMsg || err.message}`)
+        results.push({ campaignId: row.campaignId, archived: true })
+      } else {
+        throw err
+      }
+    }
+  }
+
+  if (!truncated) {
+    for (const row of rows) {
+      if (seen.has(row.objectId)) continue
+      try {
+        const campaign = await repo.findCampaignById(row.campaignId)
+        if (!campaign) continue
+        await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.ARCHIVED, metaError: 'Meta ad object missing from account — likely deleted' })
+        await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+          'Meta ad object missing from account — manual review required')
+        await sendAdminAlert('Meta campaign archived', `Campaign ${campaign.name} (${campaign.id}) has a deleted Meta object. Review and settle manually.`)
+        await repo.touchMetaSync(campaign.id)
+        results.push({ campaignId: campaign.id, archived: true })
+      } catch (err) {
+        await logMetaEvent({ campaignId: row.campaignId, action: 'sync_account', error: err.message })
+      }
+    }
+  }
+
+  // Campaign-level batched status check for campaigns needing it
+  const CAMPAIGN_LEVEL_STATUSES = [
+    META_STATUS.PENDING_REVIEW,
+    META_STATUS.PENDING_BILLING_INFO,
+    META_STATUS.WITH_ISSUES,
+    META_STATUS.PREAPPROVED,
+  ]
+  const needCampaignCheck = results
+    .filter(r => CAMPAIGN_LEVEL_STATUSES.includes(r.metaStatusAfter))
+    .map(r => {
+      const row = rows.find(x => x.campaignId === r.campaignId)
+      return row?.fbCampaignId
     })
+    .filter(Boolean)
+
+  if (needCampaignCheck.length > 0 && !isRateLimited(accountDbId)) {
+    try {
+      const campaignStatuses = await getCampaignStatusesBatch(adAccountId, systemToken, needCampaignCheck)
+      for (const fbId of needCampaignCheck) {
+        const metaStatus = campaignStatuses[fbId]
+        if (!metaStatus) continue
+        const row = rows.find(r => r.fbCampaignId === fbId)
+        if (!row) continue
+        const campaign = await repo.findCampaignById(row.campaignId)
+        if (!campaign) continue
+        const transition = await applyMetaStatusTransition(campaign, metaStatus)
+        results.push({ campaignId: campaign.id, ...transition, campaignLevelCheck: true })
+      }
+    } catch (err) {
+      await logMetaEvent({ campaignId: null, action: 'sync_campaign_batch', error: err.message })
+    }
   }
 
-  return insights
+  return { success: true, ads: ads.length, campaigns: results.length, truncated, budget }
+}
+
+async function fanOutInsightsRows(rowsData) {
+  const fbIds = [...new Set((rowsData || []).map(r => r.campaign_id).filter(Boolean))]
+  if (!fbIds.length) return { count: 0, campaignIds: [] }
+  const idMap = await repo.findCampaignIdsByFbObjectIds(fbIds)
+  const grouped = {}
+  for (const row of rowsData || []) {
+    const campaignId = idMap.get(row.campaign_id)
+    if (!campaignId) continue
+    if (!grouped[campaignId]) grouped[campaignId] = []
+    grouped[campaignId].push(row)
+  }
+  let count = 0
+  for (const campaignId of Object.keys(grouped)) {
+    count += await persistInsightsRows(campaignId, grouped[campaignId])
+  }
+  return { count, campaignIds: Object.keys(grouped) }
+}
+
+export async function syncAccountInsightsJob(adAccountId = process.env.META_AD_ACCOUNT_ID) {
+  const { accessToken: systemToken, accountDbId } = await resolveAccountContext(adAccountId)
+  if (!systemToken || !adAccountId) {
+    return { success: false, error: 'Meta not configured' }
+  }
+
+  const dbAccount = accountDbId ? await repo.findMetaAdAccountById(accountDbId) : null
+  const includeUnassigned = !dbAccount || dbAccount.isPrimary || adAccountId === process.env.META_AD_ACCOUNT_ID
+
+  const runKey = `${ACCOUNT_INSIGHTS_RUN_KEY_PREFIX}${adAccountId}`
+  const state = await repo.getMetaSyncState(runKey)
+  const reportRunId = state?.reportRunId || null
+
+  try {
+    if (reportRunId) {
+      if (state?.nextPollAt && Date.now() < Number(state.nextPollAt)) {
+        return { success: true, pending: true, throttled: true }
+      }
+      const report = await getInsightsReport(reportRunId, systemToken)
+      const status = report.async_status || report.status || ''
+      if (status === 'Job Completed' || status === 'COMPLETED') {
+        const rowsData = await getInsightsReportData(reportRunId, systemToken)
+        const { count, campaignIds } = await fanOutInsightsRows(rowsData)
+        await repo.clearMetaSyncState(runKey)
+        const now = new Date().toISOString().slice(0, 19).replace('T', ' ')
+        for (const campaignId of campaignIds) {
+          await repo.saveInsightsSyncState(campaignId, { lastInsightsSyncAt: now, insightsError: null })
+        }
+        return { success: true, rows: count, campaigns: campaignIds.length }
+      }
+      if (status === 'Job Failed' || status === 'FAILED') {
+        await repo.clearMetaSyncState(runKey)
+        throw new Error(`Insights report failed: ${report.error || 'unknown error'}`)
+      }
+      await repo.saveMetaSyncState(runKey, { reportRunId, nextPollAt: Date.now() + INSIGHTS_POLL_MIN_INTERVAL_MS })
+      return { success: true, pending: true }
+    }
+
+    if (isRateLimited(adAccountId)) {
+      throw new Error('Meta rate limited — insights sync deferred')
+    }
+
+    const batch = await repo.findDueInsightsBatch({
+      stalenessSeconds: INSIGHTS_SYNC_STALENESS_SECONDS,
+      limit: 100,
+      adAccountId: dbAccount?.id || undefined,
+      includeUnassigned,
+    })
+    if (!batch.length) return { success: true, skipped: true }
+
+    const fbIds = [...new Set(batch.map(b => b.fbObjectId).filter(Boolean))]
+    if (!fbIds.length) return { success: true, skipped: true }
+
+    const since = batch.map(b => computeInsightsBackfillStart(b)).sort()[0]
+    const until = new Date().toISOString().slice(0, 10)
+
+    const report = await createInsightsReport(adAccountId, {
+      accessToken: systemToken,
+      level: 'campaign',
+      timeIncrement: 1,
+      since,
+      until,
+      filtering: [{ field: 'campaign.id', operator: 'IN', value: fbIds }],
+    })
+
+    const runId = report.report_run_id
+    if (!runId) {
+      throw new Error(`Insights report created without report_run_id: ${JSON.stringify(report)}`)
+    }
+
+    await repo.saveMetaSyncState(runKey, { reportRunId: runId, nextPollAt: Date.now() + INSIGHTS_POLL_MIN_INTERVAL_MS })
+    return { success: true, pending: true, campaigns: batch.length }
+  } catch (err) {
+    await logMetaEvent({ action: 'sync_account_insights', error: err.message })
+    throw err
+  }
+}
+
+const REPORT_RUN_PREFIX = 'report_running:'
+
+function computeInsightsBackfillStart(campaign) {
+  const start = campaign.scheduledAt ? new Date(campaign.scheduledAt) : null
+  if (start && Number.isFinite(start.getTime())) {
+    return start.toISOString().slice(0, 10)
+  }
+  return new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
+
+async function persistInsightsRows(campaignId, rows) {
+  let count = 0
+  for (const row of rows || []) {
+    const actions = {}
+    for (const action of row.actions || []) {
+      if (action?.action_type) actions[action.action_type] = action.value
+    }
+    const costPerActionType = {}
+    for (const cost of row.cost_per_action_type || []) {
+      if (cost?.action_type) costPerActionType[cost.action_type] = cost.value
+    }
+    await repo.upsertDailyStat(campaignId, {
+      statDate: row.date_start,
+      impressions: row.impressions,
+      reach: row.reach,
+      frequency: row.frequency,
+      clicks: row.clicks,
+      uniqueClicks: row.unique_clicks,
+      ctr: row.ctr,
+      cpc: row.cpc,
+      cpm: row.cpm,
+      spendPaise: Math.round(parseFloat(row.spend || '0') * 100),
+      actions,
+      costPerActionType,
+    })
+    count += 1
+  }
+  return count
+}
+
+export async function syncCampaignInsightsJob(campaignId) {
+  const { accountId: adAccountId, accessToken: systemToken } = await getCampaignAccountContext(campaignId)
+
+  if (!systemToken || !adAccountId) {
+    return { success: false, error: 'Meta not configured' }
+  }
+
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) return { success: false, error: 'Campaign not found' }
+
+  const fbObjectIds = await repo.findFacebookCampaignObjectIds(campaignId)
+  if (!fbObjectIds.length) return { success: false, error: 'No Meta campaign objects' }
+
+  const resumeError = campaign.insightsError || ''
+  const reportRunId = resumeError.startsWith(REPORT_RUN_PREFIX)
+    ? resumeError.slice(REPORT_RUN_PREFIX.length)
+    : null
+
+  try {
+    if (reportRunId) {
+      const report = await getInsightsReport(reportRunId, systemToken)
+      const status = report.async_status || report.status || ''
+      if (status === 'Job Completed' || status === 'COMPLETED') {
+        const rowsData = await getInsightsReportData(reportRunId, systemToken)
+        const count = await persistInsightsRows(campaignId, rowsData)
+        await repo.saveInsightsSyncState(campaignId, {
+          lastInsightsSyncAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
+          insightsError: null,
+        })
+        return { success: true, rows: count }
+      }
+      if (status === 'Job Failed' || status === 'FAILED') {
+        await repo.saveInsightsSyncState(campaignId, { insightsError: null })
+        throw new Error(`Insights report failed: ${report.error || 'unknown error'}`)
+      }
+      return { success: true, pending: true }
+    }
+
+    if (isRateLimited()) {
+      throw new Error('Meta rate limited — insights sync deferred')
+    }
+
+    const since = computeInsightsBackfillStart(campaign)
+    const until = new Date().toISOString().slice(0, 10)
+
+    const report = await createInsightsReport(adAccountId, {
+      accessToken: systemToken,
+      level: 'campaign',
+      timeIncrement: 1,
+      since,
+      until,
+      filtering: [{ field: 'campaign.id', operator: 'IN', value: fbObjectIds }],
+    })
+
+    const runId = report.report_run_id
+    if (!runId) {
+      throw new Error(`Insights report created without report_run_id: ${JSON.stringify(report)}`)
+    }
+
+    await repo.saveInsightsSyncState(campaignId, { insightsError: `${REPORT_RUN_PREFIX}${runId}` })
+    return { success: true, pending: true }
+  } catch (err) {
+    await logMetaEvent({ campaignId, action: 'sync_insights', error: err.message })
+    throw err
+  }
+}
+
+export async function pollAccountBalance() {
+  const accounts = await getSyncableAccounts()
+  if (!accounts.length) return { success: false, error: 'Meta not configured' }
+
+  const results = []
+  for (const account of accounts) {
+    try {
+      const { accessToken: systemToken } = await resolveAccountContext(account.accountId)
+      if (!systemToken) {
+        results.push({ adAccountId: account.accountId, success: false, error: 'No token configured' })
+        continue
+      }
+      const data = await getAdAccount(account.accountId, systemToken)
+      const balancePaise = Math.round(parseFloat(data.balance || '0') * 100)
+      await repo.insertAccountSnapshot({
+        adAccountId: account.accountId,
+        balancePaise,
+        currency: data.currency || null,
+        accountStatus: data.account_status || null,
+        disableReason: data.disable_reason || null,
+      })
+      results.push({ adAccountId: account.accountId, success: true, balancePaise })
+    } catch (err) {
+      await logMetaEvent({ action: 'account_balance', error: err.message })
+      results.push({ adAccountId: account.accountId, success: false, error: err.message })
+    }
+  }
+
+  return { success: results.some(r => r.success), results }
+}
+
+export async function endExpiredCampaigns() {
+  const due = await repo.findEndableRunningCampaigns()
+  const results = []
+  for (const campaign of due) {
+    try {
+      await repo.updateCampaignWithStatusGuard(campaign.id, {
+        status: CAMPAIGN_STATUS.COMPLETED,
+      }, campaign.status)
+      await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status, 'Campaign ended by schedule')
+      await repo.requeueAutoJob(campaign.id, CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN)
+      results.push({ campaignId: campaign.id, success: true })
+    } catch (err) {
+      results.push({ campaignId: campaign.id, success: false, error: err.message })
+    }
+  }
+  return results
+}
+
+export async function settleCampaignJob(campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  if (campaign.settledAt) return { success: true, alreadySettled: true }
+
+  const chargedPaise = campaign.chargedAdBudgetPaise || 0
+  if (chargedPaise <= 0) return { success: true, nothingCharged: true }
+
+  const charge = await repo.findCampaignCharge(campaignId)
+  const rate = charge?.rate || (await getCoinConversionRate())
+  const paisePerCoin = Math.max(rate * 100, 1)
+  const coinService = await import('../../../shared/services/coin.service.js')
+
+  if ([CAMPAIGN_STATUS.RUNNING, CAMPAIGN_STATUS.PAUSED].includes(campaign.status)) {
+    await repo.updateCampaignWithStatusGuard(campaignId, { status: CAMPAIGN_STATUS.COMPLETED }, campaign.status)
+    await repo.createReviewLog(campaignId, null, REVIEW_ACTIONS.SUBMITTED, campaign.status, 'Campaign ended — Meta settlement triggered')
+  }
+
+  const actualPaise = await repo.sumDailyStatsSpend(campaignId)
+
+  if (actualPaise <= chargedPaise) {
+    const refundPaise = chargedPaise - actualPaise
+    const refundCoins = Math.round(refundPaise / paisePerCoin)
+
+    if (refundCoins > 0) {
+      const fromMonthly = charge?.paidFromMonthly || 0
+      const fromWallet = charge?.paidFromWallet || 0
+      const totalChargedCoins = fromMonthly + fromWallet
+      let monthlyShare = 0
+      let walletShare = refundCoins
+      if (totalChargedCoins > 0) {
+        monthlyShare = Math.round(refundCoins * (fromMonthly / totalChargedCoins))
+        walletShare = refundCoins - monthlyShare
+      }
+      await coinService.refundWithDetail(campaign.clientId, refundCoins, 'campaign_escrow', campaignId,
+        `Meta spend settlement refund: ${campaign.name}`, { fromMonthly: monthlyShare, fromWallet: walletShare })
+      await repo.insertBillingEntry(campaignId, {
+        kind: BILLING_ENTRY_KINDS.REFUND,
+        paise: refundPaise,
+        coins: refundCoins,
+        rate,
+        paidFromMonthly: monthlyShare,
+        paidFromWallet: walletShare,
+        reason: `Settlement refund: charged ${chargedPaise} paise, spent ${actualPaise} paise`,
+      })
+    }
+
+    await repo.insertBillingEntry(campaignId, {
+      kind: BILLING_ENTRY_KINDS.SETTLE,
+      paise: actualPaise,
+      coins: Math.round(actualPaise / paisePerCoin),
+      rate,
+      reason: `Campaign settled: charged ${chargedPaise} paise, actual spend ${actualPaise} paise`,
+    })
+    await repo.markCampaignSettled(campaignId)
+    return { success: true, refundCoins, actualPaise, chargedPaise }
+  }
+
+  const overspendPaise = actualPaise - chargedPaise
+  const overspendCoins = Math.ceil(overspendPaise / paisePerCoin)
+
+  try {
+    await coinService.spend(campaign.clientId, overspendCoins, 'campaign_escrow', campaignId,
+      `Meta overspend settlement: ${campaign.name}`)
+    await repo.insertBillingEntry(campaignId, {
+      kind: BILLING_ENTRY_KINDS.OVERSPEND,
+      paise: overspendPaise,
+      coins: overspendCoins,
+      rate,
+      reason: `Overspend settlement: spent ${actualPaise} paise vs charged ${chargedPaise} paise`,
+    })
+    await repo.insertBillingEntry(campaignId, {
+      kind: BILLING_ENTRY_KINDS.SETTLE,
+      paise: actualPaise,
+      coins: Math.round(actualPaise / paisePerCoin),
+      rate,
+      reason: 'Campaign settled with overspend deduction',
+    })
+    await repo.markCampaignSettled(campaignId)
+    return { success: true, overspendCoins, actualPaise, chargedPaise }
+  } catch (err) {
+    if (err?.statusCode === 422 || err?.code === 'INSUFFICIENT_COINS') {
+      await repo.insertBillingEntry(campaignId, {
+        kind: BILLING_ENTRY_KINDS.OVERSPEND,
+        paise: overspendPaise,
+        coins: overspendCoins,
+        rate,
+        reason: `Overspend on hold — insufficient wallet coins for ${overspendCoins} coins`,
+      })
+      await sendAdminAlert('Campaign overspend hold', `Campaign ${campaign.name} (${campaignId}) spent ${actualPaise} paise vs ${chargedPaise} charged; could not deduct ${overspendCoins} coins (insufficient balance).`)
+      return { success: true, held: true, overspendCoins, actualPaise, chargedPaise }
+    }
+    throw err
+  }
+}
+
+export async function getMetaSyncHealth() {
+  const [staleCampaigns, failedJobs, unsettledCount, runningCount, pausedCount, accountSnapshot, rateLimit, accounts, rateLimits, schedulerLease, chargedBudget] = await Promise.all([
+    repo.findStaleRunningCampaigns(),
+    repo.countFailedJobsByType(),
+    repo.countUnsettledCampaigns(),
+    repo.countRunningCampaigns(),
+    repo.countPausedCampaigns(),
+    repo.findLatestAccountSnapshot(),
+    Promise.resolve(getRateLimitState()),
+    repo.listMetaAdAccounts(),
+    Promise.resolve(getAllRateLimitStates()),
+    repo.getSchedulerLease('meta_sync_scheduler'),
+    repo.sumChargedBudgetByAccount(),
+  ])
+
+  return {
+    runningCount,
+    pausedCount,
+    staleCampaigns,
+    failedJobs,
+    unsettledCount,
+    accountSnapshot,
+    rateLimit,
+    accounts,
+    rateLimits,
+    schedulerLease,
+    chargedBudget,
+  }
+}
+
+export async function forceSyncCampaign(campaignId) {
+  const campaign = await repo.findCampaignById(campaignId)
+  if (!campaign) throw new NotFoundError('Campaign not found')
+  const enqueued = await repo.requeueAutoJob(campaignId, CAMPAIGN_JOB_TYPES.SYNC_STATUS)
+  await repo.requeueAutoJob(campaignId, CAMPAIGN_JOB_TYPES.SYNC_INSIGHTS)
+  return { queued: true, enqueued }
+}
+
+export async function listMetaAccounts() {
+  return repo.listMetaAdAccounts()
+}
+
+export async function createMetaAccount(data) {
+  const isEnvPrimary = data.metaAccountId === process.env.META_AD_ACCOUNT_ID
+  const existing = await repo.findMetaAdAccountByMetaId(data.metaAccountId)
+  if (existing) {
+    if (data.isPrimary) {
+      await repo.clearPrimaryMetaAccounts(existing.id)
+    }
+    return repo.updateMetaAdAccount(existing.id, isEnvPrimary ? { ...data, token: null } : data)
+  }
+  if (!isEnvPrimary && !data.token) {
+    throw new ValidationError('Token is required for new accounts')
+  }
+  if (data.isPrimary) {
+    await repo.clearPrimaryMetaAccounts()
+  }
+  return repo.createMetaAdAccount(isEnvPrimary ? { ...data, token: null } : data)
+}
+
+export async function updateMetaAccount(id, data) {
+  const existing = await repo.findMetaAdAccountById(id)
+  if (!existing) throw new NotFoundError('Meta ad account not found')
+  if (data.isPrimary) {
+    await repo.clearPrimaryMetaAccounts(existing.id)
+  }
+  if (existing.metaAccountId === process.env.META_AD_ACCOUNT_ID && data.token) {
+    data = { ...data, token: null }
+  }
+  return repo.updateMetaAdAccount(id, data)
+}
+
+export async function deleteMetaAccount(id) {
+  const existing = await repo.findMetaAdAccountById(id)
+  if (!existing) throw new NotFoundError('Meta ad account not found')
+  await repo.deleteMetaAdAccount(id)
+  return { deleted: true }
 }

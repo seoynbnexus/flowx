@@ -102,3 +102,69 @@ export async function updateConversionRate(req, res, next) {
     next(error)
   }
 }
+
+export async function getMetaSyncHealth(req, res, next) {
+  try {
+    const health = await service.getMetaSyncHealth()
+    return sendSuccess(res, health)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function syncCampaign(req, res, next) {
+  try {
+    const result = await service.forceSyncCampaign(req.params.id)
+    return sendAccepted(res, result, 'Campaign sync queued')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function settleCampaign(req, res, next) {
+  try {
+    const result = await service.queueManualSettle(req.params.id)
+    if (result.queued) {
+      return sendAccepted(res, { jobId: result.jobId }, 'Campaign settlement queued')
+    }
+    return sendSuccess(res, result, 'Campaign already settled')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function listMetaAccounts(req, res, next) {
+  try {
+    const accounts = await service.listMetaAccounts()
+    return sendSuccess(res, accounts)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function createMetaAccount(req, res, next) {
+  try {
+    const account = await service.createMetaAccount(req.body)
+    return sendSuccess(res, account, 'Meta ad account saved')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function updateMetaAccount(req, res, next) {
+  try {
+    const account = await service.updateMetaAccount(req.params.id, req.body)
+    return sendSuccess(res, account, 'Meta ad account updated')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function deleteMetaAccount(req, res, next) {
+  try {
+    const result = await service.deleteMetaAccount(req.params.id)
+    return sendSuccess(res, result, 'Meta ad account deleted')
+  } catch (error) {
+    next(error)
+  }
+}

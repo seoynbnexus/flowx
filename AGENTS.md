@@ -20,7 +20,7 @@ FlowX is a backend service for managing content publishing, AI-powered content g
 | Email | Nodemailer |
 | OAuth | Google (`google-auth-library`), Meta/Facebook Graph API (custom) |
 | API Docs | Swagger UI (`swagger-ui-express`, OpenAPI YAML spec) |
-| Logging | Morgan (HTTP, dev only), JSON structured errors |
+| Logging | pino 10 + pino-http + pino-roll (JSON file `logs/app-*.log`, daily rotate, stdout mirror) |
 | Rate Limiting | `express-rate-limit` |
 | Package Manager | npm (`package-lock.json`) |
 
@@ -221,13 +221,11 @@ Error
 
 ## Logging
 
-- **HTTP request logging** via Morgan (`morgan('dev')`) — only in non-production environments
-- **Error logging** via the `logError` function in `error.middleware.js` — writes structured JSON to console
-  - Errors ≥500 → `console.error` (level: `error`)
-  - Errors <500 → `console.warn` (level: `warn`)
-- **Application startup/shutdown** logged via `console.log`
-- **No structured logging library** (no Winston, Pino, etc.)
-- **No audit log suppression** — all error and warning entries are always logged
+- **HTTP request logging** via `pino-http` in production (JSON, `reqId` correlation, levels 5xx→error/4xx→warn/2xx→info, redacts authorization/cookie headers + sensitive query params); Morgan `dev` stays in dev/test
+- **File logging** via `shared/utils/logger.js` — pino singleton → `logs/app-YYYY-MM-DD.log` (daily rotation, `LOG_RETENTION_DAYS` default 14, gzip) + stdout mirror; **silent in `NODE_ENV=test`**
+- Config: `LOG_LEVEL` (default `info`), `LOG_DIR` (default `logs/`), `LOG_RETENTION_DAYS` (default 14)
+- **Error logging** via `logError` in `error.middleware.js` — writes through `req.log || logger` (structured JSON, `reqId`-correlated, stack in development)
+- **Outbound API logging** via `api-logger.js` (`shared/utils/api-logger.js`) — all envs: successes at `debug` (info in dev), non-2xx/exceptions always `warn`/`error` with truncated body; `sanitizeUrl` redacts `access_token`/`code`/`state`/`refresh_token`/`token` query params
 
 ## Validation
 
