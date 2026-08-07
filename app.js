@@ -80,7 +80,7 @@ app.use('/api/v1', routes);
 
 app.use(errorHandler);
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 3000;
 
 async function start() {
   try {
