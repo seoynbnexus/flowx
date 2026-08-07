@@ -45,7 +45,9 @@ const allowedOrigins = [
   'http://localhost:3002',
   'http://localhost:4173',
   'http://192.168.1.11:3001',
-  'http://127.0.0.1:5500'
+  'http://127.0.0.1:5500',
+  'https://swarajorganiccommunity.com',
+  'https://api.swarajorganiccommunity.com',
 ];
 
 app.use(cors({
@@ -78,7 +80,7 @@ app.use('/api/v1', routes);
 
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT;
 
 async function start() {
   try {
