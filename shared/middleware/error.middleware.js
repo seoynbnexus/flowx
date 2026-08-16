@@ -2,17 +2,22 @@ import { sendError } from '../utils/response.utils.js';
 import { AppError } from '../errors/AppError.js';
 import { HTTP_STATUS } from '../constants/httpStatus.js';
 import { ERROR_CODES } from '../errors/errorCodes.js';
-import { logger } from '../utils/logger.js';
+import { logger, safeBody } from '../utils/logger.js';
 
 function logError(level, statusCode, code, req, err) {
   const log = req.log || logger;
   const entry = {
+    reqId: req.id,
     method: req.method,
     url: req.url,
     statusCode,
     code,
     message: err.message,
   };
+  if (req.user?.id) entry.userId = req.user.id;
+  if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+    entry.body = safeBody(req.body);
+  }
   if (process.env.NODE_ENV === 'development') {
     entry.stack = err.stack;
   }
@@ -51,6 +56,23 @@ export function errorHandler(err, req, res, _next) {
   if (err.type === 'entity.too.large') {
     logError('warn', HTTP_STATUS.UNPROCESSABLE_ENTITY, ERROR_CODES.VALIDATION_ERROR, req, err);
     return sendError(res, HTTP_STATUS.UNPROCESSABLE_ENTITY, 'Request body too large', null, ERROR_CODES.VALIDATION_ERROR);
+  }
+
+  if (err.name === 'MulterError') {
+    const message = err.code === 'LIMIT_FILE_SIZE'
+      ? 'File exceeds the maximum allowed size'
+      : `Upload failed: ${err.message}`;
+    logError('warn', HTTP_STATUS.UNPROCESSABLE_ENTITY, ERROR_CODES.VALIDATION_ERROR, req, err);
+    return sendError(res, HTTP_STATUS.UNPROCESSABLE_ENTITY, message, null, ERROR_CODES.VALIDATION_ERROR);
+  }
+
+  if (
+    !(err instanceof AppError) &&
+    typeof err.message === 'string' &&
+    ['Request aborted', 'Request closed', 'Request error', 'Unexpected end of form'].includes(err.message)
+  ) {
+    logError('warn', HTTP_STATUS.BAD_REQUEST, ERROR_CODES.VALIDATION_ERROR, req, err);
+    return sendError(res, HTTP_STATUS.BAD_REQUEST, 'Upload interrupted — please retry', null, ERROR_CODES.VALIDATION_ERROR);
   }
 
   logError('error', HTTP_STATUS.INTERNAL_SERVER_ERROR, ERROR_CODES.INTERNAL_ERROR, req, err);

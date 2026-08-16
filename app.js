@@ -6,9 +6,9 @@ import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import morgan from 'morgan';
 import { getPool } from './shared/database/connection.js';
 import { errorHandler } from './shared/middleware/error.middleware.js';
+import { responseLogger } from './shared/middleware/response-log.middleware.js';
 import { logger, httpLogger } from './shared/utils/logger.js';
 import routes from './src/routes/index.js';
 
@@ -33,11 +33,8 @@ app.use('/api/v1/meta/webhook', (req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
-if (process.env.NODE_ENV === 'production') {
-  app.use(httpLogger);
-} else {
-  app.use(morgan('dev'));
-}
+app.use(httpLogger);
+app.use(responseLogger);
 
 const allowedOrigins = [
   'http://localhost:3000',

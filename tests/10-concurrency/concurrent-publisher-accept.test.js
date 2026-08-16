@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest'
-import { query } from '../../shared/database/connection.js'
+import { query, queryOne } from '../../shared/database/connection.js'
 import { generateUuid, uuidToBuffer, bufferToUuid } from '../../shared/utils/uuid.utils.js'
+import { encrypt } from '../../shared/utils/crypto.utils.js'
 import { createTestUser } from '../helpers/create-user.js'
 import * as campaignService from '../../src/modules/campaigns/campaign.service.js'
 import * as campaignRepo from '../../src/modules/campaigns/campaign.repository.js'
@@ -23,6 +24,17 @@ async function ensurePlan(userId) {
   }
 }
 
+async function addVerifiedPage(userId, platformUserId) {
+  const platform = await queryOne("SELECT id FROM platforms WHERE code = 'facebook'")
+  await query(
+    `INSERT INTO user_platform_accounts (id, user_id, platform_id, profile_url, platform_user_id,
+       platform_username, platform_display_name, token_type, access_token, token_expires_at, verification_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'page', ?, DATE_ADD(NOW(), INTERVAL 60 DAY), 'verified')`,
+    [uuidToBuffer(generateUuid()), uuidToBuffer(userId), platform.id, `https://fb.com/${platformUserId}`,
+      platformUserId, `user_${platformUserId}`, `Display ${platformUserId}`, encrypt('mock_token')]
+  )
+}
+
 beforeAll(async () => {
   const client = await createTestUser({
     email: `con-pub-client-${dateTag}@flowx-test.com`,
@@ -37,6 +49,7 @@ beforeAll(async () => {
     role: 'publisher',
   })
   publisherId = pub.id
+  await addVerifiedPage(publisherId, 'con_pub_page_1')
 
   campaignId = generateUuid()
   await campaignRepo.createCampaign(campaignId, client.id, {
@@ -50,6 +63,7 @@ beforeAll(async () => {
   await campaignRepo.createCreative(creativeId, campaignId, { caption: 'Pub accept test', mediaUrl: 'https://example.com/img.jpg' })
 
   await campaignService.submitCampaign(client.id, campaignId)
+  await campaignRepo.updateCampaign(campaignId, { status: 'awaiting_publishers' })
 })
 
 async function createRequest() {

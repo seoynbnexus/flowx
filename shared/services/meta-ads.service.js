@@ -1,13 +1,47 @@
 import { META_CONFIG } from './meta-oauth.config.js'
 import { apiFetch } from '../utils/api-logger.js'
 import { recordUsage } from './meta-rate-limiter.js'
+import { fetchBoundedBytes } from './media-url.js'
 
 const RATE_LIMIT_CODES = new Set([80004, 613, 4, 17])
 const RATE_LIMIT_SUBCODE = 2446079
+const HOSTED_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
 
 function accountKeyFromPath(path) {
   const match = String(path).match(/^act_[A-Za-z0-9]+/)
   return match ? match[0] : undefined
+}
+
+export function isRateLimitError(error) {
+  const meta = extractMetaError(error)
+  if (meta?.code != null && RATE_LIMIT_CODES.has(Number(meta.code))) return true
+  if (meta?.subcode != null && Number(meta.subcode) === RATE_LIMIT_SUBCODE) return true
+  return false
+}
+
+export function retryAfterSecondsFromError(error) {
+  const retryAfter = error?.response?.headers?.get?.('retry-after')
+  if (retryAfter) {
+    const seconds = Number(retryAfter)
+    if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds, 3600)
+  }
+  const meta = extractMetaError(error)
+  if (meta?.code != null && RATE_LIMIT_CODES.has(Number(meta.code))) return 120
+  return null
+}
+
+function tagGraphError(error, { path, method }) {
+  const meta = extractMetaError(error)
+  if (meta) {
+    error.metaHttpStatus = error?.statusCode ?? 400
+    error.metaErrorCode = meta.code
+    error.metaErrorSubcode = meta.subcode
+    error.metaAmbiguous = false
+    return error
+  }
+  error.metaHttpStatus = error?.statusCode ?? null
+  error.metaAmbiguous = true
+  return error
 }
 
 async function maybeEnterCooldown(res, errorText, accountId) {
@@ -46,7 +80,9 @@ async function graphPost(path, params = {}) {
   if (!res.ok) {
     const error = await res.text()
     await maybeEnterCooldown(res, error, accountId)
-    throw new Error(`Graph API POST ${path} failed: ${error}`)
+    const err = new Error(`Graph API POST ${path} failed: ${error}`)
+    err.statusCode = res.status
+    return tagGraphError(err, { path, method: 'POST' })
   }
   return res.json()
 }
@@ -59,7 +95,9 @@ async function graphDelete(path, accessToken) {
   if (!res.ok) {
     const error = await res.text()
     await maybeEnterCooldown(res, error, accountId)
-    throw new Error(`Graph API DELETE ${path} failed: ${error}`)
+    const err = new Error(`Graph API DELETE ${path} failed: ${error}`)
+    err.statusCode = res.status
+    return tagGraphError(err, { path, method: 'DELETE' })
   }
   return res.json()
 }
@@ -79,7 +117,9 @@ async function graphGet(path, params = {}) {
   if (!res.ok) {
     const error = await res.text()
     await maybeEnterCooldown(res, error, accountId)
-    throw new Error(`Graph API GET ${path} failed: ${error}`)
+    const err = new Error(`Graph API GET ${path} failed: ${error}`)
+    err.statusCode = res.status
+    return tagGraphError(err, { path, method: 'GET' })
   }
   return res.json()
 }
@@ -236,14 +276,283 @@ export async function createAd(adAccountId, adSetId, creativeId, name, accessTok
   return data
 }
 
-export async function createFeedPost(pageId, message, mediaUrl, scheduledPublishTime, accessToken) {
+export async function createPagePhotoPost(pageId, accessToken, { url, message, scheduledAt, published } = {}) {
+  const params = {
+    access_token: accessToken,
+    url,
+  }
+
+  if (message) params.caption = message
+
+  if (scheduledAt) {
+    params.published = false
+    params.scheduled_publish_time = Math.floor(new Date(scheduledAt).getTime() / 1000)
+  }
+
+  if (published !== undefined) params.published = published
+
+  const data = await graphPost(`${pageId}/photos`, params)
+  return data
+}
+
+export async function createPageVideoPost(pageId, accessToken, { url, message } = {}) {
+  const params = {
+    access_token: accessToken,
+    file_url: url,
+  }
+
+  if (message) params.description = message
+
+  const data = await graphPost(`${pageId}/videos`, params)
+  return data
+}
+
+async function uploadHostedVideo(uploadUrl, fileUrl, accessToken) {
+  const hosted = await apiFetch(uploadUrl, {
+    method: 'POST',
+    headers: { Authorization: `OAuth ${accessToken}`, 'file_url': fileUrl },
+  }, { service: 'meta_ads', operation: 'POST rupload (hosted)' })
+  if (hosted.ok) return hosted.json()
+  const hostedBody = await hosted.text().catch(() => '(empty)')
+  let fallbackBody = null
+  try {
+    const { bytes, truncated } = await fetchBoundedBytes(fileUrl, { maxBytes: HOSTED_UPLOAD_MAX_BYTES })
+    if (truncated || !bytes || !bytes.length) throw new Error('could not download full media (truncated or empty)')
+    const res = await apiFetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `OAuth ${accessToken}`,
+        'Content-Type': 'application/octet-stream',
+        offset: '0',
+        file_size: String(bytes.length),
+      },
+      body: bytes,
+    }, { service: 'meta_ads', operation: 'POST rupload (binary)' })
+    if (res.ok) return res.json()
+    fallbackBody = await res.text().catch(() => '(empty)')
+  } catch (downloadErr) {
+    fallbackBody = downloadErr?.message || 'download failed'
+  }
+  const fallbackDetail = fallbackBody && !/[\{\}]/.test(fallbackBody) ? ` (fallback: ${fallbackBody})` : ''
+  const err = new Error(`Graph API hosted video upload failed: ${hostedBody}${fallbackDetail}`)
+  err.statusCode = hosted.status
+  throw tagGraphError(err, { path: 'rupload', method: 'POST' })
+}
+
+async function createPageVideoContainer(pageId, accessToken, endpoint, uploadPhase, params) {
+  const body = {
+    access_token: accessToken,
+    upload_phase: uploadPhase,
+    ...params,
+  }
+  const data = await graphPost(`${pageId}/${endpoint}`, body)
+  return data
+}
+
+export const fbVideoPoll = { intervalMs: 5000, timeoutMs: 180000, publishTimeoutMs: 600000 }
+
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function waitForVideoReady(videoId, accessToken) {
+  const deadline = Date.now() + fbVideoPoll.timeoutMs
+  while (Date.now() < deadline) {
+    const data = await getVideoUploadStatus(videoId, accessToken)
+    const status = data?.status
+    if (!status) return
+    if (status.video_status === 'error') {
+      const detail = Array.isArray(status.status_errors)
+        ? status.status_errors.map(e => e?.message || e).join('; ')
+        : status.status_errors?.message || status.status_errors || 'video processing failed'
+      const err = new Error(`Facebook video processing failed: ${detail}`)
+      err.metaAmbiguous = false
+      throw err
+    }
+    if (status.video_status === 'ready') return
+    await sleep(fbVideoPoll.intervalMs)
+  }
+  const err = new Error('Timed out waiting for Facebook video to finish processing')
+  err.metaAmbiguous = false
+  throw err
+}
+
+async function listPageReels(pageId, accessToken) {
+  const data = await graphGet(`${pageId}/video_reels`, {
+    access_token: accessToken,
+    fields: 'id,description,updated_time',
+    limit: 10,
+  })
+  return Array.isArray(data?.data) ? data.data : []
+}
+
+export async function resolvePageReelPostId(pageId, accessToken, { message, since } = {}) {
+  const reels = await listPageReels(pageId, accessToken)
+  const matches = reels.filter(reel => {
+    if (!reel?.id) return false
+    if (since) {
+      const updated = reel.updated_time ? Date.parse(reel.updated_time) : NaN
+      if (!Number.isNaN(updated) && updated < since) return false
+    }
+    if (message && typeof reel.description === 'string') {
+      return reel.description === message
+    }
+    return true
+  })
+  if (matches.length === 1) return { postId: matches[0].id, ambiguous: false }
+  if (matches.length > 1) return { postId: null, ambiguous: true }
+  return { postId: null, ambiguous: false }
+}
+
+async function listPageStories(pageId, accessToken) {
+  const data = await graphGet(`${pageId}/stories`, {
+    access_token: accessToken,
+    fields: 'post_id,status,creation_time,media_type',
+    limit: 10,
+  })
+  return Array.isArray(data?.data) ? data.data : []
+}
+
+async function resolveStoryPostId(pageId, accessToken, since) {
+  const stories = await listPageStories(pageId, accessToken)
+  const matches = stories.filter(story => {
+    if (!story?.post_id || story?.status !== 'PUBLISHED') return false
+    if (since) {
+      const created = story.creation_time ? story.creation_time * 1000 : NaN
+      if (!Number.isNaN(created) && created < since) return false
+    }
+    return true
+  })
+  if (matches.length === 1) return matches[0].post_id
+  if (matches.length > 1) {
+    const sorted = [...matches].sort((a, b) => (b.creation_time || 0) - (a.creation_time || 0))
+    if (sorted[0].creation_time !== sorted[1].creation_time) return sorted[0].post_id
+  }
+  if (matches.length > 0) return matches[0].post_id
+  return null
+}
+
+async function waitForStoryPublished(pageId, videoId, accessToken) {
+  const startedAt = Date.now()
+  const deadline = startedAt + fbVideoPoll.publishTimeoutMs
+  while (Date.now() < deadline) {
+    const data = await getVideoUploadStatus(videoId, accessToken)
+    const status = data?.status
+    if (status?.video_status === 'error') {
+      const detail = Array.isArray(status.status_errors)
+        ? status.status_errors.map(e => e?.message || e).join('; ')
+        : status.status_errors?.message || status.status_errors || 'video publishing failed'
+      const err = new Error(`Facebook video story publishing failed: ${detail}`)
+      err.metaAmbiguous = false
+      throw err
+    }
+    if (status?.publishing_phase?.publish_status === 'published') {
+      const postId = await resolveStoryPostId(pageId, accessToken, startedAt)
+      if (postId) return { id: postId, videoId }
+    }
+    await sleep(fbVideoPoll.intervalMs)
+  }
+  const err = new Error('Timed out waiting for Facebook video story to finish publishing')
+  err.metaAmbiguous = false
+  throw err
+}
+
+export async function startPageReel(pageId, accessToken) {
+  const started = await createPageVideoContainer(pageId, accessToken, 'video_reels', 'start', {})
+  if (started instanceof Error) throw started
+  if (!started?.upload_url || !started?.video_id) {
+    const err = new Error('Graph API failed to allocate a Reels upload session (missing upload_url)')
+    err.metaAmbiguous = false
+    err.metaHttpStatus = 500
+    throw err
+  }
+  return started
+}
+
+export async function uploadPageReelMedia(uploadUrl, fileUrl, accessToken) {
+  return uploadHostedVideo(uploadUrl, fileUrl, accessToken)
+}
+
+export async function getPageReelStatus(videoId, accessToken) {
+  const data = await graphGet(videoId, {
+    access_token: accessToken,
+    fields: 'status',
+  })
+  if (data instanceof Error) throw data
+  return data?.status ?? data
+}
+
+export async function finishPageReel(pageId, accessToken, { videoId, description } = {}) {
+  const finished = await createPageVideoContainer(pageId, accessToken, 'video_reels', 'finish', {
+    video_id: videoId,
+    video_state: 'PUBLISHED',
+    description: description || '',
+  })
+  if (finished instanceof Error) throw finished
+  if (finished?.error) {
+    const detail = finished.error?.message || finished.error?.error_user_msg || JSON.stringify(finished.error)
+    const err = new Error(`Graph API failed to finish the Reels upload: ${detail}`)
+    err.metaAmbiguous = false
+    err.metaHttpStatus = 400
+    throw err
+  }
+  return finished
+}
+
+export async function createPageVideoStory(pageId, accessToken, { url }) {
+  const started = await createPageVideoContainer(pageId, accessToken, 'video_stories', 'start', { file_url: url })
+  if (!started?.upload_url || !started?.video_id) {
+    const err = new Error('Graph API failed to allocate a video story upload session (missing upload_url)')
+    err.metaAmbiguous = false
+    throw err
+  }
+  await uploadHostedVideo(started.upload_url, url, accessToken)
+  await waitForVideoReady(started.video_id, accessToken)
+  const finished = await createPageVideoContainer(pageId, accessToken, 'video_stories', 'finish', {
+    video_id: started.video_id,
+    video_state: 'PUBLISHED',
+  })
+  if (finished instanceof Error) throw finished
+  if (finished?.post_id) return { id: finished.post_id, videoId: started.video_id }
+  if (finished?.error) {
+    const detail = finished.error?.message || finished.error?.error_user_msg || JSON.stringify(finished.error)
+    const err = new Error(`Graph API failed to finish the video story upload: ${detail}`)
+    err.metaAmbiguous = false
+    throw err
+  }
+  return waitForStoryPublished(pageId, started.video_id, accessToken)
+}
+
+export async function createPagePhotoStory(pageId, accessToken, { url }) {
+  const photo = await createPagePhotoPost(pageId, accessToken, { url, published: false })
+  if (!photo?.id) {
+    const err = new Error('Graph API failed to stage story photo (missing photo id)')
+    err.metaAmbiguous = false
+    throw err
+  }
+  const story = await graphPost(`${pageId}/photo_stories`, {
+    access_token: accessToken,
+    photo_id: photo.id,
+  })
+  return { id: story?.id || photo.id, photoId: photo.id }
+}
+
+export async function getVideoUploadStatus(videoId, accessToken) {
+  const data = await graphGet(videoId, {
+    access_token: accessToken,
+    fields: 'status',
+  })
+  return data
+}
+
+export async function createFeedPost(pageId, message, link, scheduledPublishTime, accessToken) {
   const params = {
     access_token: accessToken,
     message: message || '',
   }
 
-  if (mediaUrl) {
-    params.attached_media = JSON.stringify([{ media_fbid: mediaUrl }])
+  if (link) {
+    params.link = link
   }
 
   if (scheduledPublishTime) {
@@ -255,11 +564,19 @@ export async function createFeedPost(pageId, message, mediaUrl, scheduledPublish
   return data
 }
 
-export async function createInstagramMedia(igBusinessAccountId, mediaUrl, caption, accessToken) {
+export async function createInstagramMedia(igBusinessAccountId, mediaUrl, caption, accessToken, options = {}) {
   const params = {
     access_token: accessToken,
-    image_url: mediaUrl,
     caption: caption || '',
+  }
+
+  const mediaType = options.mediaType || 'IMAGE'
+  if (mediaType !== 'IMAGE') params.media_type = mediaType
+
+  if (options.videoUrl || (mediaType !== 'IMAGE' && /\.(mp4|mov)$/i.test(mediaUrl || ''))) {
+    params.video_url = options.videoUrl || mediaUrl
+  } else {
+    params.image_url = mediaUrl
   }
 
   const data = await graphPost(`${igBusinessAccountId}/media`, params)
@@ -274,14 +591,182 @@ export async function publishInstagramMedia(igBusinessAccountId, mediaContainerI
   return data
 }
 
-export async function createInstagramStory(igBusinessAccountId, mediaUrl, accessToken) {
+export async function getContainerStatus(mediaContainerId, accessToken) {
+  const data = await graphGet(`${mediaContainerId}`, {
+    access_token: accessToken,
+    fields: 'status_code,status',
+  })
+  return data
+}
+
+const ENGAGEMENT_INSIGHT_METRICS = 'reach,likes,comments,saved,shares,views,total_interactions'
+
+const FB_VIDEO_FIELDS = 'id,permalink_url,length,created_time,likes.summary(true).limit(0),comments.summary(true).limit(0)'
+const FB_PHOTO_FIELDS = 'id,link,created_time,likes.summary(true).limit(0),comments.summary(true).limit(0)'
+const FB_POST_FIELDS = 'id,permalink_url,message,created_time,likes.summary(true).limit(0),comments.summary(true).limit(0),shares{count}'
+
+function isPermissionError(error) {
+  return /"code"\s*:\s*(10|200|210|282)/.test(String(error?.message || error))
+}
+
+function systemToken() {
+  return process.env.META_SYSTEM_USER_TOKEN || null
+}
+
+export async function getMediaEngagement(mediaId, accessToken, { mediaKind = 'post', platform = 'instagram' } = {}) {
+  if (platform === 'facebook') return getFacebookMediaEngagement(mediaId, accessToken)
+
+  const basic = await graphGet(`${mediaId}`, {
+    access_token: accessToken,
+    fields: mediaKind === 'story' ? 'media_type,timestamp,permalink' : 'media_type,media_product_type,permalink,timestamp,like_count,comments_count',
+  })
+
+  const result = {
+    mediaId,
+    mediaType: basic.media_type || null,
+    mediaProductType: basic.media_product_type || null,
+    permalink: basic.permalink || null,
+    timestamp: basic.timestamp || null,
+    likeCount: basic.like_count != null ? Number(basic.like_count) : null,
+    commentsCount: basic.comments_count != null ? Number(basic.comments_count) : null,
+    insights: {},
+    comments: [],
+  }
+
+  if (mediaKind === 'story') return result
+
+  const insights = await graphGet(`${mediaId}/insights`, {
+    access_token: accessToken,
+    metric: ENGAGEMENT_INSIGHT_METRICS,
+  })
+  for (const entry of insights.data || []) {
+    result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
+  }
+
+  const comments = await graphGet(`${mediaId}/comments`, {
+    access_token: accessToken,
+    fields: 'text,username,timestamp',
+  })
+  result.comments = (comments.data || []).map(c => ({
+    id: c.id,
+    text: c.text,
+    username: c.username,
+    timestamp: c.timestamp,
+  }))
+
+  return result
+}
+
+async function getFacebookMediaEngagement(mediaId, accessToken) {
+  const result = {
+    mediaId,
+    mediaType: null,
+    mediaProductType: null,
+    permalink: null,
+    timestamp: null,
+    likeCount: null,
+    commentsCount: null,
+    insights: {},
+    comments: [],
+  }
+
+  let kind = null
+  let basic = null
+  for (const [candidateKind, fields] of [
+    ['video', FB_VIDEO_FIELDS],
+    ['photo', FB_PHOTO_FIELDS],
+    ['post', FB_POST_FIELDS],
+  ]) {
+    try {
+      basic = await graphGet(`${mediaId}`, { access_token: accessToken, fields })
+      kind = candidateKind
+      break
+    } catch {
+      // try next field set — Meta rejects inapplicable fields
+    }
+  }
+  if (!kind) throw new Error(`Graph API GET ${mediaId} failed: unsupported Facebook object`)
+
+  result.mediaType = kind === 'post' ? (basic.link ? 'link' : 'post') : kind
+  result.permalink = basic.permalink_url || basic.link || null
+  result.timestamp = basic.created_time || null
+  result.likeCount = basic.likes?.summary?.total_count != null ? Number(basic.likes.summary.total_count) : null
+  result.commentsCount = basic.comments?.summary?.total_count != null ? Number(basic.comments.summary.total_count) : null
+
+  let insights
+  try {
+    if (kind === 'video') {
+      insights = await graphGet(`${mediaId}/video_insights`, {
+        access_token: accessToken,
+        metric: 'total_video_views',
+      })
+      for (const entry of insights.data || []) {
+        result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
+      }
+      result.insights.views = result.insights.total_video_views || 0
+    } else if (kind === 'post') {
+      insights = await graphGet(`${mediaId}/insights`, {
+        access_token: accessToken,
+        metric: 'post_impressions,post_engaged_users',
+      })
+      for (const entry of insights.data || []) {
+        result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
+      }
+      result.insights.reach = result.insights.post_impressions || 0
+      result.insights.interactions = result.insights.post_engaged_users || 0
+      result.insights.shares = basic.shares?.count != null ? Number(basic.shares.count) : 0
+    }
+  } catch (err) {
+    const sys = systemToken()
+    if (sys && isPermissionError(err)) {
+      const fallback = await graphGet(`${mediaId}${kind === 'video' ? '/video_insights' : '/insights'}`, {
+        access_token: sys,
+        metric: kind === 'video' ? 'total_video_views' : 'post_impressions,post_engaged_users',
+      })
+      for (const entry of fallback.data || []) {
+        result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
+      }
+      if (kind === 'video') {
+        result.insights.views = result.insights.total_video_views || 0
+      } else {
+        result.insights.reach = result.insights.post_impressions || 0
+        result.insights.interactions = result.insights.post_engaged_users || 0
+        result.insights.shares = basic.shares?.count != null ? Number(basic.shares.count) : 0
+      }
+    }
+  }
+
+  try {
+    const comments = await graphGet(`${mediaId}/comments`, {
+      access_token: accessToken,
+      fields: 'message,from{name},created_time',
+    })
+    result.comments = (comments.data || []).map(c => ({
+      id: c.id,
+      text: c.message,
+      username: c.from?.name || null,
+      timestamp: c.created_time,
+    }))
+  } catch {
+    // comments are best-effort
+  }
+
+  return result
+}
+
+export async function deleteInstagramContainer(mediaContainerId, accessToken) {
+  const data = await graphDelete(`${mediaContainerId}`, accessToken)
+  return data
+}
+
+export async function createInstagramStory(igBusinessAccountId, mediaUrl, accessToken, options = {}) {
   const params = {
     access_token: accessToken,
     media_type: 'STORIES',
   }
 
-  if (mediaUrl.match(/\.(mp4|mov)$/i)) {
-    params.video_url = mediaUrl
+  if (options.videoUrl || mediaUrl.match(/\.(mp4|mov)$/i)) {
+    params.video_url = options.videoUrl || mediaUrl
   } else {
     params.image_url = mediaUrl
   }

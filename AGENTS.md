@@ -58,6 +58,8 @@ flowx-backend/
 │       ├── config/                 # Public/full app config endpoint
 │       ├── identity-document-types/     # Document type CRUD
 │       ├── identity-documents/          # Document upload, user listing, admin verification
+│       ├── campaigns/                   # Campaign lifecycle, Meta objects, jobs queue, sync scheduler, webhooks, ad accounts, budget governor, scheduler leases
+│       ├── posts/                       # Organic posts (Phase 1): review gate, FB/IG targets, async publish via campaign_jobs with entity_type='post', engagement sync (post_sync_engagement jobs)
 │       └── publisher-platforms/         # Platform account submission, OAuth (Meta), admin verification
 └── shared/
     ├── database/

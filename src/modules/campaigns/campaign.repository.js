@@ -464,7 +464,7 @@ export async function findReviewLogsByCampaignId(campaignId) {
   const rows = await query(
     `SELECT l.*, u.email as reviewer_email, up.first_name as reviewer_first_name, up.last_name as reviewer_last_name
      FROM campaign_review_log l
-     JOIN users u ON u.id = l.reviewer_id
+     LEFT JOIN users u ON u.id = l.reviewer_id
      LEFT JOIN user_profiles up ON up.user_id = u.id
      WHERE l.campaign_id = ?
      ORDER BY l.created_at ASC`,
@@ -821,6 +821,7 @@ function mapCampaignJobRow(row) {
     id: bufferToUuid(row.id),
     campaignId: row.campaign_id ? bufferToUuid(row.campaign_id) : null,
     jobType: row.job_type,
+    entityType: row.entity_type || 'campaign',
     runKey: row.run_key || null,
     status: row.status,
     attempts: row.attempts,
@@ -836,10 +837,10 @@ function mapCampaignJobRow(row) {
   }
 }
 
-export async function enqueueCampaignJob(id, campaignId, jobType, actorId = null, payload = {}, { runKey = null } = {}) {
+export async function enqueueCampaignJob(id, campaignId, jobType, actorId = null, payload = {}, { runKey = null, runAfter = null, entityType = 'campaign' } = {}) {
   const result = await query(
-    `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, status, run_after, actor_id, payload)
-     SELECT ?, ?, ?, ?, 'queued', NOW(), ?, ?
+    `INSERT INTO campaign_jobs (id, campaign_id, job_type, entity_type, run_key, status, run_after, actor_id, payload)
+     SELECT ?, ?, ?, ?, ?, 'queued', COALESCE(?, NOW()), ?, ?
      FROM DUAL
      WHERE NOT EXISTS (
        SELECT 1 FROM campaign_jobs
@@ -849,7 +850,7 @@ export async function enqueueCampaignJob(id, campaignId, jobType, actorId = null
        status = 'queued',
        attempts = 0,
        error = NULL,
-       run_after = NOW(),
+       run_after = COALESCE(?, NOW()),
        actor_id = ?,
        payload = ?,
        started_at = NULL,
@@ -858,11 +859,14 @@ export async function enqueueCampaignJob(id, campaignId, jobType, actorId = null
       uuidToBuffer(id),
       campaignId ? uuidToBuffer(campaignId) : null,
       jobType,
+      entityType,
       runKey,
+      runAfter ? new Date(runAfter) : null,
       actorId ? uuidToBuffer(actorId) : null,
       JSON.stringify(payload),
       campaignId ? uuidToBuffer(campaignId) : null,
       jobType,
+      runAfter ? new Date(runAfter) : null,
       actorId ? uuidToBuffer(actorId) : null,
       JSON.stringify(payload),
     ]
@@ -1010,10 +1014,50 @@ export async function findAutoJobByRunKey(runKey) {
   return Boolean(row)
 }
 
-export async function requeueAutoJob(campaignId, jobType, payload = {}, { runAfterSeconds = 0, runKey = null } = {}) {
+export async function enqueueTargetJob(jobType, runKey, payload = {}, { runAfterSeconds = 0, entityType = 'post' } = {}) {
   const result = await query(
-    `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, status, run_after, payload)
-     VALUES (?, ?, ?, ?, 'queued', DATE_ADD(NOW(), INTERVAL ? SECOND), ?)
+    `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, entity_type, status, run_after, payload)
+     SELECT ?, NULL, ?, ?, ?, 'queued', DATE_ADD(NOW(), INTERVAL ? SECOND), ?
+     FROM DUAL
+     WHERE NOT EXISTS (
+       SELECT 1 FROM campaign_jobs WHERE run_key = ? AND status IN ('queued', 'running')
+     )`,
+    [
+      uuidToBuffer(generateUuid()),
+      jobType,
+      runKey,
+      entityType,
+      runAfterSeconds,
+      JSON.stringify(payload),
+      runKey,
+    ]
+  )
+  return result.affectedRows > 0
+}
+
+export async function requeueReelJob(id, backoffSeconds, attempts) {
+  if (attempts == null) {
+    await query(
+      `UPDATE campaign_jobs SET status = 'queued', attempts = 0, error = NULL,
+         run_after = DATE_ADD(NOW(), INTERVAL ? SECOND), started_at = NULL, finished_at = NULL
+       WHERE id = ? AND status = 'running'`,
+      [backoffSeconds, uuidToBuffer(id)]
+    )
+    return
+  }
+  await query(
+    `UPDATE campaign_jobs SET status = 'queued', attempts = 0, error = NULL,
+       run_after = DATE_ADD(NOW(), INTERVAL ? SECOND),
+       payload = JSON_SET(payload, '$.attempts', ?), started_at = NULL, finished_at = NULL
+     WHERE id = ? AND status = 'running'`,
+    [backoffSeconds, attempts, uuidToBuffer(id)]
+  )
+}
+
+export async function requeueAutoJob(campaignId, jobType, payload = {}, { runAfterSeconds = 0, runKey = null, entityType = 'campaign' } = {}) {
+  const result = await query(
+    `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, entity_type, status, run_after, payload)
+     VALUES (?, ?, ?, ?, ?, 'queued', DATE_ADD(NOW(), INTERVAL ? SECOND), ?)
      ON DUPLICATE KEY UPDATE
        status = 'queued',
        attempts = 0,
@@ -1027,6 +1071,7 @@ export async function requeueAutoJob(campaignId, jobType, payload = {}, { runAft
       campaignId ? uuidToBuffer(campaignId) : null,
       jobType,
       runKey,
+      entityType,
       runAfterSeconds,
       JSON.stringify(payload),
       runAfterSeconds,

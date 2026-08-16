@@ -28,7 +28,7 @@ export async function createTestUser({
     [profileIdBuf, userIdBuf, 'Test', 'User']
   )
 
-  const [roleRows] = await query('SELECT id FROM roles WHERE code = ?', [role])
+  const roleRows = await query('SELECT id FROM roles WHERE code = ?', [role])
   if (roleRows && roleRows.length > 0) {
     await query(
       'INSERT INTO user_roles (id, user_id, role_id) VALUES (?, ?, ?)',

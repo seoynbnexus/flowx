@@ -1,0 +1,897 @@
+import { query, queryOne, transaction } from '../../../shared/database/connection.js'
+import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js'
+import { decrypt } from '../../../shared/utils/crypto.utils.js'
+import { ValidationError } from '../../../shared/errors/AppError.js'
+import { requeueAutoJob } from '../campaigns/campaign.repository.js'
+import { POST_JOB_TYPES } from './post.model.js'
+
+function mapPostRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    clientId: bufferToUuid(row.client_id),
+    clientEmail: row.client_email || null,
+    clientFirstName: row.client_first_name || null,
+    clientLastName: row.client_last_name || null,
+    name: row.name,
+    type: row.type,
+    status: row.status,
+    scheduledAt: row.scheduled_at,
+    caption: row.caption,
+    mediaUrl: row.media_url,
+    hashtags: row.hashtags,
+    textBody: row.text_body,
+    categoryId: row.category_id ? bufferToUuid(row.category_id) : null,
+    runOnPublishers: !!row.run_on_publishers,
+    publisherCount: row.publisher_count,
+    coinsPerPublisher: row.coins_per_publisher ? Number(row.coins_per_publisher) : null,
+    escrowAmount: Number(row.escrow_amount),
+    escrowFromMonthly: Number(row.escrow_from_monthly) || 0,
+    escrowFromWallet: Number(row.escrow_from_wallet) || 0,
+    coinsEscrowedAt: row.coins_escrowed_at,
+    publisherResponseDeadlineAt: row.publisher_response_deadline_at || null,
+    clientConfirmed: !!row.client_confirmed,
+    clientConfirmedAt: row.client_confirmed_at,
+    adminNotes: row.admin_notes,
+    reviewedBy: row.reviewed_by ? bufferToUuid(row.reviewed_by) : null,
+    reviewedAt: row.reviewed_at,
+    reviewNotes: row.review_notes,
+    publishedAt: row.published_at,
+    error: row.error || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function mapPostTargetRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    postId: bufferToUuid(row.post_id),
+    platformAccountId: bufferToUuid(row.platform_account_id),
+    targetType: row.target_type,
+    publisherRequestId: row.publisher_request_id ? bufferToUuid(row.publisher_request_id) : null,
+    status: row.status,
+    error: row.error || null,
+    metaObjectId: row.meta_object_id || null,
+    postedAt: row.posted_at,
+    publishState: row.publish_state || 'none',
+    remoteVideoId: row.remote_video_id || null,
+    remoteUploadUrl: row.remote_upload_url || null,
+    publishStateChangedAt: row.publish_state_changed_at || null,
+    verificationAttempts: Number(row.verification_attempts) || 0,
+    lastVerifyAt: row.last_verify_at || null,
+    lastMetaStatus: row.last_meta_status || null,
+    lastOperation: row.last_operation || null,
+    lastOperationAt: row.last_operation_at || null,
+    processingStartedAt: row.processing_started_at || null,
+    unknownSince: row.unknown_since || null,
+    createdAt: row.created_at,
+    lastEngagementSyncAt: row.last_engagement_sync_at || null,
+    platformCode: row.platform_code || null,
+    platformUserId: row.platform_user_id || null,
+    platformDisplayName: row.platform_display_name || null,
+    platformUsername: row.platform_username || null,
+    avatarUrl: row.avatar_url || null,
+    igBusinessAccountId: row.instagram_business_account_id || null,
+    accessToken: row.access_token ? decrypt(row.access_token) : null,
+  }
+}
+
+function mapReviewLogRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    postId: bufferToUuid(row.post_id),
+    reviewerId: row.reviewer_id ? bufferToUuid(row.reviewer_id) : null,
+    action: row.action,
+    previousStatus: row.previous_status,
+    notes: row.notes,
+    createdAt: row.created_at,
+  }
+}
+
+export async function createPost(id, clientId, data) {
+  await query(
+    `INSERT INTO posts (id, client_id, category_id, name, type, scheduled_at, run_on_publishers,
+       publisher_count, coins_per_publisher, caption, media_url, hashtags, text_body)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(clientId),
+      data.categoryId ? uuidToBuffer(data.categoryId) : null,
+      data.name,
+      data.type || 'post',
+      data.scheduledAt || null,
+      data.runOnPublishers ? 1 : 0,
+      data.publisherCount || null,
+      data.coinsPerPublisher || null,
+      data.caption || null,
+      data.mediaUrl || null,
+      data.hashtags || null,
+      data.textBody || null,
+    ]
+  )
+  return findPostById(id)
+}
+
+export async function findPostById(id) {
+  const row = await queryOne('SELECT * FROM posts WHERE id = ?', [uuidToBuffer(id)])
+  return mapPostRow(row)
+}
+
+export async function findPostsByClientId(clientId, { page = 1, limit = 20, status }) {
+  const offset = (page - 1) * limit
+  const where = ['client_id = ?', 'deleted_at IS NULL']
+  const params = [uuidToBuffer(clientId)]
+
+  if (status) {
+    where.push('status = ?')
+    params.push(status)
+  }
+
+  const whereClause = `WHERE ${where.join(' AND ')}`
+
+  const countRow = await queryOne(
+    `SELECT COUNT(*) as total FROM posts ${whereClause}`,
+    params
+  )
+
+  const rows = await query(
+    `SELECT * FROM posts ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+    [...params, String(limit), String(offset)]
+  )
+
+  return {
+    items: rows.map(mapPostRow),
+    total: countRow.total,
+    page,
+    limit,
+  }
+}
+
+export async function findAllPosts({ page = 1, limit = 20, status, clientId }) {
+  const offset = (page - 1) * limit
+  const where = ['p.deleted_at IS NULL']
+  const params = []
+
+  if (status) {
+    where.push('p.status = ?')
+    params.push(status)
+  }
+
+  if (clientId) {
+    where.push('p.client_id = ?')
+    params.push(uuidToBuffer(clientId))
+  }
+
+  const whereClause = `WHERE ${where.join(' AND ')}`
+
+  const countRow = await queryOne(
+    `SELECT COUNT(*) as total FROM posts p ${whereClause}`,
+    params
+  )
+
+  const rows = await query(
+    `SELECT p.*, u.email as client_email, up.first_name as client_first_name, up.last_name as client_last_name
+     FROM posts p
+     JOIN users u ON u.id = p.client_id
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     ${whereClause}
+     ORDER BY p.created_at DESC LIMIT ? OFFSET ?`,
+    [...params, String(limit), String(offset)]
+  )
+
+  return {
+    items: rows.map(mapPostRow),
+    total: countRow.total,
+    page,
+    limit,
+  }
+}
+
+export async function updatePost(id, data) {
+  const fields = []
+  const params = []
+
+  if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name) }
+  if (data.type !== undefined) { fields.push('type = ?'); params.push(data.type) }
+  if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(data.categoryId ? uuidToBuffer(data.categoryId) : null) }
+  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(data.scheduledAt) }
+  if (data.runOnPublishers !== undefined) { fields.push('run_on_publishers = ?'); params.push(data.runOnPublishers ? 1 : 0) }
+  if (data.publisherCount !== undefined) { fields.push('publisher_count = ?'); params.push(data.publisherCount) }
+  if (data.coinsPerPublisher !== undefined) { fields.push('coins_per_publisher = ?'); params.push(data.coinsPerPublisher) }
+  if (data.caption !== undefined) { fields.push('caption = ?'); params.push(data.caption) }
+  if (data.mediaUrl !== undefined) { fields.push('media_url = ?'); params.push(data.mediaUrl) }
+  if (data.hashtags !== undefined) { fields.push('hashtags = ?'); params.push(data.hashtags) }
+  if (data.textBody !== undefined) { fields.push('text_body = ?'); params.push(data.textBody) }
+  if (data.status !== undefined) { fields.push('status = ?'); params.push(data.status) }
+  if (data.publishedAt !== undefined) { fields.push('published_at = ?'); params.push(data.publishedAt) }
+  if (data.error !== undefined) { fields.push('error = ?'); params.push(data.error) }
+  if (data.adminNotes !== undefined) { fields.push('admin_notes = ?'); params.push(data.adminNotes) }
+  if (data.reviewedBy !== undefined) { fields.push('reviewed_by = ?'); params.push(data.reviewedBy ? uuidToBuffer(data.reviewedBy) : null) }
+  if (data.reviewedAt !== undefined) { fields.push('reviewed_at = ?'); params.push(data.reviewedAt) }
+  if (data.reviewNotes !== undefined) { fields.push('review_notes = ?'); params.push(data.reviewNotes) }
+  if (data.escrowAmount !== undefined) { fields.push('escrow_amount = ?'); params.push(data.escrowAmount) }
+  if (data.coinsEscrowedAt !== undefined) { fields.push('coins_escrowed_at = ?'); params.push(data.coinsEscrowedAt) }
+  if (data.publisherResponseDeadlineAt !== undefined) { fields.push('publisher_response_deadline_at = ?'); params.push(data.publisherResponseDeadlineAt) }
+  if (data.clientConfirmed !== undefined) { fields.push('client_confirmed = ?'); params.push(data.clientConfirmed ? 1 : 0) }
+  if (data.clientConfirmedAt !== undefined) { fields.push('client_confirmed_at = ?'); params.push(data.clientConfirmedAt) }
+
+  if (fields.length === 0) return findPostById(id)
+
+  params.push(uuidToBuffer(id))
+  await query(
+    `UPDATE posts SET ${fields.join(', ')} WHERE id = ?`,
+    params
+  )
+  return findPostById(id)
+}
+
+export async function updatePostWithStatusGuard(id, data, expectedStatus) {
+  const fields = []
+  const params = []
+
+  if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name) }
+  if (data.type !== undefined) { fields.push('type = ?'); params.push(data.type) }
+  if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(data.categoryId ? uuidToBuffer(data.categoryId) : null) }
+  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(data.scheduledAt) }
+  if (data.runOnPublishers !== undefined) { fields.push('run_on_publishers = ?'); params.push(data.runOnPublishers ? 1 : 0) }
+  if (data.publisherCount !== undefined) { fields.push('publisher_count = ?'); params.push(data.publisherCount) }
+  if (data.coinsPerPublisher !== undefined) { fields.push('coins_per_publisher = ?'); params.push(data.coinsPerPublisher) }
+  if (data.caption !== undefined) { fields.push('caption = ?'); params.push(data.caption) }
+  if (data.mediaUrl !== undefined) { fields.push('media_url = ?'); params.push(data.mediaUrl) }
+  if (data.hashtags !== undefined) { fields.push('hashtags = ?'); params.push(data.hashtags) }
+  if (data.textBody !== undefined) { fields.push('text_body = ?'); params.push(data.textBody) }
+  if (data.status !== undefined) { fields.push('status = ?'); params.push(data.status) }
+  if (data.publishedAt !== undefined) { fields.push('published_at = ?'); params.push(data.publishedAt) }
+  if (data.error !== undefined) { fields.push('error = ?'); params.push(data.error) }
+  if (data.reviewedBy !== undefined) { fields.push('reviewed_by = ?'); params.push(data.reviewedBy ? uuidToBuffer(data.reviewedBy) : null) }
+  if (data.reviewedAt !== undefined) { fields.push('reviewed_at = ?'); params.push(data.reviewedAt) }
+  if (data.reviewNotes !== undefined) { fields.push('review_notes = ?'); params.push(data.reviewNotes) }
+  if (data.adminNotes !== undefined) { fields.push('admin_notes = ?'); params.push(data.adminNotes) }
+  if (data.escrowAmount !== undefined) { fields.push('escrow_amount = ?'); params.push(data.escrowAmount) }
+  if (data.coinsEscrowedAt !== undefined) { fields.push('coins_escrowed_at = ?'); params.push(data.coinsEscrowedAt) }
+  if (data.publisherResponseDeadlineAt !== undefined) { fields.push('publisher_response_deadline_at = ?'); params.push(data.publisherResponseDeadlineAt) }
+  if (data.clientConfirmed !== undefined) { fields.push('client_confirmed = ?'); params.push(data.clientConfirmed ? 1 : 0) }
+  if (data.clientConfirmedAt !== undefined) { fields.push('client_confirmed_at = ?'); params.push(data.clientConfirmedAt) }
+
+  if (fields.length === 0) return findPostById(id)
+
+  params.push(expectedStatus, uuidToBuffer(id))
+  const result = await query(
+    `UPDATE posts SET ${fields.join(', ')} WHERE status = ? AND id = ?`,
+    params
+  )
+  if (result.affectedRows === 0) return null
+  return findPostById(id)
+}
+
+export async function createReviewLog(postId, reviewerId, action, previousStatus, notes) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO post_review_log (id, post_id, reviewer_id, action, previous_status, notes)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(postId),
+      reviewerId ? uuidToBuffer(reviewerId) : null,
+      action,
+      previousStatus,
+      notes || null,
+    ]
+  )
+}
+
+export async function findReviewLogsByPostId(postId) {
+  const rows = await query(
+    'SELECT * FROM post_review_log WHERE post_id = ? ORDER BY created_at ASC',
+    [uuidToBuffer(postId)]
+  )
+  return rows.map(mapReviewLogRow)
+}
+
+export async function findPostTargetsByPostId(postId) {
+  const rows = await query(
+    `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,
+       upa.avatar_url, upa.instagram_business_account_id, upa.access_token
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pt.post_id = ?`,
+    [uuidToBuffer(postId)]
+  )
+  return rows.map(mapPostTargetRow)
+}
+
+export async function findPostTargetById(id) {
+  const row = await queryOne(
+    `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,
+       upa.avatar_url, upa.instagram_business_account_id, upa.access_token
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pt.id = ?`,
+    [uuidToBuffer(id)]
+  )
+  return mapPostTargetRow(row)
+}
+
+export async function findInstagramTargetsWithMediaIds() {
+  const rows = await query(
+    `SELECT pt.id, pt.post_id, pt.meta_object_id, upa.access_token
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pt.meta_object_id IS NOT NULL AND p.code = 'instagram'
+     ORDER BY pt.created_at ASC`
+  )
+  return rows.map(row => ({
+    id: bufferToUuid(row.id),
+    postId: bufferToUuid(row.post_id),
+    metaObjectId: row.meta_object_id,
+    accessToken: row.access_token ? decrypt(row.access_token) : null,
+  }))
+}
+
+export async function findPostTargetsByStatus(postId, status) {
+  const rows = await query(
+    `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,
+       upa.avatar_url, upa.instagram_business_account_id, upa.access_token
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pt.post_id = ? AND pt.status = ?`,
+    [uuidToBuffer(postId), status]
+  )
+  return rows.map(mapPostTargetRow)
+}
+
+export async function findPostTargetsByPostIdAndTargetType(postId, targetType) {
+  const rows = await query(
+    `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,
+       upa.avatar_url, upa.instagram_business_account_id, upa.access_token
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pt.post_id = ? AND pt.target_type = ?`,
+    [uuidToBuffer(postId), targetType]
+  )
+  return rows.map(mapPostTargetRow)
+}
+
+export async function replacePostTargets(postId, targetType, platformAccountIds) {
+  return transaction(async (conn) => {
+    const bufPostId = uuidToBuffer(postId)
+    const existing = await conn.execute(
+      'SELECT id, platform_account_id FROM post_targets WHERE post_id = ? AND target_type = ?',
+      [bufPostId, targetType]
+    )
+    const existingIds = new Set(existing[0].map(r => r.platform_account_id.toString('hex')))
+    const keepIds = new Set(platformAccountIds.map(id => uuidToBuffer(id).toString('hex')))
+    const idsToDelete = [...existingIds].filter(id => !keepIds.has(id))
+
+    for (const id of idsToDelete) {
+      await conn.execute(
+        'DELETE FROM post_targets WHERE post_id = ? AND platform_account_id = ? AND target_type = ?',
+        [bufPostId, Buffer.from(id, 'hex'), targetType]
+      )
+    }
+
+    const created = []
+    for (const accountId of platformAccountIds) {
+      const bufAccountId = uuidToBuffer(accountId)
+      const [res] = await conn.execute(
+        `INSERT IGNORE INTO post_targets (id, post_id, platform_account_id, target_type)
+         VALUES (?, ?, ?, ?)`,
+        [uuidToBuffer(generateUuid()), bufPostId, bufAccountId, targetType]
+      )
+      if (res.affectedRows > 0) created.push(accountId)
+    }
+    return created
+  })
+}
+
+export async function updatePostTargetStatus(id, data) {
+  const fields = []
+  const params = []
+
+  if (data.status !== undefined) { fields.push('status = ?'); params.push(data.status) }
+  if (data.error !== undefined) { fields.push('error = ?'); params.push(data.error) }
+  if (data.metaObjectId !== undefined) { fields.push('meta_object_id = ?'); params.push(data.metaObjectId) }
+  if (data.postedAt !== undefined) { fields.push('posted_at = ?'); params.push(data.postedAt) }
+  if (data.publishState !== undefined) { fields.push('publish_state = ?'); params.push(data.publishState) }
+  if (data.remoteVideoId !== undefined) { fields.push('remote_video_id = ?'); params.push(data.remoteVideoId) }
+  if (data.remoteUploadUrl !== undefined) { fields.push('remote_upload_url = ?'); params.push(data.remoteUploadUrl) }
+  if (data.publishStateChangedAt !== undefined) { fields.push('publish_state_changed_at = ?'); params.push(data.publishStateChangedAt) }
+  if (data.verificationAttempts !== undefined) { fields.push('verification_attempts = ?'); params.push(data.verificationAttempts) }
+  if (data.lastVerifyAt !== undefined) { fields.push('last_verify_at = ?'); params.push(data.lastVerifyAt) }
+  if (data.lastMetaStatus !== undefined) { fields.push('last_meta_status = ?'); params.push(data.lastMetaStatus) }
+  if (data.lastOperation !== undefined) { fields.push('last_operation = ?'); params.push(data.lastOperation) }
+  if (data.lastOperationAt !== undefined) { fields.push('last_operation_at = ?'); params.push(data.lastOperationAt) }
+
+  if (fields.length === 0) return
+
+  params.push(uuidToBuffer(id))
+  await query(
+    `UPDATE post_targets SET ${fields.join(', ')} WHERE id = ?`,
+    params
+  )
+}
+
+export async function transitionPostTargetState(id, fromStates, toState, fields = {}) {
+  const sets = ['publish_state = ?', 'publish_state_changed_at = NOW()']
+  const params = [toState]
+
+  if (fields.status !== undefined) { sets.push('status = ?'); params.push(fields.status) }
+  if (fields.error !== undefined) { sets.push('error = ?'); params.push(fields.error) }
+  if (fields.metaObjectId !== undefined) { sets.push('meta_object_id = ?'); params.push(fields.metaObjectId) }
+  if (fields.postedAt !== undefined) { sets.push('posted_at = ?'); params.push(fields.postedAt) }
+  if (fields.remoteVideoId !== undefined) { sets.push('remote_video_id = ?'); params.push(fields.remoteVideoId) }
+  if (fields.remoteUploadUrl !== undefined) { sets.push('remote_upload_url = ?'); params.push(fields.remoteUploadUrl) }
+  if (fields.verificationAttempts !== undefined) { sets.push('verification_attempts = ?'); params.push(fields.verificationAttempts) }
+  if (fields.lastVerifyAt !== undefined) { sets.push('last_verify_at = ?'); params.push(fields.lastVerifyAt) }
+  if (fields.lastMetaStatus !== undefined) { sets.push('last_meta_status = ?'); params.push(fields.lastMetaStatus) }
+  if (fields.lastOperation !== undefined) { sets.push('last_operation = ?'); params.push(fields.lastOperation) }
+  if (fields.lastOperationAt !== undefined) { sets.push('last_operation_at = ?'); params.push(fields.lastOperationAt) }
+  if (fields.processingStartedAt !== undefined) { sets.push('processing_started_at = ?'); params.push(fields.processingStartedAt) }
+  if (fields.unknownSince !== undefined) { sets.push('unknown_since = ?'); params.push(fields.unknownSince) }
+
+  const placeholders = fromStates.map(() => '?').join(', ')
+  params.push(uuidToBuffer(id), ...fromStates)
+  const result = await query(
+    `UPDATE post_targets SET ${sets.join(', ')} WHERE id = ? AND publish_state IN (${placeholders})`,
+    params
+  )
+  return result.affectedRows > 0
+}
+
+export async function findPostTargetsWithPublishState(postId, publishState) {
+  const rows = await query(
+    `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,
+       upa.avatar_url, upa.instagram_business_account_id, upa.access_token
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pt.post_id = ? AND pt.publish_state = ?`,
+    [uuidToBuffer(postId), publishState]
+  )
+  return rows.map(mapPostTargetRow)
+}
+
+export async function findPostAccountsForUser(userId) {
+  const rows = await query(
+    `SELECT upa.id, upa.platform_user_id, upa.platform_username, upa.platform_display_name,
+       upa.avatar_url, upa.followers_count, upa.instagram_business_account_id,
+       upa.verification_status, upa.token_status, p.code as platform_code
+     FROM user_platform_accounts upa
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE upa.user_id = ?
+       AND upa.token_type = 'page'
+       AND upa.verification_status = 'verified'
+       AND p.code IN ('facebook', 'instagram')
+     ORDER BY p.code, upa.platform_display_name`,
+    [uuidToBuffer(userId)]
+  )
+  return rows.map(r => ({
+    id: bufferToUuid(r.id),
+    platformUserId: r.platform_user_id,
+    platformUsername: r.platform_username,
+    platformDisplayName: r.platform_display_name,
+    avatarUrl: r.avatar_url,
+    followersCount: r.followers_count,
+    igBusinessAccountId: r.instagram_business_account_id,
+    verificationStatus: r.verification_status,
+    tokenStatus: r.token_status,
+    platformCode: r.platform_code,
+  }))
+}
+
+export async function findPostsDueForEngagementSync({ stalenessSeconds = 3600, limit = 20 } = {}) {
+  const rows = await query(
+    `SELECT DISTINCT p.id FROM posts p
+     JOIN post_targets pt ON pt.post_id = p.id
+     WHERE pt.status = 'posted'
+       AND pt.meta_object_id IS NOT NULL
+       AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND)
+       AND NOT EXISTS (
+         SELECT 1 FROM campaign_jobs j
+         WHERE j.campaign_id = p.id AND j.job_type = 'post_sync_engagement' AND j.status IN ('queued', 'running')
+       )
+     ORDER BY p.updated_at ASC
+     LIMIT ?`,
+    [stalenessSeconds, String(limit)]
+  )
+  return rows.map(r => bufferToUuid(r.id))
+}
+
+export async function upsertPostEngagement(targetId, postId, snapshot) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO post_engagement_daily
+       (id, post_id, target_id, stat_date, media_type, permalink, likes, comments, saved, shares, views, reach, interactions, raw, comments_json, error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       media_type = VALUES(media_type),
+       permalink = VALUES(permalink),
+       likes = VALUES(likes),
+       comments = VALUES(comments),
+       saved = VALUES(saved),
+       shares = VALUES(shares),
+       views = VALUES(views),
+       reach = VALUES(reach),
+       interactions = VALUES(interactions),
+       raw = VALUES(raw),
+       comments_json = VALUES(comments_json),
+       error = VALUES(error)`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(postId),
+      uuidToBuffer(targetId),
+      snapshot.statDate,
+      snapshot.mediaType || null,
+      snapshot.permalink || null,
+      snapshot.likes || 0,
+      snapshot.comments || 0,
+      snapshot.saved || 0,
+      snapshot.shares || 0,
+      snapshot.views || 0,
+      snapshot.reach || 0,
+      snapshot.interactions || 0,
+      JSON.stringify(snapshot.raw || {}),
+      JSON.stringify(snapshot.commentsJson || []),
+      snapshot.error || null,
+    ]
+  )
+}
+
+export async function findPostEngagement(postId) {
+  const rows = await query(
+    `SELECT pe.*, pt.platform_account_id, pt.status as target_status, pt.meta_object_id, pt.last_engagement_sync_at,
+       p.code as platform_code, upa.platform_display_name, upa.platform_username
+     FROM post_engagement_daily pe
+     JOIN post_targets pt ON pt.id = pe.target_id
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pe.post_id = ?
+     ORDER BY pe.stat_date ASC`,
+    [uuidToBuffer(postId)]
+  )
+  return rows.map(r => ({
+    id: bufferToUuid(r.id),
+    postId: bufferToUuid(r.post_id),
+    targetId: bufferToUuid(r.target_id),
+    statDate: r.stat_date,
+    mediaType: r.media_type || null,
+    permalink: r.permalink || null,
+    likes: Number(r.likes),
+    comments: Number(r.comments),
+    saved: Number(r.saved),
+    shares: Number(r.shares),
+    views: Number(r.views),
+    reach: Number(r.reach),
+    interactions: Number(r.interactions),
+    raw: typeof r.raw === 'string' ? JSON.parse(r.raw) : r.raw,
+    commentsJson: typeof r.comments_json === 'string' ? JSON.parse(r.comments_json) : r.comments_json,
+    error: r.error || null,
+    platformAccountId: bufferToUuid(r.platform_account_id),
+    platformCode: r.platform_code,
+    platformDisplayName: r.platform_display_name,
+    platformUsername: r.platform_username,
+    metaObjectId: r.meta_object_id || null,
+    targetStatus: r.target_status,
+    lastEngagementSyncAt: r.last_engagement_sync_at || null,
+  }))
+}
+
+export async function stampPostEngagementSync(targetId) {
+  await query(
+    'UPDATE post_targets SET last_engagement_sync_at = NOW() WHERE id = ?',
+    [uuidToBuffer(targetId)]
+  )
+}
+
+export async function requeuePostEngagementJob(postId) {
+  return requeueAutoJob(postId, POST_JOB_TYPES.SYNC_ENGAGEMENT, {}, { entityType: 'post' })
+}
+
+function mapPostPublisherRequestRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    postId: bufferToUuid(row.post_id),
+    publisherId: bufferToUuid(row.publisher_id),
+    publisherEmail: row.publisher_email || null,
+    publisherFirstName: row.publisher_first_name || null,
+    publisherLastName: row.publisher_last_name || null,
+    coinsOffered: Number(row.coins_offered),
+    status: row.status,
+    platformAccountId: row.platform_account_id ? bufferToUuid(row.platform_account_id) : null,
+    platformCode: row.platform_code || null,
+    platformDisplayName: row.platform_display_name || null,
+    platformUsername: row.platform_username || null,
+    creativeSnapshot: row.creative_snapshot || null,
+    contentSnapshot: row.content_snapshot || null,
+    contentSnapshotHash: row.content_snapshot_hash || null,
+    respondedAt: row.responded_at || null,
+    acceptedAt: row.accepted_at || null,
+    rejectedAt: row.rejected_at || null,
+    completedAt: row.completed_at || null,
+    expiresAt: row.expires_at || null,
+    publishedAt: row.published_at || null,
+    failureReason: row.failure_reason || null,
+    payoutStatus: row.payout_status || 'pending',
+    payoutTransactionId: row.payout_transaction_id || null,
+    requestGeneration: Number(row.request_generation) || 1,
+    createdAt: row.created_at,
+  }
+}
+
+export async function lockPostById(postId) {
+  await query('SELECT id FROM posts WHERE id = ? FOR UPDATE', [uuidToBuffer(postId)])
+}
+
+export async function createPostPublisherRequests(postId, publisherIds, coinsOffered, { expiresAt = null, requestGeneration = 1, snapshot = null, snapshotHash = null } = {}) {
+  const ids = publisherIds.map(() => generateUuid())
+  const values = publisherIds.map((pubId, i) => [
+    uuidToBuffer(ids[i]),
+    uuidToBuffer(postId),
+    uuidToBuffer(pubId),
+    coinsOffered,
+    expiresAt,
+    requestGeneration,
+    snapshot,
+    snapshotHash,
+  ])
+  const placeholders = values.map(() => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
+  const flatValues = values.flat()
+  await query(
+    `INSERT INTO post_publisher_requests
+       (id, post_id, publisher_id, coins_offered, expires_at, request_generation, content_snapshot, content_snapshot_hash)
+     VALUES ${placeholders}`,
+    flatValues
+  )
+  return ids.map((id, i) => ({ requestId: id, publisherId: publisherIds[i] }))
+}
+
+export async function findPostPublisherRequestsByPostId(postId) {
+  const rows = await query(
+    `SELECT r.*, u.email as publisher_email, up.first_name as publisher_first_name, up.last_name as publisher_last_name,
+       p.code as platform_code, upa.platform_display_name, upa.platform_username
+     FROM post_publisher_requests r
+     JOIN users u ON u.id = r.publisher_id
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     LEFT JOIN user_platform_accounts upa ON upa.id = r.platform_account_id
+     LEFT JOIN platforms p ON p.id = upa.platform_id
+     WHERE r.post_id = ?
+     ORDER BY r.created_at ASC`,
+    [uuidToBuffer(postId)]
+  )
+  return rows.map(mapPostPublisherRequestRow)
+}
+
+export async function findPostPublisherRequestById(id) {
+  const row = await queryOne(
+    `SELECT r.*, u.email as publisher_email, up.first_name as publisher_first_name, up.last_name as publisher_last_name,
+       p.code as platform_code, upa.platform_display_name, upa.platform_username
+     FROM post_publisher_requests r
+     JOIN users u ON u.id = r.publisher_id
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     LEFT JOIN user_platform_accounts upa ON upa.id = r.platform_account_id
+     LEFT JOIN platforms p ON p.id = upa.platform_id
+     WHERE r.id = ?`,
+    [uuidToBuffer(id)]
+  )
+  return mapPostPublisherRequestRow(row)
+}
+
+export async function findPostPublisherRequestsByPublisherId(publisherId, { page = 1, limit = 20, status } = {}) {
+  const offset = (page - 1) * limit
+  const where = ['r.publisher_id = ?']
+  const params = [uuidToBuffer(publisherId)]
+  if (status) {
+    where.push('r.status = ?')
+    params.push(status)
+  }
+  const whereClause = `WHERE ${where.join(' AND ')}`
+  const countRow = await queryOne(
+    `SELECT COUNT(*) as total FROM post_publisher_requests r ${whereClause}`,
+    params
+  )
+  const rows = await query(
+    `SELECT r.*, po.name as post_name, po.type as post_type, po.status as post_status, po.caption, po.media_url,
+       po.scheduled_at, u.email as client_email, up.first_name as client_first_name,
+       p.code as platform_code, upa.platform_display_name, upa.platform_username
+     FROM post_publisher_requests r
+     JOIN posts po ON po.id = r.post_id
+     JOIN users u ON u.id = po.client_id
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     LEFT JOIN user_platform_accounts upa ON upa.id = r.platform_account_id
+     LEFT JOIN platforms p ON p.id = upa.platform_id
+     ${whereClause}
+     ORDER BY r.created_at DESC LIMIT ? OFFSET ?`,
+    [...params, String(limit), String(offset)]
+  )
+  return {
+    total: countRow.total,
+    items: rows.map(r => ({
+      ...mapPostPublisherRequestRow(r),
+      postName: r.post_name,
+      postType: r.post_type,
+      postStatus: r.post_status,
+      postCaption: r.post_caption,
+      postMediaUrl: r.post_media_url,
+      clientEmail: r.client_email,
+      clientFirstName: r.client_first_name,
+    })),
+  }
+}
+
+export async function countPostPublisherRequestsByStatus(postId, status) {
+  const row = await queryOne(
+    'SELECT COUNT(*) as count FROM post_publisher_requests WHERE post_id = ? AND status = ?',
+    [uuidToBuffer(postId), status]
+  )
+  return row.count
+}
+
+export async function findPostPublisherRequestsByStatus(postId, status) {
+  const rows = await query(
+    'SELECT * FROM post_publisher_requests WHERE post_id = ? AND status = ?',
+    [uuidToBuffer(postId), status]
+  )
+  return rows.map(mapPostPublisherRequestRow)
+}
+
+export async function findAcceptedPostPublisherRequests(postId) {
+  const rows = await query(
+    'SELECT * FROM post_publisher_requests WHERE post_id = ? AND status = ?',
+    [uuidToBuffer(postId), 'accepted']
+  )
+  return rows.map(mapPostPublisherRequestRow)
+}
+
+export async function updatePostPublisherRequestStatusWithGuard(id, status, respondedAt, expectedStatus) {
+  const result = await query(
+    `UPDATE post_publisher_requests
+     SET status = ?, responded_at = COALESCE(?, responded_at),
+         accepted_at = IF(? = 'accepted', NOW(), accepted_at),
+         rejected_at = IF(? = 'rejected', NOW(), rejected_at),
+         completed_at = IF(? = 'completed', NOW(), completed_at)
+     WHERE id = ? AND status = ?`,
+    [status, respondedAt, status, status, status, uuidToBuffer(id), expectedStatus]
+  )
+  if (result.affectedRows === 0) {
+    throw new ValidationError('Publisher request status conflict — concurrent modification detected')
+  }
+}
+
+export async function updatePostPublisherRequestPublishedWithGuard(id, expectedStatus) {
+  const result = await query(
+    `UPDATE post_publisher_requests SET status = ?, published_at = NOW()
+     WHERE id = ? AND status = ?`,
+    ['published', uuidToBuffer(id), expectedStatus]
+  )
+  if (result.affectedRows === 0) {
+    throw new ValidationError('Publisher request status conflict — concurrent modification detected')
+  }
+}
+
+export async function updatePostPublisherRequest(id, data) {
+  const fields = []
+  const params = []
+  if (data.platformAccountId !== undefined) {
+    fields.push('platform_account_id = ?')
+    params.push(data.platformAccountId ? uuidToBuffer(data.platformAccountId) : null)
+  }
+  if (data.status !== undefined) { fields.push('status = ?'); params.push(data.status) }
+  if (data.publishedAt !== undefined) { fields.push('published_at = ?'); params.push(data.publishedAt) }
+  if (data.respondedAt !== undefined) { fields.push('responded_at = ?'); params.push(data.respondedAt) }
+  if (data.failureReason !== undefined) { fields.push('failure_reason = ?'); params.push(data.failureReason) }
+  if (data.payoutStatus !== undefined) { fields.push('payout_status = ?'); params.push(data.payoutStatus) }
+  if (data.payoutTransactionId !== undefined) { fields.push('payout_transaction_id = ?'); params.push(data.payoutTransactionId) }
+  if (!fields.length) return
+  params.push(uuidToBuffer(id))
+  await query(
+    `UPDATE post_publisher_requests SET ${fields.join(', ')} WHERE id = ?`,
+    params
+  )
+}
+
+export async function createPublisherTarget(postId, requestId, platformAccountId) {
+  const existing = await queryOne(
+    'SELECT id FROM post_targets WHERE post_id = ? AND platform_account_id = ?',
+    [uuidToBuffer(postId), uuidToBuffer(platformAccountId)]
+  )
+  if (existing) {
+    await query(
+      'UPDATE post_targets SET target_type = ?, publisher_request_id = ? WHERE id = ?',
+      ['publisher', uuidToBuffer(requestId), existing.id]
+    )
+    return bufferToUuid(existing.id)
+  }
+  const id = generateUuid()
+  await query(
+    `INSERT INTO post_targets (id, post_id, platform_account_id, target_type, publisher_request_id)
+     VALUES (?, ?, ?, 'publisher', ?)`,
+    [uuidToBuffer(id), uuidToBuffer(postId), uuidToBuffer(platformAccountId), uuidToBuffer(requestId)]
+  )
+  return id
+}
+
+export async function findEligiblePublishersForPost({ categoryId, limit = 20 } = {}) {
+  const params = []
+  let categoryClause = ''
+  if (categoryId) {
+    categoryClause = `
+      AND (
+        EXISTS (SELECT 1 FROM publisher_ad_categories pac WHERE pac.publisher_id = u.id AND pac.category_id = ?)
+        OR
+        EXISTS (SELECT 1 FROM user_categories uc WHERE uc.user_id = u.id AND uc.category_id = ?)
+      )`
+    params.push(uuidToBuffer(categoryId), uuidToBuffer(categoryId))
+  }
+  const rows = await query(
+    `SELECT DISTINCT u.id as publisher_id, u.email, up.first_name, up.last_name
+     FROM users u
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     JOIN user_roles ur ON ur.user_id = u.id
+     JOIN roles r ON r.id = ur.role_id AND r.code = 'publisher'
+     WHERE u.deleted_at IS NULL AND u.status = 'active'
+       ${categoryClause}
+       AND EXISTS (
+         SELECT 1 FROM user_platform_accounts upa
+         JOIN platforms p ON p.id = upa.platform_id
+         WHERE upa.user_id = u.id
+           AND upa.token_type = 'page'
+           AND upa.verification_status = 'verified'
+           AND p.code IN ('facebook', 'instagram')
+       )
+     ORDER BY u.id
+     LIMIT ?`,
+    [...params, String(limit)]
+  )
+  return rows.map(r => ({
+    publisherId: bufferToUuid(r.publisher_id),
+    email: r.email,
+    firstName: r.first_name,
+    lastName: r.last_name,
+  }))
+}
+
+export async function findVerifiedPublisherAccounts(publisherId) {
+  const rows = await query(
+    `SELECT upa.id, upa.platform_user_id, upa.platform_username, upa.platform_display_name,
+       upa.avatar_url, upa.instagram_business_account_id, upa.verification_status, upa.token_status,
+       p.code as platform_code
+     FROM user_platform_accounts upa
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE upa.user_id = ?
+       AND upa.token_type = 'page'
+       AND upa.verification_status = 'verified'
+       AND p.code IN ('facebook', 'instagram')
+     ORDER BY p.code, upa.platform_display_name`,
+    [uuidToBuffer(publisherId)]
+  )
+  return rows.map(r => ({
+    id: bufferToUuid(r.id),
+    platformUserId: r.platform_user_id,
+    platformUsername: r.platform_username,
+    platformDisplayName: r.platform_display_name,
+    avatarUrl: r.avatar_url,
+    igBusinessAccountId: r.instagram_business_account_id,
+    verificationStatus: r.verification_status,
+    tokenStatus: r.token_status,
+    platformCode: r.platform_code,
+  }))
+}
+
+export async function findExpiredPublisherPosts() {
+  const rows = await query(
+    `SELECT id FROM posts
+     WHERE status = 'awaiting_publishers'
+       AND publisher_response_deadline_at IS NOT NULL
+       AND publisher_response_deadline_at <= NOW()`
+  )
+  return rows.map(r => bufferToUuid(r.id))
+}

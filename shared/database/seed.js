@@ -51,6 +51,10 @@ const PERMISSIONS = [
   { code: 'campaigns.review', name: 'Review Campaigns', module: 'campaigns' },
   { code: 'campaigns.manage', name: 'Manage Campaigns', module: 'campaigns' },
   { code: 'campaigns.force-manage', name: 'Force Manage Campaigns', module: 'campaigns' },
+  { code: 'posts.read', name: 'Read Posts', module: 'posts' },
+  { code: 'posts.create', name: 'Create Posts', module: 'posts' },
+  { code: 'posts.review', name: 'Review Posts', module: 'posts' },
+  { code: 'posts.manage', name: 'Manage Posts', module: 'posts' },
   { code: 'subscriptions.admin', name: 'Manage Subscription Plans', module: 'subscriptions' },
   { code: 'subscriptions.read', name: 'Read Subscriptions', module: 'subscriptions' },
 ]
@@ -68,6 +72,7 @@ const ROLE_PERMISSION_MAP = {
     'identity_document_types.read', 'identity_document_types.create', 'identity_document_types.update', 'identity_document_types.delete',
     'ai.admin',
     'campaigns.review', 'campaigns.manage', 'campaigns.force-manage', 'campaigns.read',
+    'posts.read', 'posts.review', 'posts.manage',
     'subscriptions.admin', 'subscriptions.read',
   ],
   client: [
@@ -76,6 +81,7 @@ const ROLE_PERMISSION_MAP = {
     'identity_documents.upload', 'identity_documents.read',
     'ai.generate', 'ai.save', 'ai.read',
     'campaigns.read', 'campaigns.create',
+    'posts.read', 'posts.create',
   ],
   publisher: [
     'own.profile.read', 'own.profile.update',
@@ -165,6 +171,8 @@ const APP_CONFIG_SEEDS = [
   { key: 'ai_markup_coins', value: 200, is_public: 0, description: 'Admin markup coins added on top of LLM token cost per AI generation' },
   { key: 'publisher_request_multiplier', value: 2, is_public: 0, description: 'Over-provisioning multiplier for publisher requests (e.g., 2 = invite 2x the requested count)' },
   { key: 'publisher_response_deadline_days', value: 7, is_public: 0, description: 'Number of days publishers have to respond to campaign requests before the campaign expires' },
+  { key: 'post_media_quota_bytes', value: Number(process.env.POST_MEDIA_QUOTA_BYTES) || 512 * 1024 * 1024, is_public: 1, description: 'Total media storage quota per user in bytes' },
+  { key: 'post_media_max_file_bytes', value: Number(process.env.POST_MEDIA_MAX_FILE_BYTES) || 200 * 1024 * 1024, is_public: 1, description: 'Maximum size for a single uploaded media file in bytes' },
 ]
 
 const report = []

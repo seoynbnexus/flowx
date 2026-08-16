@@ -1061,17 +1061,26 @@ export async function acceptPublisherRequest(publisherId, requestId) {
   const campaign = await repo.findCampaignById(request.campaignId)
   if (!campaign) throw new NotFoundError('Campaign not found')
 
+  const page = await repo.findVerifiedFacebookPage(publisherId)
+  if (!page) {
+    throw new ValidationError('You must have a verified Facebook page before accepting campaign requests')
+  }
+
   return await transaction(async () => {
     await repo.lockCampaignById(request.campaignId)
+    const lockedCampaign = await repo.findCampaignById(request.campaignId)
+    if (!lockedCampaign || lockedCampaign.status !== CAMPAIGN_STATUS.AWAITING_PUBLISHERS) {
+      throw new ValidationError('Campaign is no longer awaiting publishers')
+    }
     const acceptedCount = await repo.countPublisherRequestsByStatus(request.campaignId, 'accepted')
-    if (acceptedCount >= (campaign.publisherCount || Infinity)) {
+    if (acceptedCount >= (lockedCampaign.publisherCount || Infinity)) {
       throw new ValidationError('Publisher capacity reached for this campaign')
     }
     await repo.updatePublisherRequestStatusWithGuard(requestId, 'accepted', new Date().toISOString().slice(0, 19).replace('T', ' '), 'pending')
 
     const newAcceptedCount = await repo.countPublisherRequestsByStatus(request.campaignId, 'accepted')
 
-    if (newAcceptedCount >= (campaign.publisherCount || Infinity)) {
+    if (newAcceptedCount >= (lockedCampaign.publisherCount || Infinity)) {
       const pendingRequests = await repo.findPublisherRequestsByStatus(request.campaignId, 'pending')
       for (const p of pendingRequests) {
         await repo.updatePublisherRequestStatusWithGuard(p.id, 'rejected', new Date().toISOString().slice(0, 19).replace('T', ' '), 'pending')
@@ -1093,6 +1102,10 @@ export async function goLiveForFilledCampaign(campaignId) {
 
   return await transaction(async () => {
     await repo.lockCampaignById(campaignId)
+    const lockedCampaign = await repo.findCampaignById(campaignId)
+    if (!lockedCampaign || lockedCampaign.status !== CAMPAIGN_STATUS.AWAITING_PUBLISHERS) {
+      throw new ValidationError('Campaign is no longer awaiting publishers')
+    }
 
     const clientResult = await publishAdForClient(campaignId)
     if (!clientResult.success) {
@@ -1275,9 +1288,10 @@ export async function activateAllMetaObjects(campaignId) {
   return { success: allSuccess, results }
 }
 
-export async function completePublisherRequest(requestId) {
+export async function completePublisherRequest(publisherId, requestId) {
   const request = await repo.findPublisherRequestById(requestId)
   if (!request) throw new NotFoundError('Request not found')
+  if (request.publisherId !== publisherId) throw new ForbiddenError('Not your request')
 
   if (request.status !== 'published') {
     throw new ValidationError(`Cannot complete request with status '${request.status}' — must be 'published'`)
@@ -1286,7 +1300,7 @@ export async function completePublisherRequest(requestId) {
   const completedAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
 
   await transaction(async () => {
-    await repo.updatePublisherRequestStatus(requestId, 'completed', completedAt)
+    await repo.updatePublisherRequestStatusWithGuard(requestId, 'completed', completedAt, 'published')
     await addCoins(request.publisherId, request.coinsOffered)
     await createTransaction(generateUuid(), request.publisherId, `Campaign payout: ${request.campaignName}`, request.coinsOffered, 'credit', 'campaign', request.campaignId)
   })

@@ -14,6 +14,7 @@ export default defineConfig({
       RAZORPAY_WEBHOOK_SECRET: 'mock_webhook_secret',
       JWT_SECRET: 'fallback-secret',
       JWT_REFRESH_SECRET: 'fallback-refresh-secret',
+      ENCRYPTION_KEY: 'd42a84bcb6e83b6264d482e8f8b346862c60a905a3c4e585b5607cccea30dfaa',
     },
     testTimeout: 60000,
     fileParallelism: false,

@@ -1,7 +1,9 @@
 import * as repo from './campaign.repository.js'
 import * as service from './campaign.service.js'
+import * as postService from '../posts/post.service.js'
 import { AppError } from '../../../shared/errors/AppError.js'
 import { CAMPAIGN_JOB_TYPES } from './campaign.model.js'
+import { POST_JOB_TYPES } from '../posts/post.model.js'
 import { isRateLimited } from '../../../shared/services/meta-rate-limiter.js'
 import os from 'node:os'
 
@@ -23,6 +25,12 @@ const HANDLERS = {
   [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_STATUS]: (campaignId, actorId, payload) => service.syncAccountStatusJob(payload?.adAccountId ?? undefined),
   [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_INSIGHTS]: (campaignId, actorId, payload) => service.syncAccountInsightsJob(payload?.adAccountId ?? undefined),
   [CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN]: (campaignId) => service.settleCampaignJob(campaignId),
+  [POST_JOB_TYPES.PUBLISH]: (postId) => postService.publishPostJob(postId),
+  [POST_JOB_TYPES.VERIFY]: (postId) => postService.verifyPostJob(postId),
+  [POST_JOB_TYPES.SYNC_ENGAGEMENT]: (postId) => postService.syncPostEngagementJob(postId),
+  [POST_JOB_TYPES.FB_REEL]: (campaignId, actorId, payload) => postService.fbReelJob(payload?.postId, payload?.targetId, payload),
+  [POST_JOB_TYPES.PUBLISHER_GO_LIVE]: (postId) => postService.goLiveForFilledPost(postId),
+  [POST_JOB_TYPES.EXPIRE_PUBLISHER_REQUESTS]: (postId) => postService.expirePublisherPosts([postId]),
 }
 
 function isPermanentError(error) {
@@ -42,13 +50,21 @@ export async function processDueJobs() {
       return
     }
     try {
-      await handler(job.campaignId, job.actorId, job.payload)
-      await repo.completeCampaignJob(job.id, 'done')
+      const result = await handler(job.campaignId, job.actorId, job.payload)
+      if (result && typeof result.requeueAfterSeconds === 'number') {
+        await repo.requeueReelJob(job.id, result.requeueAfterSeconds, result.attempts)
+      } else {
+        await repo.completeCampaignJob(job.id, 'done')
+      }
     } catch (error) {
       const message = error?.message || String(error)
       if (isPermanentError(error) || job.attempts >= job.maxAttempts) {
         await repo.completeCampaignJob(job.id, 'dead', message)
-        await service.markCampaignJobFailed(job.campaignId, job.jobType, message)
+        if (job.entityType === 'post' && job.jobType === POST_JOB_TYPES.PUBLISH) {
+          await postService.markPostJobFailed(job.campaignId, message)
+        } else if (job.entityType !== 'post') {
+          await service.markCampaignJobFailed(job.campaignId, job.jobType, message)
+        }
       } else {
         const backoffSeconds = Math.min(2 ** job.attempts * 30, MAX_BACKOFF_SECONDS)
         await repo.rescheduleCampaignJob(job.id, message, backoffSeconds)
@@ -96,6 +112,8 @@ async function tickSyncScheduler() {
   if (!isLeader) return
   try {
     await service.scheduleCampaignSyncs()
+    await postService.schedulePostEngagementSyncs()
+    await postService.handleExpiredPublisherPosts()
     balanceTick += 1
     if (balanceTick % 12 === 0) {
       balanceTick = 0
