@@ -110,3 +110,4 @@ const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.r
 if (isDirectRun) start();
 
 export default app;
+export { start };
