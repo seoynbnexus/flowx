@@ -147,6 +147,29 @@ describe('facebook reel durable publish state machine', () => {
     expect(target.publishState).toBe('ready')
   })
 
+  it('transitions to ready when Meta reports upload complete with processing not started', async () => {
+    const { postId, targetId } = await createApprovedReel()
+    await postService.fbReelJob(postId, targetId, {})
+    let target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('uploaded')
+
+    metaMocks.getPageReelStatus.mockResolvedValue({
+      video_status: 'upload_complete',
+      uploading_phase: { status: 'complete' },
+      processing_phase: { status: 'not_started' },
+    })
+    await postService.fbReelJob(postId, targetId, {})
+
+    target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('ready')
+    expect(target.lastMetaStatus).toBe('upload_complete')
+
+    await postService.fbReelJob(postId, targetId, {})
+    expect(metaMocks.finishPageReel).toHaveBeenCalledTimes(1)
+    target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('published')
+  })
+
   it('probes persisted upload status before re-uploading after a crash in uploading', async () => {
     const { postId, targetId } = await createApprovedReel()
     const ok = await postRepo.transitionPostTargetState(targetId, ['none'], 'uploading', {
@@ -162,6 +185,22 @@ describe('facebook reel durable publish state machine', () => {
     const target = await postRepo.findPostTargetById(targetId)
     expect(target.publishState).toBe('uploaded')
     expect(target.remoteVideoId).toBe('persisted_video_id')
+  })
+
+  it('accepts uploading_phase complete (not just finished) without re-uploading', async () => {
+    const { postId, targetId } = await createApprovedReel()
+    const ok = await postRepo.transitionPostTargetState(targetId, ['none'], 'uploading', {
+      remoteVideoId: 'persisted_video_id',
+      remoteUploadUrl: 'https://rupload.facebook.com/persisted',
+    })
+    expect(ok).toBe(true)
+
+    metaMocks.getPageReelStatus.mockResolvedValue({ uploading_phase: { status: 'complete' } })
+    await postService.fbReelJob(postId, targetId, {})
+
+    expect(metaMocks.uploadPageReelMedia).not.toHaveBeenCalled()
+    const target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('uploaded')
   })
 
   it('probes persisted upload status and re-uploads only when Meta confirms it was incomplete', async () => {
@@ -304,6 +343,60 @@ describe('facebook reel durable publish state machine', () => {
     expect(target.publishState).toBe('published')
     expect(target.metaObjectId).toBe('fb_verified')
     expect(metaMocks.uploadPageReelMedia).toHaveBeenCalledTimes(1)
+  })
+
+  it('rescues an unknown target whose finish never ran by finishing the completed upload', async () => {
+    const { postId, targetId } = await createApprovedReel()
+    metaMocks.uploadPageReelMedia.mockRejectedValueOnce((() => {
+      const err = new Error('connection reset during upload')
+      err.metaAmbiguous = true
+      return err
+    })())
+
+    await postService.fbReelJob(postId, targetId, {})
+    let target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('unknown')
+
+    metaMocks.getPageReelStatus.mockResolvedValue({
+      video_status: 'upload_complete',
+      uploading_phase: { status: 'complete' },
+      processing_phase: { status: 'not_started' },
+      publishing_phase: { publish_status: 'not_started' },
+    })
+    metaMocks.finishPageReel.mockResolvedValue({ post_id: 'fb_rescued', success: true })
+    await postService.fbReelJob(postId, targetId, {})
+
+    expect(metaMocks.uploadPageReelMedia).toHaveBeenCalledTimes(1)
+    expect(metaMocks.finishPageReel).toHaveBeenCalledTimes(1)
+    target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('published')
+    expect(target.metaObjectId).toBe('fb_rescued')
+  })
+
+  it('does not re-upload a completed upload while processing is in progress during verify', async () => {
+    const { postId, targetId } = await createApprovedReel()
+    metaMocks.uploadPageReelMedia.mockRejectedValueOnce((() => {
+      const err = new Error('connection reset during upload')
+      err.metaAmbiguous = true
+      return err
+    })())
+
+    await postService.fbReelJob(postId, targetId, {})
+    let target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('unknown')
+
+    metaMocks.getPageReelStatus.mockResolvedValue({
+      video_status: 'processing',
+      uploading_phase: { status: 'complete' },
+      processing_phase: { status: 'processing' },
+      publishing_phase: { publish_status: 'pending' },
+    })
+    await postService.fbReelJob(postId, targetId, {})
+
+    expect(metaMocks.uploadPageReelMedia).toHaveBeenCalledTimes(1)
+    expect(metaMocks.finishPageReel).not.toHaveBeenCalled()
+    target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('verifying')
   })
 
   it('marks a processing timeout as unknown after the processing cap', async () => {

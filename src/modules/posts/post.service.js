@@ -1254,8 +1254,8 @@ async function probeUploadStatus(target, accessToken) {
   }
   if (!status) return 'ambiguous'
   if (status.video_status === 'error') return 'error'
-  if (status.video_status === 'ready') return 'uploaded'
-  if (status.uploading_phase?.status === 'finished') return 'uploaded'
+  if (status.video_status === 'ready' || status.video_status === 'upload_complete') return 'uploaded'
+  if (status.uploading_phase?.status === 'finished' || status.uploading_phase?.status === 'complete') return 'uploaded'
   if (status.processing_phase?.status === 'processing_finished' || status.processing_phase?.status === 'finished') return 'uploaded'
   return 'not_uploaded'
 }
@@ -1363,13 +1363,17 @@ async function fbReelStatusCheck(post, target, pageId, accessToken, attempts) {
     return reelPermanent(target, statusDetail(status) || 'Facebook video processing failed', 'status')
   }
   const processing = status?.processing_phase
-  const isReady = videoStatus === 'ready' ||
+  const uploading = status?.uploading_phase
+  const uploadComplete = videoStatus === 'upload_complete' ||
+    uploading?.status === 'complete' ||
+    uploading?.status === 'finished'
+  const processingDone = videoStatus === 'ready' ||
     processing?.status === 'processing_finished' ||
     processing?.status === 'finished'
-  if (isReady) {
+  if (processingDone || uploadComplete) {
     const ok = await repo.transitionPostTargetState(target.id, [POST_TARGET_PUBLISH_STATE.UPLOADED, POST_TARGET_PUBLISH_STATE.PROCESSING], POST_TARGET_PUBLISH_STATE.READY, {
       error: null,
-      lastMetaStatus: 'ready',
+      lastMetaStatus: uploadComplete && !processingDone ? 'upload_complete' : 'ready',
       lastOperation: 'status',
       lastOperationAt: nowString(),
     })
@@ -1442,10 +1446,15 @@ async function fbReelVerify(post, target, pageId, accessToken, attempts) {
   }
   const uploading = status?.uploading_phase
   const processing = status?.processing_phase
-  const uploadIncomplete = !uploading?.status || uploading.status !== 'finished'
+  const uploadComplete = uploading?.status === 'finished' || uploading?.status === 'complete' || status?.video_status === 'upload_complete'
+  const uploadIncomplete = !uploadComplete && !uploading?.status
   const processingDone = processing?.status === 'processing_finished' || processing?.status === 'finished' || status?.video_status === 'ready'
+  const finishNeverRan = uploadComplete && processing?.status === 'not_started' && status?.publishing_phase?.publish_status === 'not_started'
   if (uploadIncomplete) {
     return fbReelUpload(post, target, pageId, accessToken, attempts)
+  }
+  if (finishNeverRan) {
+    return fbReelFinish(post, target, pageId, accessToken, attempts)
   }
   if (processingDone) {
     return fbReelFinish(post, target, pageId, accessToken, attempts)

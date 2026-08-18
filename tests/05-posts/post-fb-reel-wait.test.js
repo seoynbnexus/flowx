@@ -235,13 +235,13 @@ describe('resolvePageReelPostId (correlation-safe FINISH resolution)', () => {
   })
 })
 
-describe('createPageVideoStory waits for video processing before publishing', () => {
+describe('createPageVideoStory finishes immediately after upload', () => {
   beforeEach(() => {
     apiFetch.mockReset()
     fetchBoundedBytes.mockReset()
   })
 
-  it('polls until ready, finishes the story, and returns the post_id', async () => {
+  it('starts, uploads, then finishes the story without polling status first, returning the post_id', async () => {
     const calls = []
     apiFetch.mockImplementation(async (url, options = {}) => {
       calls.push({ url, options })
@@ -256,13 +256,41 @@ describe('createPageVideoStory waits for video processing before publishing', ()
       return okJson({ status: { video_status: 'ready' } })
     })
 
+    const result = await createPageVideoStory('page_1', 'tok', { url: 'https://cdn.example.com/s.mp4' })
+
+    expect(result).toEqual({ id: 'fb_story_9', videoId: 'vid_s1' })
+    const finishIndex = calls.findIndex(c => String(c.options.body || '').includes('upload_phase=finish'))
+    expect(finishIndex).toBeGreaterThan(-1)
+    const statusPolledBeforeFinish = calls.slice(0, finishIndex).some(c => String(c.url).includes('fields=status'))
+    expect(statusPolledBeforeFinish).toBe(false)
+    const finishCall = calls[finishIndex]
+    expect(finishCall.options.body).toContain('video_state=PUBLISHED')
+    expect(finishCall.options.body).toContain('video_id=vid_s1')
+  })
+
+  it('waits for the publishing phase after finish when finish returns no post_id', async () => {
+    const now = Math.floor(Date.now() / 1000) + 5
+    const statuses = [
+      { video_status: 'processing', publishing_phase: { publish_status: 'pending' } },
+      { video_status: 'processing', publishing_phase: { publish_status: 'published' } },
+    ]
+    apiFetch.mockImplementation(async (url, options = {}) => {
+      const body = typeof options.body === 'string' ? options.body : ''
+      if (body.includes('upload_phase=start')) {
+        return okJson({ video_id: 'vid_s2', upload_url: 'https://rupload.facebook.com/video_s2' })
+      }
+      if (url === 'https://rupload.facebook.com/video_s2') return okJson({ success: true })
+      if (body.includes('upload_phase=finish')) return okJson({ success: true })
+      if (String(url).includes('/page_1/stories')) {
+        return okJson({ data: [{ post_id: 'fb_story_resolved', status: 'PUBLISHED', creation_time: now }] })
+      }
+      return okJson({ status: statuses.length ? statuses.shift() : { video_status: 'ready' } })
+    })
+
     const result = await withFastPolling(() =>
       createPageVideoStory('page_1', 'tok', { url: 'https://cdn.example.com/s.mp4' })
     )
 
-    expect(result).toEqual({ id: 'fb_story_9', videoId: 'vid_s1' })
-    const finishCall = calls.find(c => String(c.options.body || '').includes('upload_phase=finish'))
-    expect(finishCall.options.body).toContain('video_state=PUBLISHED')
-    expect(finishCall.options.body).toContain('video_id=vid_s1')
+    expect(result.id).toBe('fb_story_resolved')
   })
 })

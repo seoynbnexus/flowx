@@ -115,12 +115,19 @@ Failure/uncertain paths:
 `last_meta_status`, `last_operation`, `last_operation_at`, `processing_started_at`,
 `unknown_since` record the most recent Meta signal for the admin detail view.
 
+Upload completion (`video_status:'upload_complete'` or `uploading_phase.status` `complete`/`finished`)
+transitions `uploaded`/`processing` straight to `ready` — the finish call triggers Meta's processing
+and publishing. `fbReelVerify` also rescues targets whose finish never ran (upload complete +
+processing/publishing `not_started`) by calling `fbReelFinish`.
+
 ## Files
 
 - `shared/services/meta-ads.service.js` — one-op primitives `startPageReel`,
   `uploadPageReelMedia`, `getPageReelStatus`, `finishPageReel`; `resolvePageReelPostId` strict
-  resolver. Story-only helpers (`waitForVideoReady`, `getVideoUploadStatus`, `createPageVideoStory`)
-  untouched.
+  resolver. Story helpers `getVideoUploadStatus` + `createPageVideoStory` — order is start →
+  hosted upload → finish → `waitForStoryPublished` (no pre-finish processing wait: Meta only
+  starts processing after `upload_phase:'finish'`, and its status literals are `complete` /
+  `upload_complete`, not `finished`).
 - `src/modules/posts/post.service.js` — `fbReelJob` dispatcher + `fbReelState` tunables
   (`backoffSteps`, `processingBackoffMs`, `verifyBackoffSeconds`, `processingCapMs`),
   `FB_REEL_VERIFY_CAP`, step functions, `refreshPostStatus`; `publishPostJob` routes reel targets to

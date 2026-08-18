@@ -82,7 +82,7 @@ async function graphPost(path, params = {}) {
     await maybeEnterCooldown(res, error, accountId)
     const err = new Error(`Graph API POST ${path} failed: ${error}`)
     err.statusCode = res.status
-    return tagGraphError(err, { path, method: 'POST' })
+    throw tagGraphError(err, { path, method: 'POST' })
   }
   return res.json()
 }
@@ -97,7 +97,7 @@ async function graphDelete(path, accessToken) {
     await maybeEnterCooldown(res, error, accountId)
     const err = new Error(`Graph API DELETE ${path} failed: ${error}`)
     err.statusCode = res.status
-    return tagGraphError(err, { path, method: 'DELETE' })
+    throw tagGraphError(err, { path, method: 'DELETE' })
   }
   return res.json()
 }
@@ -119,7 +119,7 @@ async function graphGet(path, params = {}) {
     await maybeEnterCooldown(res, error, accountId)
     const err = new Error(`Graph API GET ${path} failed: ${error}`)
     err.statusCode = res.status
-    return tagGraphError(err, { path, method: 'GET' })
+    throw tagGraphError(err, { path, method: 'GET' })
   }
   return res.json()
 }
@@ -355,28 +355,6 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function waitForVideoReady(videoId, accessToken) {
-  const deadline = Date.now() + fbVideoPoll.timeoutMs
-  while (Date.now() < deadline) {
-    const data = await getVideoUploadStatus(videoId, accessToken)
-    const status = data?.status
-    if (!status) return
-    if (status.video_status === 'error') {
-      const detail = Array.isArray(status.status_errors)
-        ? status.status_errors.map(e => e?.message || e).join('; ')
-        : status.status_errors?.message || status.status_errors || 'video processing failed'
-      const err = new Error(`Facebook video processing failed: ${detail}`)
-      err.metaAmbiguous = false
-      throw err
-    }
-    if (status.video_status === 'ready') return
-    await sleep(fbVideoPoll.intervalMs)
-  }
-  const err = new Error('Timed out waiting for Facebook video to finish processing')
-  err.metaAmbiguous = false
-  throw err
-}
-
 async function listPageReels(pageId, accessToken) {
   const data = await graphGet(`${pageId}/video_reels`, {
     access_token: accessToken,
@@ -507,7 +485,6 @@ export async function createPageVideoStory(pageId, accessToken, { url }) {
     throw err
   }
   await uploadHostedVideo(started.upload_url, url, accessToken)
-  await waitForVideoReady(started.video_id, accessToken)
   const finished = await createPageVideoContainer(pageId, accessToken, 'video_stories', 'finish', {
     video_id: started.video_id,
     video_state: 'PUBLISHED',
