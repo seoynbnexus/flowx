@@ -70,7 +70,8 @@ export async function duplicatePost(req, res, next) {
 
 export async function setPostTargets(req, res, next) {
   try {
-    const targets = await service.setPostTargets(req.user.id, req.params.id, req.body)
+    const targetAccountIds = Array.isArray(req.body) ? req.body : req.body?.targetAccountIds
+    const targets = await service.setPostTargets(req.user.id, req.params.id, targetAccountIds)
     return sendSuccess(res, targets, 'Targets updated')
   } catch (error) {
     next(error)

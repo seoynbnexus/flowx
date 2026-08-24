@@ -30,6 +30,15 @@ import { sendAdminAlert, sendPublisherRepublishNotification } from '../../../sha
 
 let cachedCoinRate = null
 
+async function isCampaignDuplicateEnabled() {
+  try {
+    const row = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', ['feature_visibility'])
+    if (!row) return false
+    const v = typeof row.config_value === 'string' ? JSON.parse(row.config_value) : row.config_value
+    return v.campaign_duplicate === true
+  } catch { return false }
+}
+
 export async function enqueueCampaignJob(campaignId, jobType, actorId = null, payload = {}) {
   const jobId = generateUuid()
   const enqueued = await repo.enqueueCampaignJob(jobId, campaignId, jobType, actorId, payload)
@@ -152,6 +161,34 @@ export async function getPublisherResponseDeadlineDays() {
   } catch {
     return 7
   }
+}
+
+export async function getPublisherDeadlineHours() {
+  try {
+    const hoursRow = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', ['publisher_response_deadline_hours'])
+    if (hoursRow) {
+      const v = typeof hoursRow.config_value === 'string' ? JSON.parse(hoursRow.config_value) : hoursRow.config_value
+      const n = Number(v)
+      if (Number.isFinite(n) && n >= 1 && n <= 720) return Math.floor(n)
+    }
+    if (process.env.POST_PUBLISHER_DEADLINE_HOURS) {
+      const n = Number(process.env.POST_PUBLISHER_DEADLINE_HOURS)
+      if (Number.isFinite(n) && n >= 1 && n <= 720) return Math.floor(n)
+    }
+    const days = await getPublisherResponseDeadlineDays()
+    return days * 24
+  } catch { return 48 }
+}
+
+export async function effectivePublisherDeadline(scheduledAt) {
+  const hours = await getPublisherDeadlineHours()
+  const now = Date.now()
+  const deadlineMs = now + hours * 3600 * 1000
+  if (scheduledAt) {
+    const schedMs = new Date(scheduledAt).getTime()
+    if (Number.isFinite(schedMs) && schedMs > now) return new Date(Math.min(deadlineMs, schedMs))
+  }
+  return new Date(deadlineMs)
 }
 
 export function invalidatePublisherConfigCache() {
@@ -914,9 +951,7 @@ export async function approveCampaign(adminId, campaignId, data) {
     // Publisher flow — await publishers before creating Meta ads
     if (campaign.categoryId && campaign.publisherCount && campaign.coinsPerPublisher) {
       const multiplier = await getPublisherRequestMultiplier()
-      const deadlineDays = await getPublisherResponseDeadlineDays()
-      const deadlineAt = new Date()
-      deadlineAt.setDate(deadlineAt.getDate() + deadlineDays)
+      const deadlineAt = await effectivePublisherDeadline(campaign.scheduledAt)
 
       let updated
       await transaction(async () => {
@@ -1342,6 +1377,9 @@ export async function getCampaignDetail(campaignId) {
 }
 
 export async function duplicateCampaign(userId, campaignId, data) {
+  if (!(await isCampaignDuplicateEnabled())) {
+    throw new ForbiddenError('Duplicate is temporarily disabled')
+  }
   const campaign = await repo.findCampaignById(campaignId)
   if (!campaign) throw new NotFoundError('Campaign not found')
   if (campaign.clientId !== userId) throw new ForbiddenError('Not your campaign')
@@ -2416,7 +2454,7 @@ export async function settleCampaignJob(campaignId) {
 }
 
 export async function getMetaSyncHealth() {
-  const [staleCampaigns, failedJobs, unsettledCount, runningCount, pausedCount, accountSnapshot, rateLimit, accounts, rateLimits, schedulerLease, chargedBudget] = await Promise.all([
+  const [staleCampaigns, failedJobs, unsettledCount, runningCount, pausedCount, accountSnapshot, rateLimit, accounts, rateLimits, schedulerLease, chargedBudget, activeQueueJobs, deadQueueJobs, oldestQueued] = await Promise.all([
     repo.findStaleRunningCampaigns(),
     repo.countFailedJobsByType(),
     repo.countUnsettledCampaigns(),
@@ -2428,6 +2466,9 @@ export async function getMetaSyncHealth() {
     Promise.resolve(getAllRateLimitStates()),
     repo.getSchedulerLease('meta_sync_scheduler'),
     repo.sumChargedBudgetByAccount(),
+    repo.countActiveCampaignJobs(),
+    repo.countDeadJobs(),
+    repo.oldestQueuedJob(),
   ])
 
   return {
@@ -2442,6 +2483,11 @@ export async function getMetaSyncHealth() {
     rateLimits,
     schedulerLease,
     chargedBudget,
+    queue: {
+      active: activeQueueJobs,
+      dead: deadQueueJobs,
+      oldestQueuedAgeSeconds: oldestQueued ? Math.max(0, Math.floor((Date.now() - new Date(oldestQueued.runAfter).getTime()) / 1000)) : null,
+    },
   }
 }
 

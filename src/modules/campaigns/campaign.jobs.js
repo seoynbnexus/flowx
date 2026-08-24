@@ -5,9 +5,10 @@ import { AppError } from '../../../shared/errors/AppError.js'
 import { CAMPAIGN_JOB_TYPES } from './campaign.model.js'
 import { POST_JOB_TYPES } from '../posts/post.model.js'
 import { isRateLimited } from '../../../shared/services/meta-rate-limiter.js'
+import { logger } from '../../../shared/utils/logger.js'
 import os from 'node:os'
 
-const JOB_CONCURRENCY = Number(process.env.CAMPAIGN_JOB_CONCURRENCY) || 10
+const JOB_CONCURRENCY = Number(process.env.CAMPAIGN_JOB_CONCURRENCY) || 25
 const STALE_JOB_MINUTES = 10
 const MAX_BACKOFF_SECONDS = 3600
 const SCHEDULER_LEASE_NAME = 'meta_sync_scheduler'
@@ -29,6 +30,8 @@ const HANDLERS = {
   [POST_JOB_TYPES.VERIFY]: (postId) => postService.verifyPostJob(postId),
   [POST_JOB_TYPES.SYNC_ENGAGEMENT]: (postId) => postService.syncPostEngagementJob(postId),
   [POST_JOB_TYPES.FB_REEL]: (campaignId, actorId, payload) => postService.fbReelJob(payload?.postId, payload?.targetId, payload),
+  [POST_JOB_TYPES.IG_REEL]: (campaignId, actorId, payload) => postService.igReelJob(payload?.postId, payload?.targetId, payload),
+  [POST_JOB_TYPES.IG_STORY]: (campaignId, actorId, payload) => postService.igVideoStoryJob(payload?.postId, payload?.targetId, payload),
   [POST_JOB_TYPES.PUBLISHER_GO_LIVE]: (postId) => postService.goLiveForFilledPost(postId),
   [POST_JOB_TYPES.EXPIRE_PUBLISHER_REQUESTS]: (postId) => postService.expirePublisherPosts([postId]),
 }
@@ -87,6 +90,22 @@ export async function drainCampaignJobs({ timeoutMs = 15000, pollMs = 100 } = {}
 
 let workerTimer = null
 
+export function shouldRunWorker() {
+  return process.env.WORKER_ENABLED !== '0'
+}
+
+export function shouldRunScheduler() {
+  return process.env.SYNC_SCHEDULER_ENABLED !== '0'
+}
+
+export function startBackgroundWorkers() {
+  const workerEnabled = shouldRunWorker()
+  const schedulerEnabled = shouldRunScheduler()
+  if (workerEnabled) startCampaignJobWorker()
+  if (schedulerEnabled) startMetaSyncScheduler()
+  return { workerEnabled, schedulerEnabled }
+}
+
 export function startCampaignJobWorker() {
   if (workerTimer) return workerTimer
   processDueJobs().catch((err) => console.error('Campaign job worker error:', err?.message))
@@ -107,10 +126,42 @@ export function stopCampaignJobWorker() {
 let syncSchedulerTimer = null
 let balanceTick = 0
 
+export const maintenance = {
+  intervalMs: 24 * 60 * 60 * 1000,
+  lastRunAt: 0,
+}
+
+export function maintenanceDue(now = Date.now()) {
+  return now - maintenance.lastRunAt >= maintenance.intervalMs
+}
+
+const JOB_RETENTION_DAYS = Number(process.env.JOB_RETENTION_DAYS) || 7
+const ENGAGEMENT_RETENTION_DAYS = Number(process.env.ENGAGEMENT_RETENTION_DAYS) || 90
+const WEBHOOK_RETENTION_DAYS = Number(process.env.WEBHOOK_RETENTION_DAYS) || 90
+
+export async function runJobMaintenance() {
+  const [terminalJobs, engagement, webhookEvents] = await Promise.all([
+    repo.purgeTerminalJobs(JOB_RETENTION_DAYS),
+    repo.purgeOldEngagementRows(ENGAGEMENT_RETENTION_DAYS),
+    repo.purgeOldWebhookEvents(WEBHOOK_RETENTION_DAYS),
+  ])
+  const result = { ...terminalJobs, ...engagement, ...webhookEvents }
+  logger.info(result, 'Job archival maintenance')
+  return result
+}
+
 async function tickSyncScheduler() {
   const isLeader = await repo.claimSchedulerLease(SCHEDULER_LEASE_NAME, instanceId, SCHEDULER_LEASE_TTL_SECONDS)
   if (!isLeader) return
   try {
+    if (maintenanceDue()) {
+      maintenance.lastRunAt = Date.now()
+      try {
+        await runJobMaintenance()
+      } catch (err) {
+        logger.warn({ err: err?.message }, 'Job archival maintenance failed')
+      }
+    }
     await service.scheduleCampaignSyncs()
     await postService.schedulePostEngagementSyncs()
     await postService.handleExpiredPublisherPosts()

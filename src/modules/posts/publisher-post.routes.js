@@ -11,8 +11,14 @@ const requestQuerySchema = z.object({
 })
 
 const acceptSchema = z.object({
-  platformAccountId: z.string().uuid('Invalid account ID'),
-})
+  platformAccountIds: z.array(z.string().uuid('Invalid account ID')).min(1, 'Select at least one account').max(10).optional(),
+  platformAccountId: z.string().uuid('Invalid account ID').optional(),
+}).refine(d => (d.platformAccountIds?.length || 0) + (d.platformAccountId ? 1 : 0) >= 1, { message: 'Select at least one account', path: ['platformAccountIds'] })
+  .transform(d => {
+    if (d.platformAccountIds?.length) return { platformAccountIds: [...new Set(d.platformAccountIds)] }
+    if (d.platformAccountId) return { platformAccountIds: [d.platformAccountId] }
+    return d
+  })
 
 const router = Router()
 

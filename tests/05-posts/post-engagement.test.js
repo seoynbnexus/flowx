@@ -19,6 +19,8 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
     createInstagramMedia: vi.fn().mockResolvedValue({ id: 'mock_ig_container_1' }),
     publishInstagramMedia: vi.fn().mockResolvedValue({ id: 'mock_ig_post_1' }),
     createInstagramStory: vi.fn().mockResolvedValue({ id: 'mock_ig_story_1' }),
+    createPagePhotoStory: vi.fn().mockResolvedValue({ id: 'mock_fb_story_1', photoId: 'mock_fb_photo_1' }),
+    createPageVideoStory: vi.fn().mockResolvedValue({ id: 'mock_fb_story_video_1', videoId: 'mock_fb_video_1' }),
     getContainerStatus: vi.fn().mockResolvedValue({ status_code: 'FINISHED' }),
     deleteInstagramContainer: vi.fn().mockResolvedValue({ success: true }),
     getMediaEngagement: vi.fn().mockResolvedValue({
@@ -310,8 +312,19 @@ describe('post engagement sync', () => {
     delete process.env.META_SYSTEM_USER_TOKEN
   })
 
-  it('should use story-only fields for story media', async () => {
+  it('should use story-only fields and store story insights for story media', async () => {
     const postId = await createSubmittedOnlyPost([igAccountId], { type: 'story' })
+    metaMocks.getMediaEngagement.mockResolvedValue({
+      mediaId: 'mock_ig_story_1',
+      mediaType: 'VIDEO',
+      mediaProductType: null,
+      permalink: 'https://instagram.com/stories/eng_ig_acct_1/123/',
+      timestamp: '2026-08-12T10:00:00+0000',
+      likeCount: null,
+      commentsCount: null,
+      insights: { impressions: 240, reach: 180, views: 200, taps_forward: 12, taps_back: 3, exits: 7, replies: 5 },
+      comments: [],
+    })
     await postService.syncPostEngagementJob(postId)
 
     expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(
@@ -321,6 +334,78 @@ describe('post engagement sync', () => {
     )
     const rows = await postRepo.findPostEngagement(postId)
     expect(rows).toHaveLength(1)
+    expect(rows[0].impressions).toBe(240)
+    expect(rows[0].reach).toBe(180)
+    expect(rows[0].views).toBe(200)
+    expect(rows[0].tapsForward).toBe(12)
+    expect(rows[0].tapsBack).toBe(3)
+    expect(rows[0].exits).toBe(7)
+    expect(rows[0].replies).toBe(5)
+    expect(rows[0].error).toBeNull()
+  })
+
+  it('should store FB video story engagement through the video node', async () => {
+    const postId = await createSubmittedOnlyPost([fbAccountId], { type: 'story' })
+    metaMocks.getMediaEngagement.mockResolvedValue({
+      mediaId: 'fb_story_video_1',
+      mediaType: 'video',
+      mediaProductType: null,
+      permalink: 'https://www.facebook.com/reel/1051217994554694/',
+      timestamp: '2026-08-12T10:00:00+0000',
+      likeCount: 9,
+      commentsCount: 2,
+      insights: { views: 500 },
+      comments: [],
+    })
+    const result = await postService.syncPostEngagementJob(postId)
+    expect(result.synced).toBe(1)
+    expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      { mediaKind: 'story', platform: 'facebook' }
+    )
+    const rows = await postRepo.findPostEngagement(postId)
+    expect(rows[0].mediaType).toBe('video')
+    expect(rows[0].views).toBe(500)
+    expect(rows[0].likes).toBe(9)
+    expect(rows[0].comments).toBe(2)
+    expect(rows[0].error).toBeNull()
+  })
+
+  it('should record a clean no-data row when an FB story node is not queryable', async () => {
+    const postId = await createSubmittedOnlyPost([fbAccountId], { type: 'story' })
+    metaMocks.getMediaEngagement.mockResolvedValue({
+      mediaId: 'fb_story_1',
+      mediaType: null,
+      mediaProductType: null,
+      permalink: null,
+      timestamp: null,
+      likeCount: null,
+      commentsCount: null,
+      insights: {},
+      comments: [],
+      storyInsightError: 'unsupported story object',
+    })
+    const result = await postService.syncPostEngagementJob(postId)
+    expect(result.synced).toBe(1)
+    const rows = await postRepo.findPostEngagement(postId)
+    expect(rows[0].mediaType).toBeNull()
+    expect(rows[0].impressions).toBe(0)
+    expect(rows[0].views).toBe(0)
+    expect(rows[0].error).toBeNull()
+  })
+
+  it('should not schedule engagement for stories older than the 24h window', async () => {
+    const postId = await createSubmittedOnlyPost([igAccountId], { type: 'story' })
+    const targets = await postRepo.findPostTargetsByPostId(postId)
+    const t = targets[0]
+    await postRepo.updatePostTargetStatus(t.id, {
+      postedAt: new Date(Date.now() - 30 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' '),
+    })
+    const due = await postRepo.findPostsDueForEngagementSync({ stalenessSeconds: 3600, limit: 20 })
+    expect(due).not.toContain(postId)
+    const dueFresh = await postRepo.findPostsDueForEngagementSync({ stalenessSeconds: 3600, limit: 20, storyMaxAgeHours: 48 })
+    expect(dueFresh).toContain(postId)
   })
 
   it('should pass facebook platform for FB targets and store FB photo engagement', async () => {
@@ -378,7 +463,7 @@ describe('post engagement sync', () => {
     expect(rows[0].likes).toBe(8)
   })
 
-  it('should use the system token as the primary token for FB targets too', async () => {
+  it('should use the owner page token (not the system token) for FB targets', async () => {
     process.env.META_SYSTEM_USER_TOKEN = 'test_system_token'
     const postId = await createPublishedPost([fbAccountId])
     metaMocks.getMediaEngagement.mockResolvedValue({
@@ -396,10 +481,22 @@ describe('post engagement sync', () => {
     const result = await postService.syncPostEngagementJob(postId)
     expect(result.synced).toBe(1)
     expect(metaMocks.getMediaEngagement).toHaveBeenCalledTimes(1)
-    expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(expect.any(String), 'test_system_token', {
+    expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(expect.any(String), 'mock_page_token', {
       mediaKind: 'post',
       platform: 'facebook',
     })
+    delete process.env.META_SYSTEM_USER_TOKEN
+  })
+
+  it('should not fall back to the system token when the FB owner token fails', async () => {
+    process.env.META_SYSTEM_USER_TOKEN = 'test_system_token'
+    const postId = await createPublishedPost([fbAccountId])
+    metaMocks.getMediaEngagement.mockRejectedValue(new Error('Graph API down'))
+    const result = await postService.syncPostEngagementJob(postId)
+    expect(result.synced).toBe(0)
+    expect(metaMocks.getMediaEngagement).toHaveBeenCalledTimes(1)
+    const rows = await postRepo.findPostEngagement(postId)
+    expect(rows[0].error).toBe('Graph API down')
     delete process.env.META_SYSTEM_USER_TOKEN
   })
 
@@ -464,13 +561,20 @@ describe('post engagement sync', () => {
       targetAccountIds: [igAccountId],
     })
     await postService.submitPost(client.id, post.id)
-    metaMocks.publishInstagramMedia.mockRejectedValue(new Error('(#100) something failed'))
+    const permanent = new Error('(#100) something failed')
+    permanent.metaHttpStatus = 400
+    permanent.metaErrorCode = 100
+    metaMocks.publishInstagramMedia.mockRejectedValue(permanent)
     metaMocks.publishInstagramMedia.mockClear()
     metaMocks.deleteInstagramContainer.mockClear()
     metaMocks.getContainerStatus.mockResolvedValue({ status_code: 'FINISHED' })
-    await postService.approvePost(admin.id, post.id, {})
-    await expect(drainCampaignJobs({ timeoutMs: 4000 })).rejects.toThrow(/timed out/i)
-    await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(post.id)])
+    postService.igVideoState.pollSeconds = 0
+    try {
+      await postService.approvePost(admin.id, post.id, {})
+      await drainCampaignJobs()
+    } finally {
+      postService.igVideoState.pollSeconds = 5
+    }
 
     expect(metaMocks.deleteInstagramContainer).toHaveBeenCalledWith('mock_ig_container_1', 'mock_page_token')
     expect(metaMocks.deleteInstagramContainer).toHaveBeenCalledTimes(1)

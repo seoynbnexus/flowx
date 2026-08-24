@@ -3,16 +3,59 @@ import { generateUuid } from '../../../shared/utils/uuid.utils.js'
 import { NotFoundError, ValidationError, ForbiddenError } from '../../../shared/errors/AppError.js'
 import { POST_STATUS, POST_TYPES, VALID_TRANSITIONS, REVIEW_ACTIONS, POST_JOB_TYPES, POST_TARGET_STATUS, POST_TARGET_TYPES, POST_TARGET_PUBLISH_STATE, PUBLISHER_REQUEST_STATUS } from './post.model.js'
 import { enqueueCampaignJob as enqueueJob, enqueueTargetJob as enqueueReelJob, requeueAutoJob, enqueueCampaignJob } from '../campaigns/campaign.repository.js'
-import { transaction } from '../../../shared/database/connection.js'
-import { createPagePhotoPost, createPageVideoPost, createFeedPost, createInstagramMedia, publishInstagramMedia, createInstagramStory, getContainerStatus, getMediaEngagement, deleteInstagramContainer, extractMetaError, createPageVideoStory, createPagePhotoStory, startPageReel, uploadPageReelMedia, getPageReelStatus, finishPageReel, resolvePageReelPostId } from '../../../shared/services/meta-ads.service.js'
+import { transaction, queryOne } from '../../../shared/database/connection.js'
+import { createPagePhotoPost, createPageVideoPost, createFeedPost, createInstagramMedia, publishInstagramMedia, createInstagramStory, getContainerStatus, getMediaEngagement, deleteInstagramContainer, extractMetaError, createPageVideoStory, createPagePhotoStory, startPageReel, uploadPageReelMedia, getPageReelStatus, finishPageReel, resolvePageReelPostId, qualifyFbPostId } from '../../../shared/services/meta-ads.service.js'
 import { getInstagramMedia } from '../../../shared/services/meta-graph.service.js'
 import { buildPostMessage, validatePostContent, PostValidationError } from '../../../shared/services/post-content-validation.js'
 import { isPublicHttpUrl, resolveMediaHost, inspectMediaSize, fetchBoundedBytes } from '../../../shared/services/media-url.js'
 import { probeMedia, probeWithFfprobe } from '../../../shared/services/media-probe.js'
+import { isRateLimited, tokenKeyFor } from '../../../shared/services/meta-rate-limiter.js'
 import { randomBytes, createHash } from 'node:crypto'
 import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+async function isPostDuplicateEnabled() {
+  try {
+    const row = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', ['feature_visibility'])
+    if (!row) return false
+    const v = typeof row.config_value === 'string' ? JSON.parse(row.config_value) : row.config_value
+    return v.post_duplicate === true
+  } catch { return false }
+}
+
+export async function getPublisherDeadlineHours() {
+  try {
+    const hoursRow = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', ['publisher_response_deadline_hours'])
+    if (hoursRow) {
+      const v = typeof hoursRow.config_value === 'string' ? JSON.parse(hoursRow.config_value) : hoursRow.config_value
+      const n = Number(v)
+      if (Number.isFinite(n) && n >= 1 && n <= 720) return Math.floor(n)
+    }
+    if (process.env.POST_PUBLISHER_DEADLINE_HOURS) {
+      const n = Number(process.env.POST_PUBLISHER_DEADLINE_HOURS)
+      if (Number.isFinite(n) && n >= 1 && n <= 720) return Math.floor(n)
+    }
+    const daysRow = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', ['publisher_response_deadline_days'])
+    if (daysRow) {
+      const v = typeof daysRow.config_value === 'string' ? JSON.parse(daysRow.config_value) : daysRow.config_value
+      const n = Number(v)
+      if (Number.isFinite(n) && n >= 1) return Math.floor(n * 24)
+    }
+    return 48
+  } catch { return 48 }
+}
+
+export async function effectivePublisherDeadline(scheduledAt) {
+  const hours = await getPublisherDeadlineHours()
+  const now = Date.now()
+  const deadlineMs = now + hours * 3600 * 1000
+  if (scheduledAt) {
+    const schedMs = new Date(scheduledAt).getTime()
+    if (Number.isFinite(schedMs) && schedMs > now) return new Date(Math.min(deadlineMs, schedMs))
+  }
+  return new Date(deadlineMs)
+}
 
 export const postMediaProbe = {
   enabled: process.env.NODE_ENV !== 'test' && process.env.POST_MEDIA_PROBE !== '0',
@@ -124,6 +167,14 @@ async function sniffMediaType(url) {
   } finally {
     clearTimeout(timer)
   }
+}
+
+function mediaIsVideoForTarget(post, target, mediaByTarget) {
+  const report = mediaByTarget?.[target.id]
+  if (report?.probe?.kind != null) return report.probe.kind === 'video'
+  if (report?.contentType) return String(report.contentType).startsWith('video/')
+  if (isVideoUrl(post.mediaUrl)) return true
+  return false
 }
 
 export const igContainerPoll = { intervalMs: 5000, timeoutMs: 150000 }
@@ -402,6 +453,9 @@ export async function cancelPost(userId, postId) {
 }
 
 export async function duplicatePost(userId, postId, data) {
+  if (!(await isPostDuplicateEnabled())) {
+    throw new ForbiddenError('Duplicate is temporarily disabled')
+  }
   const post = await repo.findPostById(postId)
   if (!post) throw new NotFoundError('Post not found')
   if (post.clientId !== userId) throw new ForbiddenError('Not your post')
@@ -434,6 +488,9 @@ export async function setPostTargets(userId, postId, targetAccountIds) {
   const post = await repo.findPostById(postId)
   if (!post) throw new NotFoundError('Post not found')
   if (post.clientId !== userId) throw new ForbiddenError('Not your post')
+  if (!Array.isArray(targetAccountIds)) {
+    throw new ValidationError('Invalid target account IDs')
+  }
 
   const owned = await repo.findPostAccountsForUser(userId)
   const ownedIds = new Set(owned.map(a => a.id))
@@ -470,6 +527,7 @@ export async function approvePost(adminId, postId, data) {
     const split = await coinService.spend(post.clientId, total, 'post_publisher_escrow', postId,
       `Publisher escrow for "${post.name}"`)
 
+    const effectiveDeadline = await effectivePublisherDeadline(post.scheduledAt)
     const updated = await repo.updatePostWithStatusGuard(postId, {
       status: POST_STATUS.AWAITING_PUBLISHERS,
       escrowAmount: total,
@@ -480,7 +538,7 @@ export async function approvePost(adminId, postId, data) {
       reviewedAt: now,
       reviewNotes: data.notes || null,
       adminNotes: data.notes || null,
-      publisherResponseDeadlineAt: new Date(Date.now() + (Number(process.env.POST_PUBLISHER_DEADLINE_HOURS) || 48) * 3600 * 1000),
+      publisherResponseDeadlineAt: effectiveDeadline,
     }, POST_STATUS.PENDING_REVIEW)
     await repo.createReviewLog(postId, adminId, REVIEW_ACTIONS.APPROVED, POST_STATUS.PENDING_REVIEW, data.notes || null)
 
@@ -551,6 +609,13 @@ export async function retryPostPublish(postId) {
     throw new ValidationError('Post can only be retried when failed or partially published')
   }
 
+  const targets = await repo.findPostTargetsByPostId(postId)
+  for (const target of targets) {
+    if (target.status !== POST_TARGET_STATUS.POSTED) {
+      await repo.resetPostTargetForRetry(target.id)
+    }
+  }
+
   const queuedJob = await queuePostPublish(postId)
   return { queued: true, jobId: queuedJob.jobId }
 }
@@ -606,7 +671,7 @@ export async function createPostPublisherRequests(postId) {
   const selected = eligible.slice(0, limit)
   if (selected.length === 0) return { created: [] }
 
-  const expiresAt = new Date(Date.now() + (Number(process.env.POST_PUBLISHER_DEADLINE_HOURS) || 48) * 3600 * 1000)
+  const expiresAt = await effectivePublisherDeadline(post.scheduledAt)
   const snapshot = buildContentSnapshot(post)
   const hash = snapshotHash(snapshot)
 
@@ -690,7 +755,18 @@ export async function getPostPublisherProgress(userId, postId) {
   }
 }
 
-export async function acceptPostPublisherRequest(publisherId, requestId, { platformAccountId } = {}) {
+async function getPublisherMaxAccounts() {
+  try {
+    const row = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', ['publisher_max_accounts_per_request'])
+    if (!row) return 5
+    const v = typeof row.config_value === 'string' ? JSON.parse(row.config_value) : row.config_value
+    const n = Number(v)
+    if (!Number.isFinite(n) || n < 1 || n > 10) return 5
+    return Math.floor(n)
+  } catch { return 5 }
+}
+
+export async function acceptPostPublisherRequest(publisherId, requestId, { platformAccountIds, platformAccountId } = {}) {
   const request = await repo.findPostPublisherRequestById(requestId)
   if (!request) throw new NotFoundError('Request not found')
   if (request.publisherId !== publisherId) throw new ForbiddenError('Not your request')
@@ -698,13 +774,22 @@ export async function acceptPostPublisherRequest(publisherId, requestId, { platf
     throw new ValidationError('Request is no longer pending')
   }
 
-  if (!platformAccountId) {
-    throw new ValidationError('Select a verified account to publish on')
+  let ids = platformAccountIds
+  if (!ids || !ids.length) {
+    if (platformAccountId) ids = [platformAccountId]
+  }
+  if (!ids || !ids.length) {
+    throw new ValidationError('Select at least one verified account to publish on')
+  }
+  ids = [...new Set(ids.map(String))]
+  const cap = await getPublisherMaxAccounts()
+  if (ids.length > cap) {
+    throw new ValidationError(`Select up to ${cap} accounts`)
   }
   const accounts = await repo.findVerifiedPublisherAccounts(publisherId)
-  const account = accounts.find(a => a.id === platformAccountId)
-  if (!account) {
-    throw new ValidationError('Selected account is not a verified account you own')
+  const allowed = new Set(accounts.map(a => a.id))
+  for (const id of ids) {
+    if (!allowed.has(id)) throw new ValidationError('Selected account is not a verified account you own')
   }
 
   const post = await repo.findPostById(request.postId)
@@ -717,7 +802,7 @@ export async function acceptPostPublisherRequest(publisherId, requestId, { platf
       throw new ValidationError('Publisher capacity reached for this post')
     }
 
-    await repo.updatePostPublisherRequest(requestId, { platformAccountId })
+    await repo.updatePostPublisherRequest(requestId, { platformAccountIds: ids })
     await repo.updatePostPublisherRequestStatusWithGuard(
       requestId,
       PUBLISHER_REQUEST_STATUS.ACCEPTED,
@@ -800,6 +885,10 @@ export async function goLiveForFilledPost(postId) {
     throw new ValidationError('Post must be in awaiting_publishers status')
   }
 
+  const scheduledAtRaw = post.scheduledAt
+  const scheduledAt = scheduledAtRaw ? new Date(scheduledAtRaw) : null
+  const isFutureSchedule = scheduledAt && scheduledAt.getTime() > Date.now()
+
   await transaction(async () => {
     await repo.lockPostById(postId)
     const accepted = await repo.findAcceptedPostPublisherRequests(postId)
@@ -808,19 +897,20 @@ export async function goLiveForFilledPost(postId) {
     }
 
     for (const ar of accepted) {
-      if (!ar.platformAccountId) continue
-      await repo.createPublisherTarget(postId, ar.id, ar.platformAccountId)
+      const ids = ar.platformAccountIds?.length ? ar.platformAccountIds : (ar.platformAccountId ? [ar.platformAccountId] : [])
+      for (const accountId of [...new Set(ids)]) {
+        if (!accountId) continue
+        await repo.createPublisherTarget(postId, ar.id, accountId)
+      }
     }
 
-    const scheduledAt = post.scheduledAt ? new Date(post.scheduledAt) : null
-    const isFutureSchedule = scheduledAt && scheduledAt.getTime() > Date.now()
     const afterStatus = isFutureSchedule ? POST_STATUS.SCHEDULED : POST_STATUS.RUNNING
     await repo.updatePostWithStatusGuard(postId, { status: afterStatus }, POST_STATUS.AWAITING_PUBLISHERS)
     await repo.createReviewLog(postId, null, REVIEW_ACTIONS.SUBMITTED, POST_STATUS.AWAITING_PUBLISHERS,
       `Publisher slots filled — post ${afterStatus === POST_STATUS.RUNNING ? 'is now running' : 'scheduled'}`)
   })
 
-  await queuePostPublish(postId)
+  await queuePostPublish(postId, isFutureSchedule ? scheduledAtRaw : null)
   return repo.findPostById(postId)
 }
 
@@ -1010,8 +1100,15 @@ async function verifyInstagramPublication(target, message, postType, mediaUrl, r
     const actualCaption = `${media.caption || ''}`
     const wantedCaption = candidate.message.trim()
     const captionMatch = wantedCaption.length > 0 && actualCaption.trim() === wantedCaption
-    const typeMatch = postType === 'reel' ? media.media_type === 'VIDEO' || media.media_type === 'REELS' : media.media_type !== 'VIDEO'
-    matches.push({ media, captionMatch, typeMatch, score: (captionMatch ? 2 : 0) + (typeMatch ? 1 : 0) })
+    const typeMatch = postType === 'reel'
+      ? media.media_type === 'VIDEO' || media.media_type === 'REELS'
+      : postType === 'story'
+        ? media.media_type === 'VIDEO' || media.media_type === 'STORIES'
+        : media.media_type !== 'VIDEO'
+    const score = postType === 'story'
+      ? (typeMatch ? 2 : 0) + (captionMatch ? 1 : 0)
+      : (captionMatch ? 2 : 0) + (typeMatch ? 1 : 0)
+    matches.push({ media, captionMatch, typeMatch, score })
   }
   const high = matches.filter(m => m.score >= 2)
   if (high.length === 1) {
@@ -1409,7 +1506,8 @@ async function fbReelFinish(post, target, pageId, accessToken, attempts) {
   } catch (err) {
     return reelFailure(target, err, 'finish', attempts)
   }
-  if (finished?.post_id) return reelPublished(target, finished.post_id)
+  const publishedId = finished?.video_id || (finished?.post_id ? qualifyFbPostId(pageId, finished.post_id) : null)
+  if (publishedId) return reelPublished(target, publishedId)
   const ok = await repo.transitionPostTargetState(target.id, [POST_TARGET_PUBLISH_STATE.READY], POST_TARGET_PUBLISH_STATE.VERIFYING, {
     error: null,
     lastMetaStatus: 'finish_accepted',
@@ -1489,6 +1587,10 @@ export async function fbReelJob(postId, targetId, payload = {}) {
   const accessToken = target.accessToken
   if (!pageId || !accessToken) return reelPermanent(target, 'Facebook page token is missing for target account', 'setup')
 
+  if (isRateLimited(tokenKeyFor(accessToken))) {
+    return { requeueAfterSeconds: 30, attempts: 0 }
+  }
+
   switch (target.publishState) {
     case POST_TARGET_PUBLISH_STATE.NONE:
       return fbReelAllocate(post, target, pageId, accessToken, attempts)
@@ -1510,6 +1612,259 @@ export async function fbReelJob(postId, targetId, payload = {}) {
   }
 }
 
+export const igVideoState = {
+  pollSeconds: Number(process.env.POST_IG_POLL_SECONDS) || 5,
+  processingCapMs: Number(process.env.POST_IG_PROCESSING_CAP_MS) || 30 * 60 * 1000,
+  verifyBackoffSeconds: Number(process.env.POST_IG_VERIFY_BACKOFF_SECONDS) || 60,
+  backoffSteps: [5, 15, 30, 60, 120, 300],
+}
+
+const IG_VIDEO_IN_FLIGHT_STATES = [
+  POST_TARGET_PUBLISH_STATE.NONE,
+  POST_TARGET_PUBLISH_STATE.UPLOADING,
+  POST_TARGET_PUBLISH_STATE.PROCESSING,
+  POST_TARGET_PUBLISH_STATE.READY,
+  POST_TARGET_PUBLISH_STATE.RETRYABLE_FAILURE,
+  POST_TARGET_PUBLISH_STATE.RETRY_PENDING,
+  POST_TARGET_PUBLISH_STATE.VERIFYING,
+  POST_TARGET_PUBLISH_STATE.UNKNOWN,
+]
+
+function igBackoffForStep(step) {
+  const steps = igVideoState.backoffSteps
+  return steps[Math.min(Math.max(0, Math.floor(step)), steps.length - 1)]
+}
+
+function igElapsedMs(target) {
+  const startedAt = target.processingStartedAt || target.publishStateChangedAt
+  return startedAt ? Date.now() - new Date(startedAt).getTime() : 0
+}
+
+async function igCleanupContainer(target) {
+  if (!target.containerId || !target.accessToken) return
+  try {
+    await deleteInstagramContainer(target.containerId, target.accessToken)
+  } catch {
+    // best-effort cleanup — never mask the original error
+  }
+  await repo.clearPostTargetContainer(target.id)
+}
+
+async function igContainerUnknown(target, message, step) {
+  await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.UNKNOWN, {
+    status: POST_TARGET_STATUS.FAILED,
+    error: message,
+    containerId: null,
+    unknownSince: nowString(),
+    lastOperation: step,
+    lastOperationAt: nowString(),
+  })
+  await refreshPostStatus(target.postId)
+  try {
+    await repo.requeueAutoJob(target.postId, POST_JOB_TYPES.VERIFY, {}, { entityType: 'post' })
+  } catch {
+    // verify job already queued or running
+  }
+  return { done: true }
+}
+
+async function igContainerPermanent(target, message, step) {
+  await igCleanupContainer(target)
+  await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.PERMANENT_FAILURE, {
+    status: POST_TARGET_STATUS.FAILED,
+    error: message,
+    containerId: null,
+    lastOperation: step,
+    lastOperationAt: nowString(),
+  })
+  await syncPublisherRequestOnPost({ ...target, status: POST_TARGET_STATUS.FAILED })
+  await refreshPostStatus(target.postId)
+  return { done: true }
+}
+
+async function igContainerFailure(target, err, step, attempts) {
+  const { kind } = await classifyPublishError(err)
+  const message = err?.message || String(err)
+  if (kind === 'permanent') {
+    return igContainerPermanent(target, message, step)
+  }
+  if (kind === 'ambiguous') {
+    await igCleanupContainer(target)
+    return igContainerUnknown(target, message, step)
+  }
+  await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.RETRYABLE_FAILURE, {
+    status: POST_TARGET_STATUS.FAILED,
+    error: message,
+    lastOperation: step,
+    lastOperationAt: nowString(),
+  })
+  await refreshPostStatus(target.postId)
+  return { requeueAfterSeconds: igBackoffForStep(attempts + 1), attempts: attempts + 1 }
+}
+
+async function igContainerPublish(post, target, igId, product, attempts) {
+  let published
+  try {
+    published = await publishInstagramMedia(igId, target.containerId, target.accessToken)
+  } catch (err) {
+    const detail = extractMetaError(err)
+    const notReady = err?.metaErrorCode === 9007 || detail?.code === 9007 || (err?.metaHttpStatus != null && err.metaHttpStatus >= 500)
+    if (notReady) {
+      await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.PROCESSING, {
+        error: err?.message || 'Instagram media container is not ready yet',
+        lastOperation: 'publish_wait',
+        lastOperationAt: nowString(),
+      })
+      return { requeueAfterSeconds: igVideoState.pollSeconds, attempts: 0 }
+    }
+    return igContainerFailure(target, err, 'publish', attempts)
+  }
+  const ok = await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.PUBLISHED, {
+    status: POST_TARGET_STATUS.POSTED,
+    metaObjectId: published?.id || target.containerId,
+    containerId: null,
+    postedAt: nowString(),
+    error: null,
+    lastMetaStatus: 'published',
+    lastOperation: 'published',
+    lastOperationAt: nowString(),
+  })
+  if (!ok) return { requeueAfterSeconds: 15, attempts: 0 }
+  await syncPublisherRequestOnPost({ ...target, status: POST_TARGET_STATUS.POSTED })
+  await refreshPostStatus(target.postId)
+  return { done: true }
+}
+
+async function igContainerStatus(post, target, igId, product, attempts) {
+  let status
+  try {
+    status = await getContainerStatus(target.containerId, target.accessToken)
+  } catch (err) {
+    const detail = extractMetaError(err)
+    if (detail?.code === 100) {
+      await repo.clearPostTargetContainer(target.id)
+      return igContainerCreate(post, { ...target, containerId: null }, igId, product, attempts)
+    }
+    return igContainerFailure(target, err, 'status', attempts)
+  }
+  const code = status?.status_code
+  if (code === 'ERROR') {
+    const detail = status?.status?.error?.message || status?.status?.error || status?.status?.message || 'Instagram media container failed'
+    return igContainerPermanent(target, `Instagram media container failed: ${detail}`, 'status')
+  }
+  if (code === 'EXPIRED') {
+    await repo.clearPostTargetContainer(target.id)
+    return igContainerCreate(post, { ...target, containerId: null }, igId, product, attempts)
+  }
+  if (code === 'FINISHED' || code === 'PUBLISHED') {
+    const ok = await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.READY, {
+      error: null,
+      lastMetaStatus: 'container_ready',
+      lastOperation: 'status',
+      lastOperationAt: nowString(),
+    })
+    if (!ok) return { requeueAfterSeconds: 15, attempts: 0 }
+    return igContainerPublish(post, { ...target, publishState: POST_TARGET_PUBLISH_STATE.READY }, igId, product, attempts)
+  }
+  if (igElapsedMs(target) >= igVideoState.processingCapMs) {
+    const err = new Error('Timed out waiting for Instagram to process the media container')
+    err.metaAmbiguous = true
+    return igContainerFailure(target, err, 'processing_cap', attempts)
+  }
+  const ok = await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.PROCESSING, {
+    error: null,
+    processingStartedAt: target.processingStartedAt || nowString(),
+    lastMetaStatus: 'processing',
+    lastOperation: 'status',
+    lastOperationAt: nowString(),
+  })
+  if (!ok) return { requeueAfterSeconds: 15, attempts: 0 }
+  return { requeueAfterSeconds: igVideoState.pollSeconds, attempts: 0 }
+}
+
+async function igContainerCreate(post, target, igId, product, attempts) {
+  if (!post.mediaUrl) {
+    return igContainerPermanent(target, `Instagram ${product}s require a media URL`, 'create')
+  }
+  let container
+  try {
+    if (product === 'story') {
+      container = await createInstagramStory(igId, post.mediaUrl, target.accessToken, { videoUrl: post.mediaUrl })
+    } else {
+      container = await createInstagramMedia(igId, post.mediaUrl, buildPostMessage(post), target.accessToken, {
+        mediaType: 'REELS',
+        videoUrl: post.mediaUrl,
+      })
+    }
+  } catch (err) {
+    return igContainerFailure(target, err, 'create', attempts)
+  }
+  if (!container?.id) {
+    return igContainerPermanent(target, 'Instagram media container creation returned no id', 'create')
+  }
+  const ok = await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.UPLOADING, {
+    error: null,
+    containerId: container.id,
+    lastMetaStatus: 'container_created',
+    lastOperation: 'create',
+    lastOperationAt: nowString(),
+  })
+  if (!ok) {
+    await cleanupOrphanOnPublishFailure(container.id, target.accessToken)
+    return { requeueAfterSeconds: 15, attempts: 0 }
+  }
+  return { requeueAfterSeconds: igVideoState.pollSeconds, attempts: 0 }
+}
+
+async function igVideoJob(postId, targetId, payload = {}, product = 'reel') {
+  if (!postId || !targetId) return { done: true }
+  const attempts = Number(payload?.attempts) || 0
+  const post = await repo.findPostById(postId)
+  if (!post) throw new NotFoundError('Post not found')
+  if (![POST_TYPES.REEL, POST_TYPES.STORY].includes(post.type)) return { done: true }
+
+  const target = await repo.findPostTargetById(targetId)
+  if (!target || target.platformCode !== 'instagram') return { done: true }
+
+  if ([POST_STATUS.COMPLETED, POST_STATUS.CANCELLED].includes(post.status)) {
+    if (target.containerId) await igCleanupContainer(target)
+    return { done: true }
+  }
+  if (target.status === POST_TARGET_STATUS.POSTED) return { done: true }
+  if ([POST_TARGET_PUBLISH_STATE.PUBLISHED, POST_TARGET_PUBLISH_STATE.PERMANENT_FAILURE, POST_TARGET_PUBLISH_STATE.MANUAL_REVIEW].includes(target.publishState)) {
+    return { done: true }
+  }
+  if ([POST_TARGET_PUBLISH_STATE.UNKNOWN, POST_TARGET_PUBLISH_STATE.VERIFYING].includes(target.publishState)) {
+    return { done: true }
+  }
+
+  const igId = target.igBusinessAccountId || target.platformUserId
+  const accessToken = target.accessToken
+  if (!igId || !accessToken) {
+    return igContainerPermanent(target, 'Instagram business account or token is missing for target account', 'setup')
+  }
+
+  if (isRateLimited(tokenKeyFor(accessToken))) {
+    return { requeueAfterSeconds: 30, attempts: 0 }
+  }
+
+  if (target.containerId) {
+    if (target.publishState === POST_TARGET_PUBLISH_STATE.READY) {
+      return igContainerPublish(post, target, igId, product, attempts)
+    }
+    return igContainerStatus(post, target, igId, product, attempts)
+  }
+  return igContainerCreate(post, target, igId, product, attempts)
+}
+
+export async function igReelJob(postId, targetId, payload = {}) {
+  return igVideoJob(postId, targetId, payload, 'reel')
+}
+
+export async function igVideoStoryJob(postId, targetId, payload = {}) {
+  return igVideoJob(postId, targetId, payload, 'story')
+}
+
 export async function publishPostJob(postId) {
   const post = await repo.findPostById(postId)
   if (!post) throw new NotFoundError('Post not found')
@@ -1517,6 +1872,18 @@ export async function publishPostJob(postId) {
   if ([POST_STATUS.COMPLETED, POST_STATUS.CANCELLED].includes(post.status)) return post
   if (![POST_STATUS.APPROVED, POST_STATUS.SCHEDULED, POST_STATUS.RUNNING, POST_STATUS.FAILED].includes(post.status)) {
     throw new ValidationError(`Post cannot be published in ${post.status} status`)
+  }
+
+  if (post.scheduledAt) {
+    const schedMs = new Date(post.scheduledAt).getTime()
+    if (Number.isFinite(schedMs) && schedMs > Date.now() + 60_000) {
+      if (post.status !== POST_STATUS.SCHEDULED) {
+        await repo.updatePostWithStatusGuard(postId, { status: POST_STATUS.SCHEDULED }, post.status)
+        await repo.createReviewLog(postId, null, REVIEW_ACTIONS.SUBMITTED, post.status, `Post scheduled for ${post.scheduledAt}`)
+      }
+      const seconds = Math.ceil((schedMs - Date.now()) / 1000)
+      return { requeueAfterSeconds: Math.max(seconds, 60), scheduled: true }
+    }
   }
 
   const targets = await repo.findPostTargetsByPostId(postId)
@@ -1535,15 +1902,11 @@ export async function publishPostJob(postId) {
     return repo.findPostById(postId)
   }
 
-  const isReelTarget = t => t.platformCode === 'facebook' && post.type === POST_TYPES.REEL
-  const reelTargets = actionable.filter(isReelTarget)
-  const directTargets = actionable.filter(t => !isReelTarget(t))
-
   const message = buildPostMessage(post)
   let successCount = 0
   let firstError = null
   let needsVerify = false
-  let reelInFlight = 0
+  let jobInFlight = 0
 
   let mediaErrorIds = new Set()
   let mediaByTarget = {}
@@ -1555,9 +1918,17 @@ export async function publishPostJob(postId) {
     mediaErrorMessage = partition.message
   }
 
+  const isFbReelTarget = t => t.platformCode === 'facebook' && post.type === POST_TYPES.REEL
+  const isIgVideoTarget = t => t.platformCode === 'instagram' && (
+    post.type === POST_TYPES.REEL ||
+    (post.type === POST_TYPES.STORY && mediaIsVideoForTarget(post, t, mediaByTarget))
+  )
+  const jobTargets = actionable.filter(t => isFbReelTarget(t) || isIgVideoTarget(t))
+  const directTargets = actionable.filter(t => !isFbReelTarget(t) && !isIgVideoTarget(t))
+
   const mediaError = mediaErrorMessage || 'Media failed publish-mode validation'
 
-  for (const target of reelTargets) {
+  for (const target of jobTargets) {
     if (mediaErrorIds.has(target.id)) {
       await repo.updatePostTargetStatus(target.id, {
         status: POST_TARGET_STATUS.FAILED,
@@ -1569,12 +1940,19 @@ export async function publishPostJob(postId) {
     }
     if (target.publishState === POST_TARGET_PUBLISH_STATE.PERMANENT_FAILURE) continue
     if (target.publishState === POST_TARGET_PUBLISH_STATE.PUBLISHED) continue
+    const isIg = target.platformCode === 'instagram'
+    const jobType = isIg
+      ? (post.type === POST_TYPES.REEL ? POST_JOB_TYPES.IG_REEL : POST_JOB_TYPES.IG_STORY)
+      : POST_JOB_TYPES.FB_REEL
+    const runKey = isIg
+      ? (post.type === POST_TYPES.REEL ? `ig_reel:${target.id}` : `ig_story:${target.id}`)
+      : `fb_reel:${target.id}`
     try {
-      await enqueueReelJob(POST_JOB_TYPES.FB_REEL, `fb_reel:${target.id}`, { postId, targetId: target.id })
+      await enqueueReelJob(jobType, runKey, { postId, targetId: target.id })
     } catch {
       // run_key unique already guarantees a single queued/running execution
     }
-    reelInFlight += 1
+    jobInFlight += 1
   }
 
   for (const target of directTargets) {
@@ -1601,6 +1979,11 @@ export async function publishPostJob(postId) {
       }
     }
     try {
+      if (isRateLimited(tokenKeyFor(target.accessToken))) {
+        const err = new Error('Meta API rate limited for this account, retrying shortly')
+        err.metaHttpStatus = 429
+        throw err
+      }
       await setPublishState(target.id, POST_TARGET_PUBLISH_STATE.PUBLISHING)
       let objectId
       if (target.platformCode === 'instagram') {
@@ -1679,7 +2062,7 @@ export async function publishPostJob(postId) {
       error: null,
     }, previousStatus)
     await repo.createReviewLog(postId, null, REVIEW_ACTIONS.SUBMITTED, previousStatus, 'Post published to all targets')
-  } else if (successCount > 0 || needsVerify || verifyPending.length > 0 || reelInFlight > 0) {
+  } else if (successCount > 0 || needsVerify || verifyPending.length > 0 || jobInFlight > 0) {
     const previousStatus = post.status
     await repo.updatePostWithStatusGuard(postId, {
       status: POST_STATUS.RUNNING,
@@ -1688,7 +2071,7 @@ export async function publishPostJob(postId) {
     const notes = []
     if (needsVerify) notes.push('awaiting verification on some targets')
     if (verifyPending.length > 0) notes.push(`${verifyPending.length} target(s) pending`)
-    if (reelInFlight > 0) notes.push(`${reelInFlight} reel target(s) publishing in background`)
+    if (jobInFlight > 0) notes.push(`${jobInFlight} video target(s) publishing in background`)
     await repo.createReviewLog(postId, null, REVIEW_ACTIONS.SUBMITTED, previousStatus,
       `Post published to ${successCount} target(s) — ${failed.length} failed${notes.length ? ` (${notes.join(', ')})` : ''}`)
   } else {
@@ -1728,10 +2111,34 @@ export async function syncPostEngagementJob(postId) {
   const synced = []
   for (const target of posted) {
     const platform = target.platformCode === 'facebook' ? 'facebook' : 'instagram'
+    if (isRateLimited(tokenKeyFor(target.accessToken))) {
+      await repo.upsertPostEngagement(target.id, postId, {
+        statDate,
+        mediaType: null,
+        permalink: null,
+        likes: 0,
+        comments: 0,
+        saved: 0,
+        shares: 0,
+        views: 0,
+        reach: 0,
+        interactions: 0,
+        impressions: 0,
+        tapsForward: 0,
+        tapsBack: 0,
+        exits: 0,
+        replies: 0,
+        raw: {},
+        commentsJson: [],
+        error: 'Meta rate limited — skipped this cycle',
+      })
+      await repo.stampPostEngagementSync(target.id)
+      continue
+    }
     try {
       const systemToken = process.env.META_SYSTEM_USER_TOKEN
-      const preferred = systemToken || target.accessToken
-      const fallback = systemToken ? target.accessToken : null
+      const preferred = platform === 'facebook' ? target.accessToken : (systemToken || target.accessToken)
+      const fallback = platform === 'facebook' ? null : (systemToken ? target.accessToken : null)
       let engagement
       try {
         engagement = await getMediaEngagement(target.metaObjectId, preferred, { mediaKind, platform })
@@ -1750,6 +2157,11 @@ export async function syncPostEngagementJob(postId) {
         views: engagement.insights.views || 0,
         reach: engagement.insights.reach || 0,
         interactions: engagement.insights.total_interactions || 0,
+        impressions: engagement.insights.impressions || 0,
+        tapsForward: engagement.insights.taps_forward || 0,
+        tapsBack: engagement.insights.taps_back || 0,
+        exits: engagement.insights.exits || 0,
+        replies: engagement.insights.replies || 0,
         raw: engagement,
         commentsJson: engagement.comments,
         error: null,
@@ -1768,6 +2180,11 @@ export async function syncPostEngagementJob(postId) {
         views: 0,
         reach: 0,
         interactions: 0,
+        impressions: 0,
+        tapsForward: 0,
+        tapsBack: 0,
+        exits: 0,
+        replies: 0,
         raw: {},
         commentsJson: [],
         error: err?.message || String(err),
@@ -1809,6 +2226,7 @@ export async function getPostEngagement(userId, postId, query = {}, { skipOwners
   return {
     cached: true,
     postId,
+    postType: post.type,
     lastSyncAt: rows.length ? rows[rows.length - 1].lastEngagementSyncAt : null,
     targets: [...byTarget.values()].map(t => ({
       ...t,
@@ -1853,5 +2271,53 @@ export async function cleanupOrphanContainers() {
       }
     }
   }
+
+  const staleMinutes = Math.ceil(igVideoState.processingCapMs / 60000) + 10
+  const stale = await repo.findStaleIgContainers(staleMinutes)
+  for (const target of stale) {
+    if (!target.accessToken) {
+      results.skipped += 1
+      continue
+    }
+    results.checked += 1
+    let state
+    try {
+      state = await getContainerStatus(target.containerId, target.accessToken)
+    } catch {
+      results.skipped += 1
+      continue
+    }
+    const isOrphan =
+      state.status_code === 'FINISHED' || state.status_code === 'ERROR' || state.status_code === 'EXPIRED'
+    if (!isOrphan) {
+      results.kept += 1
+      continue
+    }
+    try {
+      await deleteInstagramContainer(target.containerId, target.accessToken)
+      await repo.clearPostTargetContainer(target.id)
+      results.deleted += 1
+    } catch (err) {
+      const detail = extractMetaError(err)
+      if (detail?.code === 100) {
+        await repo.clearPostTargetContainer(target.id)
+        results.deleted += 1
+      } else {
+        results.skipped += 1
+      }
+    }
+  }
   return results
+}
+
+export async function watchdogIgVideoTargets() {
+  const targets = await repo.findInFlightIgTargetsWithoutJob([POST_JOB_TYPES.IG_REEL, POST_JOB_TYPES.IG_STORY])
+  const reenqueued = []
+  for (const target of targets) {
+    const jobType = target.postType === POST_TYPES.STORY ? POST_JOB_TYPES.IG_STORY : POST_JOB_TYPES.IG_REEL
+    const runKey = `${jobType === POST_JOB_TYPES.IG_STORY ? 'ig_story' : 'ig_reel'}:${target.id}`
+    const enqueued = await enqueueReelJob(jobType, runKey, { postId: target.postId, targetId: target.id })
+    if (enqueued) reenqueued.push(target.id)
+  }
+  return { reenqueued }
 }

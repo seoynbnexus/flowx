@@ -85,10 +85,9 @@ async function start() {
     await pool.getConnection();
     logger.info('Database connected');
 
-    const { startCampaignJobWorker, startMetaSyncScheduler } = await import('./src/modules/campaigns/campaign.jobs.js');
-    startCampaignJobWorker();
-    startMetaSyncScheduler();
-    logger.info('Campaign job worker + Meta sync scheduler started');
+    const { startBackgroundWorkers } = await import('./src/modules/campaigns/campaign.jobs.js');
+    const background = startBackgroundWorkers();
+    logger.info(background, 'Campaign job worker + Meta sync scheduler started');
 
     app.listen(PORT, () => {
       logger.info({ port: PORT }, 'FlowX API listening');

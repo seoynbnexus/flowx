@@ -1,12 +1,36 @@
 import { META_CONFIG } from './meta-oauth.config.js';
 import { apiFetch } from '../utils/api-logger.js'
+import { recordUsage, setCooldown, tokenKeyFor } from './meta-rate-limiter.js'
+
+const RATE_LIMIT_CODES = new Set([80004, 613, 4, 17])
+const RATE_LIMIT_SUBCODE = 2446079
+
+async function maybeCooldown(res, errorText, key) {
+  if (res.status === 429) {
+    setCooldown(120, key)
+    return
+  }
+  let parsed = null
+  try {
+    parsed = JSON.parse(errorText)
+  } catch {
+    return
+  }
+  const err = parsed?.error
+  if (err && (RATE_LIMIT_CODES.has(Number(err.code)) || Number(err.error_subcode) === RATE_LIMIT_SUBCODE)) {
+    setCooldown(120, key)
+  }
+}
 
 async function graphGet(path, params = {}) {
   const query = new URLSearchParams({ ...params, access_token: params.access_token });
   const url = `${META_CONFIG.graphUrl}/${path}?${query.toString()}`;
+  const key = tokenKeyFor(params.access_token)
   const res = await apiFetch(url, {}, { service: 'meta_graph', operation: path })
+  recordUsage(res.headers, key)
   if (!res.ok) {
     const error = await res.text();
+    await maybeCooldown(res, error, key)
     throw new Error(`Graph API GET ${path} failed: ${error}`);
   }
   return res.json();

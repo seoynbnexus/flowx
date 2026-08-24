@@ -1,5 +1,6 @@
 import { query, queryOne, transaction } from '../../../shared/database/connection.js'
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js'
+import { toMySqlTimestamp, fromMySqlTimestamp } from '../../../shared/utils/date.utils.js'
 import { encrypt, decrypt } from '../../../shared/utils/crypto.utils.js'
 import { ValidationError } from '../../../shared/errors/AppError.js'
 
@@ -13,7 +14,7 @@ function mapCampaignRow(row) {
     name: row.name,
     type: row.type,
     status: row.status,
-    scheduledAt: row.scheduled_at,
+    scheduledAt: fromMySqlTimestamp(row.scheduled_at),
     publisherCount: row.publisher_count,
     coinsPerPublisher: row.coins_per_publisher ? Number(row.coins_per_publisher) : null,
     escrowAmount: Number(row.escrow_amount),
@@ -141,7 +142,7 @@ export async function createCampaign(id, clientId, data) {
       data.categoryId ? uuidToBuffer(data.categoryId) : null,
       data.name,
       data.type || 'post',
-      data.scheduledAt || null,
+      toMySqlTimestamp(data.scheduledAt),
       data.publisherCount || null,
       data.coinsPerPublisher || null,
       data.runOnPublishers ? 1 : 0,
@@ -238,7 +239,7 @@ export async function updateCampaign(id, data) {
   if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name) }
   if (data.type !== undefined) { fields.push('type = ?'); params.push(data.type) }
   if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(data.categoryId ? uuidToBuffer(data.categoryId) : null) }
-  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(data.scheduledAt) }
+  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(toMySqlTimestamp(data.scheduledAt)) }
   if (data.publisherCount !== undefined) { fields.push('publisher_count = ?'); params.push(data.publisherCount) }
   if (data.coinsPerPublisher !== undefined) { fields.push('coins_per_publisher = ?'); params.push(data.coinsPerPublisher) }
   if (data.runOnPublishers !== undefined) { fields.push('run_on_publishers = ?'); params.push(data.runOnPublishers ? 1 : 0) }
@@ -274,7 +275,7 @@ export async function updateCampaignWithStatusGuard(id, data, expectedStatus) {
   if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name) }
   if (data.type !== undefined) { fields.push('type = ?'); params.push(data.type) }
   if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(data.categoryId ? uuidToBuffer(data.categoryId) : null) }
-  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(data.scheduledAt) }
+  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(toMySqlTimestamp(data.scheduledAt)) }
   if (data.publisherCount !== undefined) { fields.push('publisher_count = ?'); params.push(data.publisherCount) }
   if (data.coinsPerPublisher !== undefined) { fields.push('coins_per_publisher = ?'); params.push(data.coinsPerPublisher) }
   if (data.runOnPublishers !== undefined) { fields.push('run_on_publishers = ?'); params.push(data.runOnPublishers ? 1 : 0) }
@@ -552,7 +553,7 @@ export async function findPublisherRequestsByPublisherId(publisherId, { page = 1
       campaignName: r.campaign_name,
       campaignType: r.campaign_type,
       campaignStatus: r.campaign_status,
-      scheduledAt: r.scheduled_at,
+      scheduledAt: fromMySqlTimestamp(r.scheduled_at),
       clientEmail: r.client_email,
       clientFirstName: r.client_first_name,
     })),
@@ -803,7 +804,7 @@ export async function findDueScheduledCampaigns() {
     id: bufferToUuid(r.id),
     clientId: bufferToUuid(r.client_id),
     name: r.name,
-    scheduledAt: r.scheduled_at,
+    scheduledAt: fromMySqlTimestamp(r.scheduled_at),
   }))
 }
 
@@ -930,6 +931,43 @@ export async function requeueStaleCampaignJobs(minutes = 10) {
      WHERE status = 'running' AND started_at IS NOT NULL AND started_at < NOW() - INTERVAL ? MINUTE`,
     [minutes]
   )
+}
+
+export async function purgeTerminalJobs(days = 7) {
+  const result = await query(
+    `DELETE FROM campaign_jobs WHERE status IN ('done', 'dead') AND finished_at < NOW() - INTERVAL ? DAY`,
+    [Math.max(1, Math.floor(Number(days)))]
+  )
+  return { removed: result.affectedRows }
+}
+
+export async function purgeOldEngagementRows(days = 90) {
+  const result = await query(
+    'DELETE FROM post_engagement_daily WHERE created_at < NOW() - INTERVAL ? DAY',
+    [Math.max(1, Math.floor(Number(days)))]
+  )
+  return { removed: result.affectedRows }
+}
+
+export async function purgeOldWebhookEvents(days = 90) {
+  const result = await query(
+    'DELETE FROM meta_webhook_events WHERE created_at < NOW() - INTERVAL ? DAY',
+    [Math.max(1, Math.floor(Number(days)))]
+  )
+  return { removed: result.affectedRows }
+}
+
+export async function countDeadJobs() {
+  const row = await queryOne("SELECT COUNT(*) as count FROM campaign_jobs WHERE status = 'dead'")
+  return row.count
+}
+
+export async function oldestQueuedJob() {
+  const row = await queryOne(
+    `SELECT created_at, run_after FROM campaign_jobs WHERE status = 'queued' ORDER BY run_after ASC LIMIT 1`
+  )
+  if (!row) return null
+  return { createdAt: row.created_at, runAfter: row.run_after }
 }
 
 function mapDailyStatRow(row) {
@@ -1107,7 +1145,7 @@ export async function findDueInsightsBatch({ stalenessSeconds = 3600, limit = 10
   return rows.map(r => ({
     campaignId: bufferToUuid(r.campaign_id),
     status: r.status,
-    scheduledAt: r.scheduled_at,
+    scheduledAt: fromMySqlTimestamp(r.scheduled_at),
     lastInsightsSyncAt: r.last_insights_sync_at,
     fbObjectId: r.fb_object_id,
   }))

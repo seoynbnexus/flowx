@@ -63,6 +63,8 @@ export const POST_JOB_TYPES = {
   VERIFY: 'post_verify',
   SYNC_ENGAGEMENT: 'post_sync_engagement',
   FB_REEL: 'post_fb_reel',
+  IG_REEL: 'post_ig_reel',
+  IG_STORY: 'post_ig_story',
   PUBLISHER_GO_LIVE: 'post_publisher_go_live',
   EXPIRE_PUBLISHER_REQUESTS: 'post_expire_publisher_requests',
 }

@@ -1,6 +1,13 @@
 const DEFAULT_KEY = 'default'
 
+import { createHash } from 'node:crypto'
+
 const state = new Map()
+
+export function tokenKeyFor(accessToken) {
+  if (!accessToken) return undefined
+  return createHash('sha256').update(String(accessToken)).digest('hex').slice(0, 16)
+}
 
 function bucket(key = DEFAULT_KEY) {
   const accountId = key || DEFAULT_KEY
@@ -30,7 +37,10 @@ function parseUsageHeader(header) {
 }
 
 export function recordUsage(headers = {}, accountId) {
-  const merged = { ...parseUsageHeader(headers['x-app-usage']), ...parseUsageHeader(headers['x-ad-account-usage']) }
+  const src = typeof headers.get === 'function'
+    ? { 'x-app-usage': headers.get('x-app-usage'), 'x-ad-account-usage': headers.get('x-ad-account-usage') }
+    : headers
+  const merged = { ...parseUsageHeader(src['x-app-usage']), ...parseUsageHeader(src['x-ad-account-usage']) }
   if (!merged || Object.keys(merged).length === 0) return
   const st = bucket(accountId)
   st.callCount = Number(merged.call_count) || 0

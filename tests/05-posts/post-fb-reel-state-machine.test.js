@@ -7,6 +7,7 @@ import * as postRepo from '../../src/modules/posts/post.repository.js'
 import { enqueueTargetJob, requeueReelJob } from '../../src/modules/campaigns/campaign.repository.js'
 import { query, queryOne } from '../../shared/database/connection.js'
 import { getPool } from '../../shared/database/connection.js'
+import { qualifyFbPostId } from '../../shared/services/meta-ads.service.js'
 
 var metaMocks
 vi.mock('../../shared/services/meta-ads.service.js', async () => {
@@ -131,6 +132,50 @@ describe('facebook reel durable publish state machine', () => {
 
     const detail = await postService.getPost(client.id, postId)
     expect(detail.status).toBe('completed')
+  })
+
+  it('prefers the echoed video_id as meta_object_id when Meta finishes a reel', async () => {
+    const { postId, targetId } = await createApprovedReel()
+    await postService.fbReelJob(postId, targetId, {})
+    metaMocks.getPageReelStatus.mockResolvedValue({ video_status: 'processing' })
+    await postService.fbReelJob(postId, targetId, {})
+    metaMocks.getPageReelStatus.mockResolvedValue({ video_status: 'ready' })
+    await postService.fbReelJob(postId, targetId, {})
+    metaMocks.finishPageReel.mockResolvedValue({ video_id: 'mock_echoed_video', post_id: '98765432', success: true })
+    await postService.fbReelJob(postId, targetId, {})
+    const target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('published')
+    expect(target.metaObjectId).toBe('mock_echoed_video')
+  })
+
+  it('qualifies a bare numeric post_id when Meta finishes without an echoed video_id', async () => {
+    const { postId, targetId } = await createApprovedReel()
+    await postService.fbReelJob(postId, targetId, {})
+    metaMocks.getPageReelStatus.mockResolvedValue({ video_status: 'processing' })
+    await postService.fbReelJob(postId, targetId, {})
+    metaMocks.getPageReelStatus.mockResolvedValue({ video_status: 'ready' })
+    await postService.fbReelJob(postId, targetId, {})
+    metaMocks.finishPageReel.mockResolvedValue({ post_id: '98765432', success: true })
+    await postService.fbReelJob(postId, targetId, {})
+    const target = await postRepo.findPostTargetById(targetId)
+    expect(target.publishState).toBe('published')
+    expect(target.metaObjectId).toBe('fb_reel_sm_98765432')
+  })
+
+  describe('qualifyFbPostId', () => {
+    it('prefixes bare numeric ids with the page id', () => {
+      expect(qualifyFbPostId('123_page', '456')).toBe('123_page_456')
+    })
+    it('leaves already-qualified ids unchanged', () => {
+      expect(qualifyFbPostId('x', '123_456')).toBe('123_456')
+    })
+    it('leaves non-numeric ids untouched', () => {
+      expect(qualifyFbPostId('x', 'mock_fb_reel_post')).toBe('mock_fb_reel_post')
+    })
+    it('handles nullish ids', () => {
+      expect(qualifyFbPostId('x', null)).toBeNull()
+      expect(qualifyFbPostId('x', undefined)).toBeUndefined()
+    })
   })
 
   it('replays a crash at uploaded without re-uploading the media', async () => {

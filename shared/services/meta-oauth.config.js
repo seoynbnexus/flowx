@@ -17,6 +17,8 @@ const SCOPES = [
   'pages_manage_ads',
 ]
 
+if (process.env.META_OAUTH_INSIGHTS_SCOPE === '1') SCOPES.push('read_insights')
+
 const AUTH_URL = `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth`
 const TOKEN_URL = `https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token`
 const GRAPH_URL = `https://graph.facebook.com/${GRAPH_VERSION}`

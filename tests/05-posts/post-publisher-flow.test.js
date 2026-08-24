@@ -245,4 +245,121 @@ describe('post publisher flow', () => {
     const afterWallet = await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(client.id)])
     expect(Number(afterWallet.coins)).toBe(Number(beforeWallet.coins))
   })
+
+  describe('multi-account accept', () => {
+    let pubFbAccount, pubIgAccount, pubFbAccount2
+
+    beforeAll(async () => {
+      pubFbAccount = publisherAccountId
+      pubIgAccount = await addPlatformAccount(publisher.id, {
+        code: 'instagram',
+        platformUserId: 'ppc_ig_pub1',
+        igId: '17841455500000001',
+      })
+      pubFbAccount2 = await addPlatformAccount(publisher.id, { code: 'facebook', platformUserId: 'ppc_fb_pub1b' })
+    })
+
+    afterEach(async () => {
+      await query("DELETE FROM app_config WHERE config_key = 'publisher_max_accounts_per_request'")
+    })
+
+    it('accepts with multiple verified accounts and creates one target per account on go-live', async () => {
+      const postId = await createPublisherPost({ count: 1, coins: 10 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id)
+
+      const accepted = await postService.acceptPostPublisherRequest(publisher.id, mine.id, {
+        platformAccountIds: [pubFbAccount, pubIgAccount],
+      })
+      expect(accepted.platformAccountIds).toEqual(expect.arrayContaining([pubFbAccount, pubIgAccount]))
+      expect(accepted.platformAccountId).toBe(pubFbAccount)
+
+      await drainCampaignJobs()
+      const detail = await postService.getPost(client.id, postId)
+      expect(detail.status).toBe(POST_STATUS.COMPLETED)
+
+      const targets = detail.targets.filter(t => t.platformAccountId === pubFbAccount || t.platformAccountId === pubIgAccount)
+      expect(targets).toHaveLength(2)
+      expect(targets.every(t => t.status === 'posted')).toBe(true)
+
+      const stored = await queryOne(
+        'SELECT platform_account_ids FROM post_publisher_requests WHERE id = ?',
+        [uuidToBuffer(mine.id)]
+      )
+      const idsJson = typeof stored.platform_account_ids === 'string' ? JSON.parse(stored.platform_account_ids) : stored.platform_account_ids
+      expect(idsJson).toContain(pubFbAccount)
+      expect(idsJson).toContain(pubIgAccount)
+    })
+
+    it('deduplicates repeated account ids', async () => {
+      const postId = await createPublisherPost({ count: 1, coins: 10 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id)
+
+      const accepted = await postService.acceptPostPublisherRequest(publisher.id, mine.id, {
+        platformAccountIds: [pubFbAccount, pubFbAccount, pubIgAccount],
+      })
+      expect(accepted.platformAccountIds).toHaveLength(2)
+
+      await drainCampaignJobs()
+      const detail = await postService.getPost(client.id, postId)
+      const targets = detail.targets.filter(t => t.publisherRequestId === mine.id || t.platformAccountId === pubFbAccount || t.platformAccountId === pubIgAccount)
+      expect(targets.filter(t => t.platformAccountId === pubFbAccount)).toHaveLength(1)
+    })
+
+    it('rejects an empty selection', async () => {
+      const postId = await createPublisherPost({ count: 1, coins: 10 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id)
+      await expect(postService.acceptPostPublisherRequest(publisher.id, mine.id, { platformAccountIds: [] }))
+        .rejects.toThrow(/at least one/i)
+    })
+
+    it('rejects selections above the configured cap', async () => {
+      await query(
+        "INSERT INTO app_config (id, config_key, config_value, is_public, description, version) VALUES (?, 'publisher_max_accounts_per_request', ?, 1, 'test', 1)",
+        [uuidToBuffer(generateUuid()), JSON.stringify(1)]
+      )
+      const postId = await createPublisherPost({ count: 1, coins: 10 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id)
+      await expect(postService.acceptPostPublisherRequest(publisher.id, mine.id, {
+        platformAccountIds: [pubFbAccount, pubIgAccount],
+      })).rejects.toThrow(/up to 1/i)
+    })
+
+    it('rejects a mix of owned and unowned accounts', async () => {
+      const postId = await createPublisherPost({ count: 1, coins: 10 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id)
+      await expect(postService.acceptPostPublisherRequest(publisher.id, mine.id, {
+        platformAccountIds: [pubFbAccount, publisher2AccountId],
+      })).rejects.toThrow('not a verified account you own')
+    })
+
+    it('pays out once per request regardless of account count', async () => {
+      await query(
+        'INSERT INTO user_wallets (user_id, coins, total_purchased_coins) VALUES (?, 0, 0)',
+        [uuidToBuffer(publisher2.id)]
+      )
+      const postId = await createPublisherPost({ count: 1, coins: 30 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher2.id)
+
+      await postService.acceptPostPublisherRequest(publisher2.id, mine.id, {
+        platformAccountIds: [publisher2AccountId],
+      })
+      await drainCampaignJobs()
+      await postService.completePostPublisherRequest(publisher2.id, mine.id)
+
+      const wallet = await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(publisher2.id)])
+      expect(Number(wallet.coins)).toBe(30)
+    })
+  })
 })

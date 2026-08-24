@@ -24,6 +24,14 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
   return mocks
 })
 
+vi.mock('../../shared/services/meta-graph.service.js', async () => {
+  const actual = await vi.importActual('../../shared/services/meta-graph.service.js')
+  return {
+    ...actual,
+    getInstagramMedia: vi.fn().mockResolvedValue([]),
+  }
+})
+
 const dateTag = Date.now()
 
 async function addPlatformAccount(userId, { code, platformUserId, igId = null }) {
@@ -77,13 +85,25 @@ describe('post publishing', () => {
   async function withFastPolling(fn) {
     const interval = postService.igContainerPoll.intervalMs
     const timeout = postService.igContainerPoll.timeoutMs
+    const pollSeconds = postService.igVideoState.pollSeconds
+    const cap = postService.igVideoState.processingCapMs
+    const verifyBackoff = postService.igVideoState.verifyBackoffSeconds
+    const backoffSteps = postService.igVideoState.backoffSteps
     postService.igContainerPoll.intervalMs = 5
     postService.igContainerPoll.timeoutMs = 500
+    postService.igVideoState.pollSeconds = 0
+    postService.igVideoState.processingCapMs = 1000
+    postService.igVideoState.verifyBackoffSeconds = 0
+    postService.igVideoState.backoffSteps = [0, 0, 0, 0, 0, 0]
     try {
       return await fn()
     } finally {
       postService.igContainerPoll.intervalMs = interval
       postService.igContainerPoll.timeoutMs = timeout
+      postService.igVideoState.pollSeconds = pollSeconds
+      postService.igVideoState.processingCapMs = cap
+      postService.igVideoState.verifyBackoffSeconds = verifyBackoff
+      postService.igVideoState.backoffSteps = backoffSteps
     }
   }
 
@@ -247,18 +267,20 @@ describe('post publishing', () => {
     await postService.submitPost(client.id, post.id)
     await withFastPolling(async () => {
       await postService.approvePost(admin.id, post.id, {})
-      await expect(drainCampaignJobs({ timeoutMs: 4000 })).rejects.toThrow(/timed out/i)
+      await drainCampaignJobs()
     })
 
     const detail = await postService.getPost(client.id, post.id)
     expect(detail.targets[0].status).toBe('failed')
-    expect(detail.targets[0].error).toContain('Timed out waiting for Instagram media container')
+    expect(detail.targets[0].error).toContain('Timed out waiting for Instagram to process the media container')
     expect(metaMocks.publishInstagramMedia).not.toHaveBeenCalled()
-    await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(post.id)])
   })
 
   it('should surface story publish errors instead of marking the target posted', async () => {
-    metaMocks.publishInstagramMedia.mockRejectedValueOnce(new Error('Story publish denied'))
+    const permanent = new Error('Story publish denied')
+    permanent.metaHttpStatus = 400
+    permanent.metaErrorCode = 100
+    metaMocks.publishInstagramMedia.mockRejectedValue(permanent)
     const post = await postService.createPost(client.id, {
       name: 'Denied story',
       type: 'story',
@@ -266,13 +288,14 @@ describe('post publishing', () => {
       targetAccountIds: [igAccountId],
     })
     await postService.submitPost(client.id, post.id)
-    await postService.approvePost(admin.id, post.id, {})
-    await expect(drainCampaignJobs({ timeoutMs: 4000 })).rejects.toThrow(/timed out/i)
+    await withFastPolling(async () => {
+      await postService.approvePost(admin.id, post.id, {})
+      await drainCampaignJobs()
+    })
 
     const detail = await postService.getPost(client.id, post.id)
     expect(detail.targets[0].status).toBe('failed')
     expect(detail.targets[0].error).toContain('Story publish denied')
-    await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(post.id)])
   })
 
   it('should sniff extension-less video URLs for stories', async () => {
@@ -488,15 +511,16 @@ describe('post publishing', () => {
       targetAccountIds: [igAccountId],
     })
     await postService.submitPost(client.id, post.id)
-    await postService.approvePost(admin.id, post.id, {})
-    await expect(drainCampaignJobs({ timeoutMs: 4000 })).rejects.toThrow(/timed out/i)
+    await withFastPolling(async () => {
+      await postService.approvePost(admin.id, post.id, {})
+      await drainCampaignJobs()
+    })
 
     const detail = await postService.getPost(client.id, post.id)
-    expect(detail.status).toBe('approved')
+    expect(detail.status).toBe('failed')
     expect(detail.targets[0].status).toBe('failed')
     expect(detail.targets[0].error).toContain('Video failed to process')
     expect(metaMocks.publishInstagramMedia).not.toHaveBeenCalled()
-    await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(post.id)])
   })
 
   it('should reject a reel with a clear error when media is not a video', async () => {
@@ -536,14 +560,13 @@ describe('post publishing', () => {
     await postService.submitPost(client.id, post.id)
     await withFastPolling(async () => {
       await postService.approvePost(admin.id, post.id, {})
-      await expect(drainCampaignJobs({ timeoutMs: 4000 })).rejects.toThrow(/timed out/i)
+      await drainCampaignJobs()
     })
 
     const detail = await postService.getPost(client.id, post.id)
     expect(detail.targets[0].status).toBe('failed')
-    expect(detail.targets[0].error).toContain('Timed out waiting for Instagram media container')
+    expect(detail.targets[0].error).toContain('Timed out waiting for Instagram to process the media container')
     expect(metaMocks.publishInstagramMedia).not.toHaveBeenCalled()
-    await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(post.id)])
   })
 
   it('should publish extension-less video URLs on Instagram as reels', async () => {

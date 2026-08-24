@@ -6,9 +6,14 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000'
 export async function createAndSend(userId, type, title, body, data = null, userEmail = null, userFirstName = null) {
   await repo.createNotification(userId, type, title, body, data)
 
-  if (userEmail && type === 'new_campaign_request') {
+  if (userEmail) {
     try {
-      await sendNewCampaignRequestEmail(userEmail, userFirstName || '', data?.campaignName || 'Campaign', data?.coinsOffered || 0, FRONTEND_URL)
+      if (type === 'new_campaign_request') {
+        await sendNewCampaignRequestEmail(userEmail, userFirstName || '', data?.campaignName || data?.postName || 'Campaign', data?.coinsOffered || 0, FRONTEND_URL)
+      } else if (type === 'new_post_request') {
+        const { sendNewPostRequestEmail } = await import('../../../shared/mailer/mailer.js')
+        await sendNewPostRequestEmail(userEmail, userFirstName || '', data?.postName || data?.campaignName || 'Post', data?.coinsOffered || 0, FRONTEND_URL)
+      }
     } catch (err) {
       console.warn(`[notifications] Email send failed for ${userEmail}: ${err.message}`)
     }
@@ -16,7 +21,11 @@ export async function createAndSend(userId, type, title, body, data = null, user
 }
 
 export async function getUnreadCount(userId) {
-  return repo.getUnreadCount(userId)
+  return repo.getUnreadCountsByType(userId)
+}
+
+export async function getUnreadCountByType(userId, type) {
+  return repo.getUnreadCount(userId, type)
 }
 
 export async function listNotifications(userId, queryParams) {

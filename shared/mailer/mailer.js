@@ -102,6 +102,16 @@ export async function sendNewCampaignRequestEmail(to, publisherName, campaignNam
   });
 }
 
+export async function sendNewPostRequestEmail(to, publisherName, postName, coinsOffered, frontendUrl) {
+  const link = `${frontendUrl}/publisher/post-requests`
+  await transporter.sendMail({
+    from,
+    to,
+    subject: `New Post Request: ${postName}`,
+    html: newCampaignRequestHtml(publisherName, postName, coinsOffered, link).replace('New Campaign Request', 'New Post Request'),
+  });
+}
+
 export async function sendPublisherRepublishEmail(to, publisherName, campaignName, frontendUrl) {
   const link = `${frontendUrl}/publisher/requests`
   await transporter.sendMail({

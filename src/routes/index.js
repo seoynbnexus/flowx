@@ -12,6 +12,7 @@ import adminIdentityRoutes from '../modules/identity-documents/admin.routes.js';
 import identityDocumentTypeRoutes from '../modules/identity-document-types/identity-document-types.routes.js';
 import swaggerMiddleware from '../docs/swagger.js';
 import configRoutes from '../modules/config/config.routes.js';
+import adminConfigRoutes from '../modules/config/admin-features.routes.js';
 import aiRoutes from '../modules/ai/ai.routes.js';
 import adminAiRoutes from '../modules/ai/admin.routes.js';
 import adminAnalyticsRoutes from '../modules/analytics/admin.routes.js';
@@ -29,6 +30,7 @@ import adminPostRoutes from '../modules/posts/admin.routes.js';
 import publisherPostRoutes from '../modules/posts/publisher-post.routes.js';
 import mediaRoutes from '../modules/media-library/media.routes.js';
 import adminMediaRoutes from '../modules/media-library/admin.routes.js';
+import dashboardRoutes from '../modules/dashboard/dashboard.routes.js';
 
 const router = Router();
 
@@ -61,6 +63,8 @@ router.use('/admin/posts', adminPostRoutes);
 router.use('/publisher', publisherPostRoutes);
 router.use('/media', mediaRoutes);
 router.use('/admin/media', adminMediaRoutes);
+router.use('/admin/config', adminConfigRoutes);
+router.use('/dashboard', dashboardRoutes);
 router.use('/docs', swaggerMiddleware);
 
 router.get('/health', (_req, res) => {

@@ -2,7 +2,9 @@ import { query, queryOne, transaction } from '../../../shared/database/connectio
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js'
 import { decrypt } from '../../../shared/utils/crypto.utils.js'
 import { ValidationError } from '../../../shared/errors/AppError.js'
+import { toMySqlTimestamp, fromMySqlTimestamp } from '../../../shared/utils/date.utils.js'
 import { requeueAutoJob } from '../campaigns/campaign.repository.js'
+export { requeueAutoJob }
 import { POST_JOB_TYPES } from './post.model.js'
 
 function mapPostRow(row) {
@@ -16,7 +18,7 @@ function mapPostRow(row) {
     name: row.name,
     type: row.type,
     status: row.status,
-    scheduledAt: row.scheduled_at,
+    scheduledAt: fromMySqlTimestamp(row.scheduled_at),
     caption: row.caption,
     mediaUrl: row.media_url,
     hashtags: row.hashtags,
@@ -54,6 +56,7 @@ function mapPostTargetRow(row) {
     status: row.status,
     error: row.error || null,
     metaObjectId: row.meta_object_id || null,
+    containerId: row.container_id || null,
     postedAt: row.posted_at,
     publishState: row.publish_state || 'none',
     remoteVideoId: row.remote_video_id || null,
@@ -102,7 +105,7 @@ export async function createPost(id, clientId, data) {
       data.categoryId ? uuidToBuffer(data.categoryId) : null,
       data.name,
       data.type || 'post',
-      data.scheduledAt || null,
+      toMySqlTimestamp(data.scheduledAt),
       data.runOnPublishers ? 1 : 0,
       data.publisherCount || null,
       data.coinsPerPublisher || null,
@@ -197,7 +200,7 @@ export async function updatePost(id, data) {
   if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name) }
   if (data.type !== undefined) { fields.push('type = ?'); params.push(data.type) }
   if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(data.categoryId ? uuidToBuffer(data.categoryId) : null) }
-  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(data.scheduledAt) }
+  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(toMySqlTimestamp(data.scheduledAt)) }
   if (data.runOnPublishers !== undefined) { fields.push('run_on_publishers = ?'); params.push(data.runOnPublishers ? 1 : 0) }
   if (data.publisherCount !== undefined) { fields.push('publisher_count = ?'); params.push(data.publisherCount) }
   if (data.coinsPerPublisher !== undefined) { fields.push('coins_per_publisher = ?'); params.push(data.coinsPerPublisher) }
@@ -235,7 +238,7 @@ export async function updatePostWithStatusGuard(id, data, expectedStatus) {
   if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name) }
   if (data.type !== undefined) { fields.push('type = ?'); params.push(data.type) }
   if (data.categoryId !== undefined) { fields.push('category_id = ?'); params.push(data.categoryId ? uuidToBuffer(data.categoryId) : null) }
-  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(data.scheduledAt) }
+  if (data.scheduledAt !== undefined) { fields.push('scheduled_at = ?'); params.push(toMySqlTimestamp(data.scheduledAt)) }
   if (data.runOnPublishers !== undefined) { fields.push('run_on_publishers = ?'); params.push(data.runOnPublishers ? 1 : 0) }
   if (data.publisherCount !== undefined) { fields.push('publisher_count = ?'); params.push(data.publisherCount) }
   if (data.coinsPerPublisher !== undefined) { fields.push('coins_per_publisher = ?'); params.push(data.coinsPerPublisher) }
@@ -334,6 +337,80 @@ export async function findInstagramTargetsWithMediaIds() {
   }))
 }
 
+export async function findStaleIgContainers(staleMinutes) {
+  const rows = await query(
+    `SELECT pt.id, pt.post_id, pt.container_id, upa.access_token
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pt.container_id IS NOT NULL
+       AND p.code = 'instagram'
+       AND pt.publish_state_changed_at IS NOT NULL
+       AND pt.publish_state_changed_at < NOW() - INTERVAL ? MINUTE
+     ORDER BY pt.created_at ASC`,
+    [String(staleMinutes)]
+  )
+  return rows.map(row => ({
+    id: bufferToUuid(row.id),
+    postId: bufferToUuid(row.post_id),
+    containerId: row.container_id,
+    accessToken: row.access_token ? decrypt(row.access_token) : null,
+  }))
+}
+
+export async function clearPostTargetContainer(id) {
+  await query(
+    `UPDATE post_targets SET container_id = NULL, processing_started_at = NULL, unknown_since = NULL, publish_state_changed_at = NOW() WHERE id = ?`,
+    [uuidToBuffer(id)]
+  )
+}
+
+export async function resetPostTargetForRetry(id) {
+  const result = await query(
+    `UPDATE post_targets SET
+       status = 'pending',
+       error = NULL,
+       meta_object_id = NULL,
+       container_id = NULL,
+       publish_state = 'none',
+       publish_state_changed_at = NOW(),
+       verification_attempts = 0,
+       posted_at = NULL
+     WHERE id = ? AND status != 'posted'`,
+    [uuidToBuffer(id)]
+  )
+  return result.affectedRows > 0
+}
+
+export async function findInFlightIgTargetsWithoutJob(jobTypes) {
+  const placeholders = jobTypes.map(() => '?').join(', ')
+  const rows = await query(
+    `SELECT pt.id, pt.post_id, p.code as platform_code, pt.publish_state, po.type as post_type
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     JOIN posts po ON po.id = pt.post_id
+     WHERE p.code = 'instagram'
+       AND pt.status != 'posted'
+       AND pt.publish_state IN ('none', 'uploading', 'processing', 'ready', 'retryable_failure', 'retry_pending')
+       AND pt.container_id IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM campaign_jobs j
+         WHERE j.job_type IN (${placeholders}) AND j.status IN ('queued', 'running')
+           AND LOWER(REPLACE(JSON_UNQUOTE(JSON_EXTRACT(j.payload, '$.targetId')), '-', '')) = HEX(pt.id)
+       )
+     ORDER BY pt.created_at ASC`,
+    jobTypes
+  )
+  return rows.map(row => ({
+    id: bufferToUuid(row.id),
+    postId: bufferToUuid(row.post_id),
+    platformCode: row.platform_code,
+    publishState: row.publish_state,
+    postType: row.post_type,
+  }))
+}
+
 export async function findPostTargetsByStatus(postId, status) {
   const rows = await query(
     `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,
@@ -399,6 +476,7 @@ export async function updatePostTargetStatus(id, data) {
   if (data.status !== undefined) { fields.push('status = ?'); params.push(data.status) }
   if (data.error !== undefined) { fields.push('error = ?'); params.push(data.error) }
   if (data.metaObjectId !== undefined) { fields.push('meta_object_id = ?'); params.push(data.metaObjectId) }
+  if (data.containerId !== undefined) { fields.push('container_id = ?'); params.push(data.containerId) }
   if (data.postedAt !== undefined) { fields.push('posted_at = ?'); params.push(data.postedAt) }
   if (data.publishState !== undefined) { fields.push('publish_state = ?'); params.push(data.publishState) }
   if (data.remoteVideoId !== undefined) { fields.push('remote_video_id = ?'); params.push(data.remoteVideoId) }
@@ -426,6 +504,7 @@ export async function transitionPostTargetState(id, fromStates, toState, fields 
   if (fields.status !== undefined) { sets.push('status = ?'); params.push(fields.status) }
   if (fields.error !== undefined) { sets.push('error = ?'); params.push(fields.error) }
   if (fields.metaObjectId !== undefined) { sets.push('meta_object_id = ?'); params.push(fields.metaObjectId) }
+  if (fields.containerId !== undefined) { sets.push('container_id = ?'); params.push(fields.containerId) }
   if (fields.postedAt !== undefined) { sets.push('posted_at = ?'); params.push(fields.postedAt) }
   if (fields.remoteVideoId !== undefined) { sets.push('remote_video_id = ?'); params.push(fields.remoteVideoId) }
   if (fields.remoteUploadUrl !== undefined) { sets.push('remote_upload_url = ?'); params.push(fields.remoteUploadUrl) }
@@ -487,20 +566,21 @@ export async function findPostAccountsForUser(userId) {
   }))
 }
 
-export async function findPostsDueForEngagementSync({ stalenessSeconds = 3600, limit = 20 } = {}) {
+export async function findPostsDueForEngagementSync({ stalenessSeconds = 3600, limit = 20, storyMaxAgeHours = 26 } = {}) {
   const rows = await query(
     `SELECT DISTINCT p.id FROM posts p
      JOIN post_targets pt ON pt.post_id = p.id
      WHERE pt.status = 'posted'
        AND pt.meta_object_id IS NOT NULL
        AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND)
+       AND (p.type != 'story' OR pt.posted_at IS NULL OR pt.posted_at >= NOW() - INTERVAL ? HOUR)
        AND NOT EXISTS (
          SELECT 1 FROM campaign_jobs j
          WHERE j.campaign_id = p.id AND j.job_type = 'post_sync_engagement' AND j.status IN ('queued', 'running')
        )
      ORDER BY p.updated_at ASC
      LIMIT ?`,
-    [stalenessSeconds, String(limit)]
+    [stalenessSeconds, String(storyMaxAgeHours), String(limit)]
   )
   return rows.map(r => bufferToUuid(r.id))
 }
@@ -509,8 +589,8 @@ export async function upsertPostEngagement(targetId, postId, snapshot) {
   const id = generateUuid()
   await query(
     `INSERT INTO post_engagement_daily
-       (id, post_id, target_id, stat_date, media_type, permalink, likes, comments, saved, shares, views, reach, interactions, raw, comments_json, error)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (id, post_id, target_id, stat_date, media_type, permalink, likes, comments, saved, shares, views, reach, interactions, impressions, taps_forward, taps_back, exits, replies, raw, comments_json, error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
        media_type = VALUES(media_type),
        permalink = VALUES(permalink),
@@ -521,6 +601,11 @@ export async function upsertPostEngagement(targetId, postId, snapshot) {
        views = VALUES(views),
        reach = VALUES(reach),
        interactions = VALUES(interactions),
+       impressions = VALUES(impressions),
+       taps_forward = VALUES(taps_forward),
+       taps_back = VALUES(taps_back),
+       exits = VALUES(exits),
+       replies = VALUES(replies),
        raw = VALUES(raw),
        comments_json = VALUES(comments_json),
        error = VALUES(error)`,
@@ -538,6 +623,11 @@ export async function upsertPostEngagement(targetId, postId, snapshot) {
       snapshot.views || 0,
       snapshot.reach || 0,
       snapshot.interactions || 0,
+      snapshot.impressions || 0,
+      snapshot.tapsForward || 0,
+      snapshot.tapsBack || 0,
+      snapshot.exits || 0,
+      snapshot.replies || 0,
       JSON.stringify(snapshot.raw || {}),
       JSON.stringify(snapshot.commentsJson || []),
       snapshot.error || null,
@@ -571,6 +661,11 @@ export async function findPostEngagement(postId) {
     views: Number(r.views),
     reach: Number(r.reach),
     interactions: Number(r.interactions),
+    impressions: Number(r.impressions),
+    tapsForward: Number(r.taps_forward),
+    tapsBack: Number(r.taps_back),
+    exits: Number(r.exits),
+    replies: Number(r.replies),
     raw: typeof r.raw === 'string' ? JSON.parse(r.raw) : r.raw,
     commentsJson: typeof r.comments_json === 'string' ? JSON.parse(r.comments_json) : r.comments_json,
     error: r.error || null,
@@ -597,6 +692,13 @@ export async function requeuePostEngagementJob(postId) {
 
 function mapPostPublisherRequestRow(row) {
   if (!row) return null
+  let platformAccountIds = null
+  if (row.platform_account_ids != null) {
+    try {
+      const parsed = typeof row.platform_account_ids === 'string' ? JSON.parse(row.platform_account_ids) : row.platform_account_ids
+      if (Array.isArray(parsed)) platformAccountIds = parsed
+    } catch {}
+  }
   return {
     id: bufferToUuid(row.id),
     postId: bufferToUuid(row.post_id),
@@ -607,6 +709,7 @@ function mapPostPublisherRequestRow(row) {
     coinsOffered: Number(row.coins_offered),
     status: row.status,
     platformAccountId: row.platform_account_id ? bufferToUuid(row.platform_account_id) : null,
+    platformAccountIds,
     platformCode: row.platform_code || null,
     platformDisplayName: row.platform_display_name || null,
     platformUsername: row.platform_username || null,
@@ -780,9 +883,18 @@ export async function updatePostPublisherRequestPublishedWithGuard(id, expectedS
 export async function updatePostPublisherRequest(id, data) {
   const fields = []
   const params = []
-  if (data.platformAccountId !== undefined) {
+  if (data.platformAccountIds !== undefined) {
+    const arr = data.platformAccountIds
+    fields.push('platform_account_ids = ?')
+    params.push(arr && arr.length ? JSON.stringify(arr) : null)
+    fields.push('platform_account_id = ?')
+    params.push(arr && arr.length ? uuidToBuffer(arr[0]) : null)
+  } else if (data.platformAccountId !== undefined) {
     fields.push('platform_account_id = ?')
     params.push(data.platformAccountId ? uuidToBuffer(data.platformAccountId) : null)
+    const legacyArr = data.platformAccountId ? [data.platformAccountId] : null
+    fields.push('platform_account_ids = ?')
+    params.push(legacyArr ? JSON.stringify(legacyArr) : null)
   }
   if (data.status !== undefined) { fields.push('status = ?'); params.push(data.status) }
   if (data.publishedAt !== undefined) { fields.push('published_at = ?'); params.push(data.publishedAt) }

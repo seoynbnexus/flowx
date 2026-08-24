@@ -503,6 +503,10 @@ describe('campaign meta sync jobs', () => {
       expect(health).toHaveProperty('failedJobs')
       expect(health).toHaveProperty('unsettledCount')
       expect(health).toHaveProperty('rateLimit')
+      expect(health).toHaveProperty('schedulerLease')
+      expect(typeof health.queue.active).toBe('number')
+      expect(typeof health.queue.dead).toBe('number')
+      expect('oldestQueuedAgeSeconds' in health.queue).toBe(true)
     })
 
     it('force-sync enqueues status and insights jobs', async () => {

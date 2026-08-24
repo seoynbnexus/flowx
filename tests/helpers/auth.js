@@ -7,5 +7,5 @@ export async function loginAgent(app, email, password) {
   if (!res.body.success) {
     throw new Error(`Login failed for ${email}: ${res.body.message}`)
   }
-  return res.body.data.token
+  return res.body.data.accessToken
 }

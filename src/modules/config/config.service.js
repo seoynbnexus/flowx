@@ -5,6 +5,7 @@ import * as identityRepo from '../identity-documents/identity.repository.js';
 import * as aiRepo from '../ai/ai.repository.js';
 import * as subService from '../subscriptions/subscription.service.js';
 import { query } from '../../../shared/database/connection.js';
+import { DEFAULT_FEATURE_VISIBILITY } from './feature.controller.js';
 import {
   IDENTITY_STATUS,
   USER_STATUS,
@@ -92,6 +93,9 @@ export async function getPublicConfig() {
       maxFileBytes: raw.post_media_max_file_bytes ?? null,
     },
     coinConversionRate: raw.coin_conversion_rate ?? null,
+    featureVisibility: { ...DEFAULT_FEATURE_VISIBILITY, ...(raw.feature_visibility || {}) },
+    publisherMaxAccounts: Number(raw.publisher_max_accounts_per_request) || 5,
+    publisherDeadlineHours: Number(raw.publisher_response_deadline_hours) || 48,
   };
 }
 

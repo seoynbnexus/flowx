@@ -3,8 +3,14 @@ import { sendSuccess, sendPaginated } from '../../../shared/utils/response.utils
 
 export async function getUnreadCount(req, res, next) {
   try {
-    const count = await service.getUnreadCount(req.user.id)
-    return sendSuccess(res, { count })
+    const type = req.query.type
+    if (type) {
+      const types = String(type).split(',').map((t) => t.trim()).filter(Boolean)
+      const count = await service.getUnreadCountByType(req.user.id, types.length === 1 ? types[0] : types)
+      return sendSuccess(res, { count })
+    }
+    const result = await service.getUnreadCount(req.user.id)
+    return sendSuccess(res, result)
   } catch (error) {
     next(error)
   }

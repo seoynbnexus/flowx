@@ -173,6 +173,17 @@ const APP_CONFIG_SEEDS = [
   { key: 'publisher_response_deadline_days', value: 7, is_public: 0, description: 'Number of days publishers have to respond to campaign requests before the campaign expires' },
   { key: 'post_media_quota_bytes', value: Number(process.env.POST_MEDIA_QUOTA_BYTES) || 512 * 1024 * 1024, is_public: 1, description: 'Total media storage quota per user in bytes' },
   { key: 'post_media_max_file_bytes', value: Number(process.env.POST_MEDIA_MAX_FILE_BYTES) || 200 * 1024 * 1024, is_public: 1, description: 'Maximum size for a single uploaded media file in bytes' },
+  { key: 'feature_visibility', value: {
+    client_campaigns: true,
+    publisher_campaign_requests: true,
+    client_image_generation: true,
+    client_support: true,
+    campaign_duplicate: false,
+    post_duplicate: false,
+    publisher_registration: true,
+  }, is_public: 1, description: 'Feature visibility toggles per role (true = visible). Managed by super admin via /admin/config/features.' },
+  { key: 'publisher_max_accounts_per_request', value: 5, is_public: 1, description: 'Max verified accounts a publisher may select per post request (1..10). Managed by super admin.' },
+  { key: 'publisher_response_deadline_hours', value: 48, is_public: 1, description: 'General waiting time for publishers to accept post/campaign requests (hours, 1..720). Capped by scheduled time if scheduled.' },
 ]
 
 const report = []

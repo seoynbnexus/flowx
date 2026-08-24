@@ -61,6 +61,15 @@ describe('post lifecycle', () => {
     })
     const adminRow = await queryOne("SELECT id FROM users WHERE email = 'admin@flowx.com'")
     admin = { id: adminRow ? bufferToUuid(adminRow.id) : null }
+    const { DEFAULT_FEATURE_VISIBILITY } = await import('../../src/modules/config/feature.controller.js')
+    const { generateUuid, uuidToBuffer } = await import('../../shared/utils/uuid.utils.js')
+    const vis = { ...DEFAULT_FEATURE_VISIBILITY, post_duplicate: true, campaign_duplicate: true }
+    const ex = await queryOne("SELECT id FROM app_config WHERE config_key = 'feature_visibility'")
+    if (ex) {
+      await query("UPDATE app_config SET config_value = ? WHERE config_key = 'feature_visibility'", [JSON.stringify(vis)])
+    } else {
+      await query("INSERT INTO app_config (id, config_key, config_value, is_public, description, version) VALUES (?, ?, ?, 1, ?, 1)", [uuidToBuffer(generateUuid()), 'feature_visibility', JSON.stringify(vis), 'test'])
+    }
   })
 
   it('should create a post in draft status with targets', async () => {

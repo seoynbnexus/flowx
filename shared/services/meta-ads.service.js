@@ -1,6 +1,6 @@
 import { META_CONFIG } from './meta-oauth.config.js'
 import { apiFetch } from '../utils/api-logger.js'
-import { recordUsage } from './meta-rate-limiter.js'
+import { recordUsage, tokenKeyFor } from './meta-rate-limiter.js'
 import { fetchBoundedBytes } from './media-url.js'
 
 const RATE_LIMIT_CODES = new Set([80004, 613, 4, 17])
@@ -74,12 +74,12 @@ async function graphPost(path, params = {}) {
     }
   }
 
-  const accountId = accountKeyFromPath(path)
+  const key = accountKeyFromPath(path) || tokenKeyFor(params.access_token)
   const res = await apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_ads', operation: `POST ${path}` })
-  recordUsage(res.headers, accountId)
+  recordUsage(res.headers, key)
   if (!res.ok) {
     const error = await res.text()
-    await maybeEnterCooldown(res, error, accountId)
+    await maybeEnterCooldown(res, error, key)
     const err = new Error(`Graph API POST ${path} failed: ${error}`)
     err.statusCode = res.status
     throw tagGraphError(err, { path, method: 'POST' })
@@ -89,12 +89,12 @@ async function graphPost(path, params = {}) {
 
 async function graphDelete(path, accessToken) {
   const url = `${META_CONFIG.graphUrl}/${path}?access_token=${accessToken}`
-  const accountId = accountKeyFromPath(path)
+  const key = accountKeyFromPath(path) || tokenKeyFor(accessToken)
   const res = await apiFetch(url, { method: 'DELETE' }, { service: 'meta_ads', operation: `DELETE ${path}` })
-  recordUsage(res.headers, accountId)
+  recordUsage(res.headers, key)
   if (!res.ok) {
     const error = await res.text()
-    await maybeEnterCooldown(res, error, accountId)
+    await maybeEnterCooldown(res, error, key)
     const err = new Error(`Graph API DELETE ${path} failed: ${error}`)
     err.statusCode = res.status
     throw tagGraphError(err, { path, method: 'DELETE' })
@@ -111,12 +111,12 @@ async function graphGet(path, params = {}) {
   }
   qs.append('access_token', params.access_token)
   const url = `${META_CONFIG.graphUrl}/${path}?${qs.toString()}`
-  const accountId = accountKeyFromPath(path)
+  const key = accountKeyFromPath(path) || tokenKeyFor(params.access_token)
   const res = await apiFetch(url, {}, { service: 'meta_ads', operation: `GET ${path}` })
-  recordUsage(res.headers, accountId)
+  recordUsage(res.headers, key)
   if (!res.ok) {
     const error = await res.text()
-    await maybeEnterCooldown(res, error, accountId)
+    await maybeEnterCooldown(res, error, key)
     const err = new Error(`Graph API GET ${path} failed: ${error}`)
     err.statusCode = res.status
     throw tagGraphError(err, { path, method: 'GET' })
@@ -577,6 +577,7 @@ export async function getContainerStatus(mediaContainerId, accessToken) {
 }
 
 const ENGAGEMENT_INSIGHT_METRICS = 'reach,likes,comments,saved,shares,views,total_interactions'
+const STORY_INSIGHT_METRICS = 'impressions,reach,views,taps_forward,taps_back,exits,replies'
 
 const FB_VIDEO_FIELDS = 'id,permalink_url,length,created_time,likes.summary(true).limit(0),comments.summary(true).limit(0)'
 const FB_PHOTO_FIELDS = 'id,link,created_time,likes.summary(true).limit(0),comments.summary(true).limit(0)'
@@ -590,8 +591,16 @@ function systemToken() {
   return process.env.META_SYSTEM_USER_TOKEN || null
 }
 
+export function qualifyFbPostId(pageId, id) {
+  if (!id) return id
+  const str = String(id)
+  if (str.includes('_')) return str
+  if (!/^\d+$/.test(str)) return str
+  return `${pageId}_${str}`
+}
+
 export async function getMediaEngagement(mediaId, accessToken, { mediaKind = 'post', platform = 'instagram' } = {}) {
-  if (platform === 'facebook') return getFacebookMediaEngagement(mediaId, accessToken)
+  if (platform === 'facebook') return getFacebookMediaEngagement(mediaId, accessToken, mediaKind)
 
   const basic = await graphGet(`${mediaId}`, {
     access_token: accessToken,
@@ -610,7 +619,21 @@ export async function getMediaEngagement(mediaId, accessToken, { mediaKind = 'po
     comments: [],
   }
 
-  if (mediaKind === 'story') return result
+  if (mediaKind === 'story') {
+    try {
+      const insights = await graphGet(`${mediaId}/insights`, {
+        access_token: accessToken,
+        metric: STORY_INSIGHT_METRICS,
+        period: 'day',
+      })
+      for (const entry of insights.data || []) {
+        result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
+      }
+    } catch (err) {
+      result.storyInsightError = String(err?.message || err)
+    }
+    return result
+  }
 
   const insights = await graphGet(`${mediaId}/insights`, {
     access_token: accessToken,
@@ -634,7 +657,7 @@ export async function getMediaEngagement(mediaId, accessToken, { mediaKind = 'po
   return result
 }
 
-async function getFacebookMediaEngagement(mediaId, accessToken) {
+async function getFacebookMediaEngagement(mediaId, accessToken, mediaKind = 'post') {
   const result = {
     mediaId,
     mediaType: null,
@@ -649,6 +672,7 @@ async function getFacebookMediaEngagement(mediaId, accessToken) {
 
   let kind = null
   let basic = null
+  let lastError = null
   for (const [candidateKind, fields] of [
     ['video', FB_VIDEO_FIELDS],
     ['photo', FB_PHOTO_FIELDS],
@@ -658,11 +682,19 @@ async function getFacebookMediaEngagement(mediaId, accessToken) {
       basic = await graphGet(`${mediaId}`, { access_token: accessToken, fields })
       kind = candidateKind
       break
-    } catch {
+    } catch (err) {
+      lastError = err
       // try next field set — Meta rejects inapplicable fields
     }
   }
-  if (!kind) throw new Error(`Graph API GET ${mediaId} failed: unsupported Facebook object`)
+  if (!kind) {
+    const detail = lastError?.message ? lastError.message.slice(0, 240) : null
+    if (mediaKind === 'story') {
+      result.storyInsightError = `unsupported story object${detail ? ` (${detail})` : ''}`
+      return result
+    }
+    throw new Error(`Graph API GET ${mediaId} failed: unsupported Facebook object${detail ? ` (last: ${detail})` : ''}`)
+  }
 
   result.mediaType = kind === 'post' ? (basic.link ? 'link' : 'post') : kind
   result.permalink = basic.permalink_url || basic.link || null
@@ -696,19 +728,23 @@ async function getFacebookMediaEngagement(mediaId, accessToken) {
   } catch (err) {
     const sys = systemToken()
     if (sys && isPermissionError(err)) {
-      const fallback = await graphGet(`${mediaId}${kind === 'video' ? '/video_insights' : '/insights'}`, {
-        access_token: sys,
-        metric: kind === 'video' ? 'total_video_views' : 'post_impressions,post_engaged_users',
-      })
-      for (const entry of fallback.data || []) {
-        result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
-      }
-      if (kind === 'video') {
-        result.insights.views = result.insights.total_video_views || 0
-      } else {
-        result.insights.reach = result.insights.post_impressions || 0
-        result.insights.interactions = result.insights.post_engaged_users || 0
-        result.insights.shares = basic.shares?.count != null ? Number(basic.shares.count) : 0
+      try {
+        const fallback = await graphGet(`${mediaId}${kind === 'video' ? '/video_insights' : '/insights'}`, {
+          access_token: sys,
+          metric: kind === 'video' ? 'total_video_views' : 'post_impressions,post_engaged_users',
+        })
+        for (const entry of fallback.data || []) {
+          result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
+        }
+        if (kind === 'video') {
+          result.insights.views = result.insights.total_video_views || 0
+        } else {
+          result.insights.reach = result.insights.post_impressions || 0
+          result.insights.interactions = result.insights.post_engaged_users || 0
+          result.insights.shares = basic.shares?.count != null ? Number(basic.shares.count) : 0
+        }
+      } catch {
+        // metrics unavailable — base row still returned
       }
     }
   }
