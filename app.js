@@ -63,6 +63,15 @@ app.use(cors({
   exposedHeaders: ['Authorization'],
 }));
 
+// Dynamic config endpoints must never be HTTP-cached
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/v1/config') || req.path.startsWith('/api/v1/admin/config')) {
+    res.set('Cache-Control', 'no-store');
+    res.set('Vary', 'Authorization, Cookie, Origin');
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/privacy-policy', (req, res) => {

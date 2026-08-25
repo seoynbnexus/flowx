@@ -1,4 +1,4 @@
-import { query, queryOne } from '../../../shared/database/connection.js'
+import { query, queryOne, transaction } from '../../../shared/database/connection.js'
 import { uuidToBuffer, generateUuid } from '../../../shared/utils/uuid.utils.js'
 import { sendSuccess, sendError } from '../../../shared/utils/response.utils.js'
 import { HTTP_STATUS } from '../../../shared/constants/httpStatus.js'
@@ -64,11 +64,47 @@ export async function updateFeatureVisibility(req, res, next) {
       return sendError(res, HTTP_STATUS.UNPROCESSABLE_ENTITY, 'invalid feature key')
     }
 
-    const stored = await readFeatureVisibility()
-    const base = { ...DEFAULT_FEATURE_VISIBILITY, ...(stored || {}) }
-    const nextMap = { ...base, [key]: visible }
-    await writeFeatureVisibility(nextMap, req.user.id)
-    return sendSuccess(res, { featureVisibility: nextMap }, 'Feature visibility updated')
+    const persisted = await transaction(async (conn) => {
+      const [rows] = await conn.execute('SELECT config_value FROM app_config WHERE config_key = ? FOR UPDATE', [FEATURE_VISIBILITY_KEY])
+      const storedRow = rows[0]
+      let stored = null
+      if (storedRow) {
+        try {
+          stored = JSON.parse(storedRow.config_value)
+        } catch {
+          stored = null
+        }
+      }
+      const base = { ...DEFAULT_FEATURE_VISIBILITY, ...(stored || {}) }
+      const nextMap = { ...base, [key]: visible }
+
+      const [existing] = await conn.execute('SELECT id FROM app_config WHERE config_key = ?', [FEATURE_VISIBILITY_KEY])
+      if (existing.length > 0) {
+        await conn.execute(
+          'UPDATE app_config SET config_value = ?, updated_by = ?, version = version + 1 WHERE config_key = ?',
+          [JSON.stringify(nextMap), uuidToBuffer(req.user.id), FEATURE_VISIBILITY_KEY]
+        )
+      } else {
+        await conn.execute(
+          `INSERT INTO app_config (id, config_key, config_value, is_public, description, version, updated_by)
+           VALUES (?, ?, ?, 1, ?, 1, ?)`,
+          [uuidToBuffer(generateUuid()), FEATURE_VISIBILITY_KEY, JSON.stringify(nextMap),
+            'Feature visibility toggles per role (true = visible)', uuidToBuffer(req.user.id)]
+        )
+      }
+
+      const [freshRows] = await conn.execute('SELECT config_value FROM app_config WHERE config_key = ?', [FEATURE_VISIBILITY_KEY])
+      const freshRow = freshRows[0]
+      if (!freshRow) return nextMap
+      try {
+        const fresh = JSON.parse(freshRow.config_value)
+        return { ...DEFAULT_FEATURE_VISIBILITY, ...(fresh || {}) }
+      } catch {
+        return nextMap
+      }
+    })
+
+    return sendSuccess(res, { featureVisibility: persisted }, 'Feature visibility updated')
   } catch (error) {
     next(error)
   }
