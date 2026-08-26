@@ -2,6 +2,7 @@ import { query, queryOne, transaction } from '../../../shared/database/connectio
 import { uuidToBuffer, generateUuid } from '../../../shared/utils/uuid.utils.js'
 import { sendSuccess, sendError } from '../../../shared/utils/response.utils.js'
 import { HTTP_STATUS } from '../../../shared/constants/httpStatus.js'
+import fs from 'fs'
 
 const FEATURE_VISIBILITY_KEY = 'feature_visibility'
 
@@ -17,10 +18,28 @@ export const DEFAULT_FEATURE_VISIBILITY = {
 
 async function readFeatureVisibility() {
   const row = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', [FEATURE_VISIBILITY_KEY])
+
+    fs.appendFileSync(
+    './logs/feature_visibility.log',
+    `[GET] row=${JSON.stringify(row)} pid=${process.pid} time=${new Date().toISOString()}\n`
+  )
+
+
   if (!row) return null
   try {
-    return JSON.parse(row.config_value)
+       const parsed = JSON.parse(row.config_value)
+
+    fs.appendFileSync(
+      './logs/feature_visibility.log',
+      `[GET] parsed=${JSON.stringify(parsed)} pid=${process.pid} time=${new Date().toISOString()}\n`
+    )
+
+    return parsed
   } catch {
+    fs.appendFileSync(
+      './logs/feature_visibility.log',
+      `[GET] JSON parse failed=${error.message} pid=${process.pid} time=${new Date().toISOString()}\n`
+    )
     return null
   }
 }
@@ -45,6 +64,16 @@ async function writeFeatureVisibility(value, adminId) {
 export async function getFeatureVisibility(req, res, next) {
   try {
     const stored = await readFeatureVisibility()
+    //for logging
+    const featureVisibility = {
+      ...DEFAULT_FEATURE_VISIBILITY,
+      ...(stored || {}),
+    }
+
+    fs.appendFileSync(
+      './logs/feature_visibility.log',
+      `[GET] response=${JSON.stringify(featureVisibility)} pid=${process.pid} time=${new Date().toISOString()}\n`
+    )
     return sendSuccess(res, { featureVisibility: { ...DEFAULT_FEATURE_VISIBILITY, ...(stored || {}) } })
   } catch (error) {
     next(error)
@@ -67,6 +96,10 @@ export async function updateFeatureVisibility(req, res, next) {
     const persisted = await transaction(async (conn) => {
       const [rows] = await conn.execute('SELECT config_value FROM app_config WHERE config_key = ? FOR UPDATE', [FEATURE_VISIBILITY_KEY])
       const storedRow = rows[0]
+      
+      // log
+      fs.appendFileSync('./logs/feature_visibility.log', `Admin req select query for config_key ${FEATURE_VISIBILITY_KEY}, storedRow: ${JSON.stringify(storedRow)} , timestamp: ${new Date().toISOString()}\n`)
+
       let stored = null
       if (storedRow) {
         try {
@@ -79,11 +112,16 @@ export async function updateFeatureVisibility(req, res, next) {
       const nextMap = { ...base, [key]: visible }
 
       const [existing] = await conn.execute('SELECT id FROM app_config WHERE config_key = ?', [FEATURE_VISIBILITY_KEY])
+      
+      // log
+      fs.appendFileSync('./logs/feature_visibility.log', `Admin req select query for config_key ${FEATURE_VISIBILITY_KEY}, existing: ${JSON.stringify(existing)} , timestamp: ${new Date().toISOString()}\n`)
+      
       if (existing.length > 0) {
         await conn.execute(
           'UPDATE app_config SET config_value = ?, updated_by = ?, version = version + 1 WHERE config_key = ?',
           [JSON.stringify(nextMap), uuidToBuffer(req.user.id), FEATURE_VISIBILITY_KEY]
         )
+        fs.appendFileSync('./logs/feature_visibility.log', `Admin req update query for config_key ${FEATURE_VISIBILITY_KEY}, nextMap: ${JSON.stringify(nextMap)} , timestamp: ${new Date().toISOString()}\n`)
       } else {
         await conn.execute(
           `INSERT INTO app_config (id, config_key, config_value, is_public, description, version, updated_by)
@@ -98,14 +136,24 @@ export async function updateFeatureVisibility(req, res, next) {
       if (!freshRow) return nextMap
       try {
         const fresh = JSON.parse(freshRow.config_value)
+
+        // log
+        fs.appendFileSync('./logs/feature_visibility.log', `Admin req select query for config_key ${FEATURE_VISIBILITY_KEY}, fresh: ${JSON.stringify(fresh)} , timestamp: ${new Date().toISOString()}\n`)
+        fs.appendFileSync('./logs/feature_visibility.log', `func persisted returning: ${JSON.stringify({ ...DEFAULT_FEATURE_VISIBILITY, ...(fresh || {}) })} , timestamp: ${new Date().toISOString()}\n`)
         return { ...DEFAULT_FEATURE_VISIBILITY, ...(fresh || {}) }
       } catch {
+        fs.appendFileSync('./logs/feature_visibility.log', `func persisted returning: ${JSON.stringify(nextMap)} , timestamp: ${new Date().toISOString()}\n`)
         return nextMap
       }
     })
-
+    // log
+    fs.appendFileSync('./logs/feature_visibility.log', `Admin req updateFeatureVisibility returning: ${JSON.stringify({ featureVisibility: persisted })} , timestamp: ${new Date().toISOString()}\n`)
+    
     return sendSuccess(res, { featureVisibility: persisted }, 'Feature visibility updated')
   } catch (error) {
+    //log
+    fs.appendFileSync('./logs/feature_visibility.log', `Admin req updateFeatureVisibility error: ${error.message} , timestamp: ${new Date().toISOString()}\n`)
+    
     next(error)
   }
 }
