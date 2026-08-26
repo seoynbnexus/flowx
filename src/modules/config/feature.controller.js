@@ -36,10 +36,6 @@ async function readFeatureVisibility() {
 
     return parsed
   } catch {
-    fs.appendFileSync(
-      './logs/feature_visibility.log',
-      `[GET] JSON parse failed=${error.message} pid=${process.pid} time=${new Date().toISOString()}\n`
-    )
     return null
   }
 }
