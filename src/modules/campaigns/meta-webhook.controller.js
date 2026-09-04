@@ -15,7 +15,7 @@ export async function webhookVerify(req, res) {
 export async function webhookReceive(req, res, next) {
   try {
     const secret = process.env.META_WEBHOOK_APP_SECRET || process.env.META_APP_SECRET
-    const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}))
+    const rawBody = req.rawBody || (Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {})))
     const signature = req.headers['x-hub-signature-256']
 
     if (!verifyWebhookSignature(rawBody, signature, secret)) {
@@ -23,11 +23,27 @@ export async function webhookReceive(req, res, next) {
     }
 
     let body = req.body
-    if (!body || Object.keys(body).length === 0) {
-      body = JSON.parse(rawBody.toString('utf8'))
+    if (Buffer.isBuffer(body)) {
+      try {
+        body = body.length ? JSON.parse(body.toString('utf8')) : {}
+      } catch {
+        body = {}
+      }
+    }
+    if (!body || (typeof body === 'object' && !Buffer.isBuffer(body) && Object.keys(body).length === 0)) {
+      try {
+        body = rawBody.length ? JSON.parse(rawBody.toString('utf8')) : {}
+      } catch {
+        body = {}
+      }
     }
 
+    const start = Date.now()
     const result = await processMetaWebhookEvents(body)
+    const ms = Date.now() - start
+    if (req.log) {
+      req.log.info({ webhook: { bytes: rawBody.length, total: result.total, queued: result.queued, duplicates: result.duplicates, errors: result.errors, ms } }, 'meta webhook processed')
+    }
     return sendSuccess(res, result)
   } catch (error) {
     next(error)

@@ -4,6 +4,8 @@ import {
   createAdCampaign,
   createAdSet,
   createAdCreative,
+  createAdCreativeFromInstagramPost,
+  getConnectedFacebookPage,
   createAd,
   listAccountAds,
   getMediaEngagement,
@@ -45,6 +47,16 @@ describe('meta ads validate_only support', () => {
     const [, options] = apiFetch.mock.calls[0]
     expect(options.body).toContain('execution_options')
     expect(options.body).toContain('validate_only')
+  })
+
+  it('should place publisher_platforms inside targeting (not top-level) for createAdSet', async () => {
+    await createAdSet('act_1', 'camp_1', { geo_locations: { countries: ['IN'] } }, { budgetType: 'daily', budgetAmount: 100 }, {}, { publisherPlatforms: ['instagram'] }, 'tok', false, 'ON_POST')
+    const [, options] = apiFetch.mock.calls[0]
+    const params = Object.fromEntries(new URLSearchParams(options.body))
+    const targeting = JSON.parse(params.targeting)
+    expect(targeting.publisher_platforms).toEqual(['instagram'])
+    expect(params.publisher_platforms).toBeUndefined()
+    expect(params.destination_type).toBe('ON_POST')
   })
 
   it('should append execution_options validate_only when createAdCreative runs in validate mode', async () => {
@@ -245,5 +257,82 @@ describe('getFacebookMediaEngagement hybrid token handling', () => {
     expect(result.commentsCount).toBe(2)
     expect(result.storyInsightError).toBeUndefined()
     delete process.env.META_SYSTEM_USER_TOKEN
+  })
+})
+
+describe('createAdCreativeFromInstagramPost minimal-first behavior', () => {
+  beforeEach(() => {
+    apiFetch.mockReset()
+  })
+
+  it('should return validate_only success after exactly one Graph call (never falls through to fallback)', async () => {
+    apiFetch.mockResolvedValueOnce(okJson({ success: true }))
+    const result = await createAdCreativeFromInstagramPost('act_1', 'ig_media_1', 'ig_actor_1', 'page_1', 'Boost', 'tok', true)
+    expect(apiFetch).toHaveBeenCalledTimes(1)
+    expect(result).toEqual({ success: true })
+    const [url] = apiFetch.mock.calls[0]
+    expect(String(url)).toContain('act_act_1/adcreatives')
+    const [, options] = apiFetch.mock.calls[0]
+    expect(options.body).toContain('source_instagram_media_id')
+    expect(options.body).not.toContain('object_story_spec')
+    expect(options.body).toContain('validate_only')
+  })
+
+  it('should return the created id after exactly one Graph call on real create success', async () => {
+    apiFetch.mockResolvedValueOnce(okJson({ id: 'creative_1' }))
+    const result = await createAdCreativeFromInstagramPost('act_1', 'ig_media_1', 'ig_actor_1', 'page_1', 'Boost', 'tok', false)
+    expect(apiFetch).toHaveBeenCalledTimes(1)
+    expect(result.id).toBe('creative_1')
+    expect(apiFetch.mock.calls[0][1].body).not.toContain('object_story_spec')
+  })
+
+  it('should fall back to object_story_spec only on 1443120 Invalid Page ID rejection', async () => {
+    apiFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Invalid Page ID in object story spec', code: 100, error_subcode: 1443120 } }), { status: 400, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(okJson({ id: 'creative_fb_1' }))
+    const result = await createAdCreativeFromInstagramPost('act_1', 'ig_media_1', 'ig_actor_1', 'page_1', 'Boost', 'tok', false)
+    expect(apiFetch).toHaveBeenCalledTimes(2)
+    expect(result.id).toBe('creative_fb_1')
+    const [, fallbackOptions] = apiFetch.mock.calls[1]
+    expect(fallbackOptions.body).toContain('object_story_spec')
+    expect(fallbackOptions.body).toContain('page_1')
+    expect(fallbackOptions.body).toContain('ig_actor_1')
+  })
+
+  it('should throw ValidationError when minimal is rejected with 1443120 and no owning page is resolved', async () => {
+    apiFetch.mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Invalid Page ID in object story spec', code: 100, error_subcode: 1443120 } }), { status: 400, headers: { 'content-type': 'application/json' } }))
+    await expect(createAdCreativeFromInstagramPost('act_1', 'ig_media_1', 'ig_actor_1', null, 'Boost', 'tok', false)).rejects.toThrow('owning Facebook Page')
+    expect(apiFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('should propagate non-1443120 errors without fallback', async () => {
+    apiFetch.mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Unsupported post type', code: 100, error_subcode: 1487472 } }), { status: 400, headers: { 'content-type': 'application/json' } }))
+    await expect(createAdCreativeFromInstagramPost('act_1', 'ig_media_1', 'ig_actor_1', 'page_1', 'Boost', 'tok', false)).rejects.toThrow()
+    expect(apiFetch).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('getConnectedFacebookPage', () => {
+  beforeEach(() => {
+    apiFetch.mockReset()
+  })
+
+  it('should return the connected Facebook page id on success', async () => {
+    apiFetch.mockResolvedValueOnce(okJson({ connected_facebook_page: '122094864657401982' }))
+    const pageId = await getConnectedFacebookPage('ig_actor_1', 'tok')
+    expect(pageId).toBe('122094864657401982')
+    const [url] = apiFetch.mock.calls[0]
+    expect(String(url)).toContain('ig_actor_1')
+    expect(String(url)).toContain('connected_facebook_page')
+  })
+
+  it('should return null when the field is missing', async () => {
+    apiFetch.mockResolvedValueOnce(okJson({ id: 'ig_actor_1' }))
+    expect(await getConnectedFacebookPage('ig_actor_1', 'tok')).toBeNull()
+  })
+
+  it('should return null on Graph errors (best-effort)', async () => {
+    apiFetch.mockResolvedValueOnce(errJson(190, 'Invalid OAuth access token'))
+    expect(await getConnectedFacebookPage('ig_actor_1', 'bad_tok')).toBeNull()
   })
 })

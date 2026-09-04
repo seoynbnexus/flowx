@@ -55,6 +55,7 @@ const PERMISSIONS = [
   { code: 'posts.create', name: 'Create Posts', module: 'posts' },
   { code: 'posts.review', name: 'Review Posts', module: 'posts' },
   { code: 'posts.manage', name: 'Manage Posts', module: 'posts' },
+  { code: 'webhooks.manage', name: 'Manage Webhooks', module: 'webhooks' },
   { code: 'subscriptions.admin', name: 'Manage Subscription Plans', module: 'subscriptions' },
   { code: 'subscriptions.read', name: 'Read Subscriptions', module: 'subscriptions' },
 ]
@@ -73,6 +74,7 @@ const ROLE_PERMISSION_MAP = {
     'ai.admin',
     'campaigns.review', 'campaigns.manage', 'campaigns.force-manage', 'campaigns.read',
     'posts.read', 'posts.review', 'posts.manage',
+    'webhooks.manage',
     'subscriptions.admin', 'subscriptions.read',
   ],
   client: [

@@ -19,6 +19,7 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
     publishInstagramMedia: vi.fn().mockResolvedValue({ id: 'mock_ig_post_1' }),
     createInstagramStory: vi.fn().mockResolvedValue({ id: 'mock_ig_story_1' }),
     getContainerStatus: vi.fn().mockResolvedValue({ status_code: 'FINISHED' }),
+    getPostPromotability: vi.fn().mockResolvedValue({ isEligible: true, promotableId: 'mock_promotable_1', allowedObjectives: [], instagramEligibility: 'eligible', raw: {} }),
   }
   metaMocks = mocks
   return mocks
@@ -353,10 +354,11 @@ describe('post publishing', () => {
 
   it('should sniff content type and publish extension-less image URLs as photos', async () => {
     const realFetch = globalThis.fetch
-    globalThis.fetch = vi.fn().mockResolvedValue({
+    const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       headers: { get: () => 'image/jpeg' },
     })
+    globalThis.fetch = fetchMock
     try {
       const post = await postService.createPost(client.id, {
         name: 'Sniffed image',

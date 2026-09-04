@@ -5,6 +5,7 @@ import { authenticate } from '../../../shared/middleware/auth.middleware.js';
 const router = Router();
 
 router.get('/url', authenticate, controller.getOAuthUrl);
+router.get('/reauth-url', authenticate, controller.getReauthUrl);
 router.get('/callback', controller.handleCallback);
 router.get('/status', authenticate, controller.getConnectionStatus);
 router.get('/available-pages', authenticate, controller.getAvailablePages);

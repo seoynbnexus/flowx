@@ -176,3 +176,34 @@ function extractIgBusinessId(data) {
 }
 
 export { extractIgBusinessId };
+
+export async function subscribePage(pageId, pageToken, fields = ['feed']) {
+  const { apiFetch } = await import('../utils/api-logger.js')
+  const { META_CONFIG } = await import('./meta-oauth.config.js')
+  const url = `${META_CONFIG.graphUrl}/${pageId}/subscribed_apps?access_token=${pageToken}`
+  const body = new URLSearchParams({ subscribed_fields: fields.join(',') })
+  const res = await apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_graph', operation: `POST ${pageId}/subscribed_apps` })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Subscribe page ${pageId} failed: ${err}`)
+  }
+  return res.json()
+}
+
+export async function subscribeInstagram(igUserId, accessToken, fields = ['comments', 'story_insights', 'mentions']) {
+  const { apiFetch } = await import('../utils/api-logger.js')
+  const { META_CONFIG } = await import('./meta-oauth.config.js')
+  const url = `${META_CONFIG.graphUrl}/${igUserId}/subscribed_apps?access_token=${accessToken}`
+  const body = new URLSearchParams({ subscribed_fields: fields.join(',') })
+  const res = await apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_graph', operation: `POST ${igUserId}/subscribed_apps` })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Subscribe Instagram ${igUserId} failed: ${err}`)
+  }
+  return res.json()
+}
+
+export async function getSubscribedApps(objectId, accessToken) {
+  const data = await graphGet(`${objectId}/subscribed_apps`, { access_token: accessToken })
+  return data.data || []
+}

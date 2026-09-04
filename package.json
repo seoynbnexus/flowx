@@ -57,6 +57,8 @@
     "campaigns:reconcile": "node src/jobs/campaigns-reconcile.js",
     "campaigns:handle-awaiting": "node src/jobs/handle-awaiting-publishers.js",
     "posts:cleanup": "node src/jobs/posts-cleanup.js",
+    "meta:webhooks:sync": "node src/jobs/sync-webhooks.js",
+    "meta:webhooks:check": "node src/jobs/sync-webhooks.js --check",
     "test": "vitest run",
     "test:watch": "vitest"
   }

@@ -957,6 +957,142 @@ export async function purgeOldWebhookEvents(days = 90) {
   return { removed: result.affectedRows }
 }
 
+export async function insertWebhookEventAtomic(event) {
+  const {
+    id,
+    providerEventKey,
+    objectType,
+    sourceId,
+    platform,
+    accountId,
+    externalAccountId,
+    externalObjectId,
+    eventType,
+    eventTime,
+    payload,
+  } = event
+  try {
+    await query(
+      `INSERT INTO meta_webhook_events
+        (id, provider_event_key, object_type, source_id, platform, account_id, external_account_id, external_object_id, event_type, event_time, payload, received_at, processing_status, attempts, next_attempt_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), 'received', 0, NOW())`,
+      [
+        id,
+        providerEventKey || null,
+        objectType || null,
+        sourceId || null,
+        platform || null,
+        accountId || null,
+        externalAccountId || null,
+        externalObjectId || null,
+        eventType || 'unknown',
+        eventTime ? new Date(eventTime * 1000).toISOString().slice(0, 19).replace('T', ' ') : null,
+        JSON.stringify(payload || {}),
+      ]
+    )
+    return { inserted: true, duplicate: false }
+  } catch (err) {
+    if (String(err.code) === 'ER_DUP_ENTRY') {
+      return { inserted: false, duplicate: true }
+    }
+    throw err
+  }
+}
+
+export async function getWebhookInboxStats() {
+  const [totalRow, pendingRow, deadRow, lastRow] = await Promise.all([
+    queryOne('SELECT COUNT(*) as c FROM meta_webhook_events'),
+    queryOne("SELECT COUNT(*) as c FROM meta_webhook_events WHERE processing_status IN ('received','processing','retryable')"),
+    queryOne("SELECT COUNT(*) as c FROM meta_webhook_events WHERE processing_status = 'dead'"),
+    queryOne('SELECT MAX(created_at) as lastAt FROM meta_webhook_events'),
+  ])
+  const [byStatus, byField, byPlatform, errorCodes, latencyRow, last24] = await Promise.all([
+    query("SELECT processing_status as status, COUNT(*) as cnt FROM meta_webhook_events WHERE created_at >= NOW() - INTERVAL 7 DAY GROUP BY processing_status"),
+    query("SELECT event_type as field, COUNT(*) as cnt FROM meta_webhook_events WHERE created_at >= NOW() - INTERVAL 1 DAY GROUP BY event_type"),
+    query("SELECT platform, COUNT(*) as cnt FROM meta_webhook_events WHERE created_at >= NOW() - INTERVAL 1 DAY GROUP BY platform"),
+    query("SELECT LEFT(last_error, 80) as code, COUNT(*) as cnt FROM meta_webhook_events WHERE processing_status = 'dead' AND created_at >= NOW() - INTERVAL 7 DAY GROUP BY LEFT(last_error, 80) LIMIT 20"),
+    queryOne("SELECT AVG(TIMESTAMPDIFF(MICROSECOND, received_at, processed_at))/1000 as avgMs FROM meta_webhook_events WHERE processed_at IS NOT NULL AND received_at IS NOT NULL AND created_at >= NOW() - INTERVAL 1 DAY"),
+    queryOne('SELECT COUNT(*) as c FROM meta_webhook_events WHERE created_at >= NOW() - INTERVAL 1 DAY'),
+  ])
+  return {
+    total: Number(totalRow?.c || 0),
+    pending: Number(pendingRow?.c || 0),
+    dead: Number(deadRow?.c || 0),
+    lastEventAt: lastRow?.lastAt || null,
+    byStatus: Object.fromEntries(byStatus.map(r => [r.status, Number(r.cnt)])),
+    byField: Object.fromEntries(byField.map(r => [r.field || 'unknown', Number(r.cnt)])),
+    byPlatform: Object.fromEntries(byPlatform.map(r => [r.platform || 'unknown', Number(r.cnt)])),
+    errorCodes: Object.fromEntries(errorCodes.map(r => [r.code || 'unknown', Number(r.cnt)])),
+    avgLatencyMs: latencyRow?.avgMs != null ? Number(latencyRow.avgMs) : null,
+    last24h: Number(last24?.c || 0),
+  }
+}
+
+export async function claimWebhookEventsForProcessing(limit = 10) {
+  const rows = await query(
+    `SELECT * FROM meta_webhook_events
+     WHERE processing_status IN ('received','retryable')
+       AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+     ORDER BY created_at ASC
+     LIMIT ${Math.max(1, Math.floor(Number(limit)))} FOR UPDATE`
+  )
+  const claimed = []
+  for (const row of rows) {
+    const res = await query(
+      `UPDATE meta_webhook_events SET processing_status = 'processing', processing_started_at = NOW(), attempts = attempts + 1
+       WHERE id = ? AND processing_status IN ('received','retryable')`,
+      [row.id]
+    )
+    if (res.affectedRows > 0) claimed.push(row)
+  }
+  return claimed
+}
+
+export async function updateWebhookEventStatus(id, status, error = null, nextAttemptAt = null) {
+  await query(
+    `UPDATE meta_webhook_events SET processing_status = ?, last_error = ?, next_attempt_at = ?, processed_at = CASE WHEN ? IN ('processed','ignored','dead') THEN NOW() ELSE processed_at END
+     WHERE id = ?`,
+    [status, error ? String(error).slice(0, 2000) : null, nextAttemptAt ? new Date(nextAttemptAt).toISOString().slice(0, 19).replace('T', ' ') : null, status, id]
+  )
+}
+
+function mapPostTargetExternalRow(row) {
+  if (!row) return null
+  try { if (row.id) row.id = bufferToUuid(row.id) } catch {}
+  try { if (row.post_id) row.post_id = bufferToUuid(row.post_id) } catch {}
+  try { if (row.platform_account_id) row.platform_account_id = bufferToUuid(row.platform_account_id) } catch {}
+  try { if (row.publisher_request_id) row.publisher_request_id = bufferToUuid(row.publisher_request_id) } catch {}
+  return row
+}
+
+export async function findPostTargetByExternalId(externalId, platform) {
+  if (!externalId) return null
+  const set = new Set()
+  const push = (v) => { if (v) set.add(String(v)) }
+  push(externalId)
+  const str = String(externalId)
+  if (str.includes('_')) push(str.split('_').pop())
+  const candidates = [...set]
+  if (!candidates.length) return null
+  const inClause = `(${candidates.map(() => '?').join(', ')})`
+  const params = [...candidates, ...candidates, ...candidates]
+  let platformClause = ''
+  if (platform) {
+    platformClause = ' AND p.code = ?'
+    params.push(platform)
+  }
+  const row = await queryOne(
+    `SELECT pt.*, p.code as platform_code FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE (pt.meta_object_id IN ${inClause} OR pt.remote_video_id IN ${inClause} OR pt.container_id IN ${inClause})${platformClause}
+     ORDER BY pt.created_at DESC LIMIT 1`,
+    params
+  )
+  if (row) return mapPostTargetExternalRow(row)
+  return null
+}
+
 export async function countDeadJobs() {
   const row = await queryOne("SELECT COUNT(*) as count FROM campaign_jobs WHERE status = 'dead'")
   return row.count
@@ -1092,7 +1228,37 @@ export async function requeueReelJob(id, backoffSeconds, attempts) {
   )
 }
 
-export async function requeueAutoJob(campaignId, jobType, payload = {}, { runAfterSeconds = 0, runKey = null, entityType = 'campaign' } = {}) {
+export async function requeueAutoJob(campaignId, jobType, payload = {}, { runAfterSeconds = 0, runKey = null, entityType = 'campaign', maxAttempts = null } = {}) {
+  if (maxAttempts != null) {
+    const capped = Math.max(1, Math.floor(Number(maxAttempts)))
+    const result = await query(
+      `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, entity_type, status, run_after, payload, max_attempts)
+       VALUES (?, ?, ?, ?, ?, 'queued', DATE_ADD(NOW(), INTERVAL ? SECOND), ?, ?)
+       ON DUPLICATE KEY UPDATE
+         status = 'queued',
+         attempts = 0,
+         error = NULL,
+         run_after = DATE_ADD(NOW(), INTERVAL ? SECOND),
+         payload = ?,
+         max_attempts = ?,
+         started_at = NULL,
+         finished_at = NULL`,
+      [
+        uuidToBuffer(generateUuid()),
+        campaignId ? uuidToBuffer(campaignId) : null,
+        jobType,
+        runKey,
+        entityType,
+        runAfterSeconds,
+        JSON.stringify(payload),
+        capped,
+        runAfterSeconds,
+        JSON.stringify(payload),
+        capped,
+      ]
+    )
+    return result.affectedRows > 0
+  }
   const result = await query(
     `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, entity_type, status, run_after, payload)
      VALUES (?, ?, ?, ?, ?, 'queued', DATE_ADD(NOW(), INTERVAL ? SECOND), ?)

@@ -17,6 +17,18 @@ export async function getOAuthUrl(req, res, next) {
   }
 }
 
+export async function getReauthUrl(req, res, next) {
+  try {
+    if (!isMetaConfigured()) {
+      return sendSuccess(res, { configured: false, url: null }, 'Meta OAuth not configured');
+    }
+    const result = await oauthService.generateReauthUrl(req.user.id);
+    return sendSuccess(res, { configured: true, url: result.url });
+  } catch (error) {
+    next(error);
+  }
+}
+
 export async function handleCallback(req, res, next) {
   try {
     const { code, state: stateParam } = req.query;
@@ -35,6 +47,9 @@ export async function handleCallback(req, res, next) {
     const result = await oauthService.handleOAuthCallback(code, stateData);
 
     if (result.success) {
+      if (result.reauthAll) {
+        return res.redirect(`${FRONTEND_URL}/meta/callback?reauthAll=true&refreshed=${result.refreshed || 0}&failed=${result.failed || 0}`);
+      }
       if (result.pendingSelection) {
         return res.redirect(`${FRONTEND_URL}/meta/callback?pending_selection=true`);
       }

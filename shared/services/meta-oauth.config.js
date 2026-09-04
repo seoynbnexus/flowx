@@ -12,8 +12,11 @@ const SCOPES = [
   'pages_manage_posts',
   'pages_manage_metadata',
   'instagram_content_publish',
+  'instagram_manage_comments',
+  'instagram_manage_insights',
   'business_management',
   'ads_management',
+  'ads_read',
   'pages_manage_ads',
 ]
 

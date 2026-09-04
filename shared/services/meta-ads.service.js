@@ -2,6 +2,8 @@ import { META_CONFIG } from './meta-oauth.config.js'
 import { apiFetch } from '../utils/api-logger.js'
 import { recordUsage, tokenKeyFor } from './meta-rate-limiter.js'
 import { fetchBoundedBytes } from './media-url.js'
+import { logMetaEvent } from './meta-logger.service.js'
+import { ValidationError } from '../errors/AppError.js'
 
 const RATE_LIMIT_CODES = new Set([80004, 613, 4, 17])
 const RATE_LIMIT_SUBCODE = 2446079
@@ -143,34 +145,59 @@ export function extractMetaError(error) {
 }
 
 export async function createAdCampaign(adAccountId, name, objective, status = 'PAUSED', accessToken, extra = {}, validateOnly = false) {
+  const allowed = new Set(['OUTCOME_AWARENESS','OUTCOME_ENGAGEMENT','OUTCOME_LEADS','OUTCOME_SALES','OUTCOME_TRAFFIC','OUTCOME_APP_PROMOTION'])
+  const legacyMap = {
+    REACH: 'OUTCOME_AWARENESS',
+    IMPRESSIONS: 'OUTCOME_AWARENESS',
+    BRAND_AWARENESS: 'OUTCOME_AWARENESS',
+    VIDEO_VIEWS: 'OUTCOME_ENGAGEMENT',
+    POST_ENGAGEMENT: 'OUTCOME_ENGAGEMENT',
+    LINK_CLICKS: 'OUTCOME_TRAFFIC',
+    PAGE_LIKES: 'OUTCOME_ENGAGEMENT',
+    MESSAGES: 'OUTCOME_ENGAGEMENT',
+    CONVERSIONS: 'OUTCOME_SALES',
+    LEAD_GENERATION: 'OUTCOME_LEADS',
+  }
+  let safeObjective = String(objective || '').toUpperCase().trim()
+  if (legacyMap[safeObjective]) safeObjective = legacyMap[safeObjective]
+  if (!allowed.has(safeObjective)) safeObjective = 'OUTCOME_ENGAGEMENT'
+  let safeName = String(name || '').trim()
+  if (!safeName) safeName = `FlowX-Boost-${Date.now()}`
   const params = {
     access_token: accessToken,
-    name,
-    objective,
+    name: safeName,
+    objective: safeObjective,
     status,
     special_ad_categories: [],
     is_adset_budget_sharing_enabled: false,
   }
   if (extra.spendCap) params.spend_cap = extra.spendCap
   if (validateOnly) params.execution_options = ['validate_only']
+  await logMetaEvent({ action: 'create_campaign', params: { ...params, access_token: '[REDACTED]' } })
   const data = await graphPost(`act_${adAccountId}/campaigns`, params)
   return data
 }
 
-const GOAL_BILLING_MAP = {
+export const GOAL_BILLING_MAP = {
   REACH: 'IMPRESSIONS',
   IMPRESSIONS: 'IMPRESSIONS',
   LINK_CLICKS: 'LINK_CLICKS',
-  LANDING_PAGE_VIEWS: 'LINK_CLICKS',
+  LANDING_PAGE_VIEWS: 'IMPRESSIONS',
   OUTBOUND_CLICKS: 'LINK_CLICKS',
-  POST_ENGAGEMENT: 'POST_ENGAGEMENT',
-  PAGE_LIKES: 'PAGE_LIKES',
-  CONVERSIONS: 'OFFSITE_CONVERSIONS',
-  LEAD_GENERATION: 'LEAD_GENERATION',
-  VALUE: 'OFFSITE_CONVERSIONS',
+  POST_ENGAGEMENT: 'IMPRESSIONS',
+  PAGE_LIKES: 'IMPRESSIONS',
+  CONVERSIONS: 'IMPRESSIONS',
+  OFFSITE_CONVERSIONS: 'IMPRESSIONS',
+  LEAD_GENERATION: 'IMPRESSIONS',
+  QUALITY_LEAD: 'IMPRESSIONS',
+  VALUE: 'IMPRESSIONS',
+  VIDEO_VIEWS: 'THRUPLAY',
+  THRUPLAY: 'THRUPLAY',
+  CONVERSATIONS: 'IMPRESSIONS',
+  AD_RECALL_LIFT: 'IMPRESSIONS',
 }
 
-export async function createAdSet(adAccountId, campaignId, targeting, budget, schedule, placement, accessToken, validateOnly = false) {
+export async function createAdSet(adAccountId, campaignId, targeting, budget, schedule, placement, accessToken, validateOnly = false, destinationType = null) {
   const optimizationGoal = budget.optimizationGoal || 'REACH'
   const params = {
     access_token: accessToken,
@@ -182,6 +209,8 @@ export async function createAdSet(adAccountId, campaignId, targeting, budget, sc
     targeting: { ...targeting, targeting_automation: { advantage_audience: 0 } },
     status: 'PAUSED',
   }
+  if (destinationType) params.destination_type = destinationType
+  else if (budget.destinationType) params.destination_type = budget.destinationType
 
   if (budget.budgetType === 'daily') {
     params.daily_budget = Math.round(budget.budgetAmount * 100)
@@ -193,7 +222,7 @@ export async function createAdSet(adAccountId, campaignId, targeting, budget, sc
   if (schedule.endTime) params.end_time = schedule.endTime
 
   if (placement) {
-    params.publisher_platforms = placement.publisherPlatforms || ['facebook', 'instagram']
+    params.targeting.publisher_platforms = placement.publisherPlatforms || ['facebook', 'instagram']
     if (placement.feedPositions) params.feed_positions = placement.feedPositions
     if (placement.instagramPositions) params.instagram_positions = placement.instagramPositions
   }
@@ -253,12 +282,14 @@ export async function createUnpublishedPagePost(pageId, message, mediaUrl, acces
   return data
 }
 
-export async function createAdCreativeFromPost(adAccountId, objectStoryId, name, accessToken) {
-  const data = await graphPost(`act_${adAccountId}/adcreatives`, {
+export async function createAdCreativeFromPost(adAccountId, objectStoryId, name, accessToken, validateOnly = false) {
+  const params = {
     access_token: accessToken,
     name: name || `Creative ${Date.now()}`,
     object_story_id: objectStoryId,
-  })
+  }
+  if (validateOnly) params.execution_options = ['validate_only']
+  const data = await graphPost(`act_${adAccountId}/adcreatives`, params)
   return data
 }
 
@@ -304,7 +335,35 @@ export async function createPageVideoPost(pageId, accessToken, { url, message } 
   if (message) params.description = message
 
   const data = await graphPost(`${pageId}/videos`, params)
-  return data
+  let postId = null
+  if (data?.id) {
+    try {
+      const resolved = await graphGet(`${data.id}`, {
+        access_token: accessToken,
+        fields: 'post_id',
+      })
+      postId = resolved?.post_id || null
+    } catch {
+      // post_id may not be minted yet — caller retries lazily
+    }
+  }
+  return { ...data, id: postId ? qualifyFbPostId(pageId, postId) : data.id, videoId: data?.id || null, postId: postId ? qualifyFbPostId(pageId, postId) : null }
+}
+
+export async function resolveFbPostObjectId(pageId, rawId, pageToken) {
+  if (!rawId) return null
+  const str = String(rawId)
+  if (str.includes('_')) return str
+  try {
+    const data = await graphGet(`${str}`, {
+      access_token: pageToken,
+      fields: 'post_id',
+    })
+    if (data?.post_id) return qualifyFbPostId(pageId, data.post_id)
+  } catch {
+    // not a video/object with post_id — treat as post id
+  }
+  return null
 }
 
 async function uploadHostedVideo(uploadUrl, fileUrl, accessToken) {
@@ -597,6 +656,123 @@ export function qualifyFbPostId(pageId, id) {
   if (str.includes('_')) return str
   if (!/^\d+$/.test(str)) return str
   return `${pageId}_${str}`
+}
+
+export async function getPostPromotability(postId, pageToken) {
+  const data = await graphGet(postId, {
+    access_token: pageToken,
+    fields: 'is_eligible_for_promotion,promotable_id,allowed_advertising_objectives,instagram_eligibility',
+  })
+  return {
+    isEligible: !!data.is_eligible_for_promotion,
+    promotableId: data.promotable_id || null,
+    allowedObjectives: Array.isArray(data.allowed_advertising_objectives) ? data.allowed_advertising_objectives : [],
+    instagramEligibility: data.instagram_eligibility || null,
+    raw: data,
+  }
+}
+
+export async function isPostLiveForBoost(pageId, postId, pageToken) {
+  if (!postId || !String(postId).includes('_')) return false
+  try {
+    const data = await graphGet(`${postId}`, {
+      access_token: pageToken,
+      fields: 'id,permalink_url',
+    })
+    return !!data?.id
+  } catch {
+    return false
+  }
+}
+
+export async function isInstagramPostLive(igMediaId, igToken) {
+  if (!igMediaId) return false
+  try {
+    const data = await graphGet(`${igMediaId}`, {
+      access_token: igToken,
+      fields: 'id,permalink',
+    })
+    return !!data?.id
+  } catch {
+    return false
+  }
+}
+
+export async function getInstagramBoostEligibility(igMediaId, igToken) {
+  try {
+    const data = await graphGet(`${igMediaId}`, {
+      access_token: igToken,
+      fields: 'boost_eligibility_info',
+    })
+    logMetaEvent({ action: 'get_ig_boost_eligibility', params: { igMediaId, access_token: '[REDACTED]', req: JSON.stringify(data) } })
+    const info = data?.boost_eligibility_info
+    if (info == null) return { ready: false, transient: true, raw: data }
+    return {
+      ready: true,
+      isEligible: !!info.eligible_to_boost,
+      allowedObjectives: Array.isArray(info.eligible_objectives) ? info.eligible_objectives : [],
+      reasons: Array.isArray(info.reasons_not_eligible) ? info.reasons_not_eligible : [],
+      raw: info,
+    }
+  } catch (err) {
+    return { ready: false, transient: false, error: err?.message || String(err) }
+  }
+}
+
+export async function createAdCreativeFromInstagramPost(adAccountId, igMediaId, igActorId, pageId, name, accessToken, validateOnly = false) {
+  const minimal = {
+    access_token: accessToken,
+    name: name || `Creative ${Date.now()}`,
+    source_instagram_media_id: igMediaId,
+  }
+  if (igActorId) minimal.instagram_user_id = String(igActorId)
+  if (pageId) minimal.object_id = String(pageId)
+  if (validateOnly) minimal.execution_options = ['validate_only']
+  try {
+    const data = await graphPost(`act_${adAccountId}/adcreatives`, minimal)
+    logMetaEvent({ action: 'create_adcreative_from_ig_post', params: { adAccountId, igMediaId, igActorId, pageId, name, access_token: '[REDACTED]', mode: validateOnly ? 'validate-minimal' : 'create-minimal', resObj: JSON.stringify(minimal), res: JSON.stringify(data) } })
+    if (data?.id || validateOnly) return data
+  } catch (err) {
+    const detail = extractMetaError(err)
+    const msg = detail?.userMsg || err.message || ''
+    const isMissingSpecError = err.metaErrorCode === 100 && (err.metaErrorSubcode === 1443120 || msg.includes('Invalid Page ID'))
+    if (!isMissingSpecError) throw err
+    logMetaEvent({ action: 'create_adcreative_from_ig_post_fallback', params: { adAccountId, igMediaId, igActorId, pageId, access_token: '[REDACTED]', error: msg } })
+  }
+  if (!pageId) throw new ValidationError(`Cannot boost Instagram media ${igMediaId} — minimal creative rejected and no owning Facebook Page resolved`)
+  const fallback = {
+    access_token: accessToken,
+    name: name || `Creative ${Date.now()}`,
+    object_story_spec: {
+      page_id: pageId,
+      instagram_actor_id: igActorId,
+    },
+    source_instagram_media_id: igMediaId,
+  }
+  if (validateOnly) fallback.execution_options = ['validate_only']
+  const data = await graphPost(`act_${adAccountId}/adcreatives`, fallback)
+  logMetaEvent({ action: 'create_adcreative_from_ig_post', params: { adAccountId, igMediaId, igActorId, pageId, name, access_token: '[REDACTED]', mode: validateOnly ? 'validate-fallback' : 'create-fallback', resObj: JSON.stringify(fallback), res: JSON.stringify(data) } })
+  return data
+}
+
+// GET /{creativeId}?fields=effective_object_story_id
+export async function getCreativeStoryId(creativeId, accessToken) {
+  const data = await graphGet(`${creativeId}`, { fields: 'effective_object_story_id', access_token: accessToken })
+  return data?.effective_object_story_id || null
+}
+
+export async function getConnectedFacebookPage(igActorId, accessToken) {
+  try {
+    const data = await graphGet(`${igActorId}`, {
+      access_token: accessToken,
+      fields: 'connected_facebook_page',
+    })
+    logMetaEvent({ action: 'get_connected_facebook_page', params: { igActorId, access_token: '[REDACTED]', res: JSON.stringify(data) } })
+    return data?.connected_facebook_page ? String(data.connected_facebook_page) : null
+  } catch (err) {
+    logMetaEvent({ action: 'get_connected_facebook_page', params: { igActorId, access_token: '[REDACTED]', error: extractMetaError(err)?.userMsg || err.message } })
+    return null
+  }
 }
 
 export async function getMediaEngagement(mediaId, accessToken, { mediaKind = 'post', platform = 'instagram' } = {}) {

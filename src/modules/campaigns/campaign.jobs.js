@@ -26,14 +26,21 @@ const HANDLERS = {
   [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_STATUS]: (campaignId, actorId, payload) => service.syncAccountStatusJob(payload?.adAccountId ?? undefined),
   [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_INSIGHTS]: (campaignId, actorId, payload) => service.syncAccountInsightsJob(payload?.adAccountId ?? undefined),
   [CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN]: (campaignId) => service.settleCampaignJob(campaignId),
+  [CAMPAIGN_JOB_TYPES.META_WEBHOOK]: async (campaignId, actorId, payload) => {
+    const { processWebhookEventById } = await import('./meta-webhook.service.js')
+    const eventId = payload?.eventId || campaignId
+    return processWebhookEventById(eventId)
+  },
   [POST_JOB_TYPES.PUBLISH]: (postId) => postService.publishPostJob(postId),
   [POST_JOB_TYPES.VERIFY]: (postId) => postService.verifyPostJob(postId),
-  [POST_JOB_TYPES.SYNC_ENGAGEMENT]: (postId) => postService.syncPostEngagementJob(postId),
+  [POST_JOB_TYPES.SYNC_ENGAGEMENT]: (postId, actorId, payload) => postService.syncPostEngagementJob(postId, payload),
+  [POST_JOB_TYPES.SYNC_ENGAGEMENT_TARGET]: (postId, actorId, payload) => postService.syncPostEngagementJob(postId, { targetId: payload?.targetId }),
   [POST_JOB_TYPES.FB_REEL]: (campaignId, actorId, payload) => postService.fbReelJob(payload?.postId, payload?.targetId, payload),
   [POST_JOB_TYPES.IG_REEL]: (campaignId, actorId, payload) => postService.igReelJob(payload?.postId, payload?.targetId, payload),
   [POST_JOB_TYPES.IG_STORY]: (campaignId, actorId, payload) => postService.igVideoStoryJob(payload?.postId, payload?.targetId, payload),
   [POST_JOB_TYPES.PUBLISHER_GO_LIVE]: (postId) => postService.goLiveForFilledPost(postId),
   [POST_JOB_TYPES.EXPIRE_PUBLISHER_REQUESTS]: (postId) => postService.expirePublisherPosts([postId]),
+  [POST_JOB_TYPES.BOOST]: (campaignId, actorId, payload) => postService.postBoostJob(payload?.postId, payload?.postTargetId, payload),
 }
 
 function isPermanentError(error) {
@@ -65,12 +72,20 @@ export async function processDueJobs() {
         await repo.completeCampaignJob(job.id, 'dead', message)
         if (job.entityType === 'post' && job.jobType === POST_JOB_TYPES.PUBLISH) {
           await postService.markPostJobFailed(job.campaignId, message)
-        } else if (job.entityType !== 'post') {
+        } else if (job.entityType !== 'post' && job.entityType !== 'system' && job.campaignId) {
           await service.markCampaignJobFailed(job.campaignId, job.jobType, message)
+        } else if (job.jobType === CAMPAIGN_JOB_TYPES.META_WEBHOOK) {
+          const { query } = await import('../../shared/database/connection.js')
+          await query('UPDATE meta_webhook_events SET processing_status = ?, last_error = ? WHERE id = ?', ['dead', message.slice(0, 2000), job.payload?.eventId || job.campaignId])
         }
       } else {
         const backoffSeconds = Math.min(2 ** job.attempts * 30, MAX_BACKOFF_SECONDS)
         await repo.rescheduleCampaignJob(job.id, message, backoffSeconds)
+        if (job.jobType === CAMPAIGN_JOB_TYPES.META_WEBHOOK) {
+          const { query } = await import('../../shared/database/connection.js')
+          const nextAt = new Date(Date.now() + backoffSeconds * 1000).toISOString().slice(0, 19).replace('T', ' ')
+          await query('UPDATE meta_webhook_events SET processing_status = ?, last_error = ?, next_attempt_at = ?, attempts = attempts + 1 WHERE id = ?', ['retryable', message.slice(0, 2000), nextAt, job.payload?.eventId || job.campaignId])
+        }
       }
     }
   }))
@@ -135,9 +150,18 @@ export function maintenanceDue(now = Date.now()) {
   return now - maintenance.lastRunAt >= maintenance.intervalMs
 }
 
+export const webhookCheck = {
+  intervalMs: Number(process.env.META_WEBHOOK_CHECK_INTERVAL_HOURS || 24) * 60 * 60 * 1000,
+  lastRunAt: 0,
+}
+
+export function webhookCheckDue(now = Date.now()) {
+  return now - webhookCheck.lastRunAt >= webhookCheck.intervalMs
+}
+
 const JOB_RETENTION_DAYS = Number(process.env.JOB_RETENTION_DAYS) || 7
 const ENGAGEMENT_RETENTION_DAYS = Number(process.env.ENGAGEMENT_RETENTION_DAYS) || 90
-const WEBHOOK_RETENTION_DAYS = Number(process.env.WEBHOOK_RETENTION_DAYS) || 90
+const WEBHOOK_RETENTION_DAYS = Number(process.env.WEBHOOK_RETENTION_DAYS) || 30
 
 export async function runJobMaintenance() {
   const [terminalJobs, engagement, webhookEvents] = await Promise.all([
@@ -165,6 +189,15 @@ async function tickSyncScheduler() {
     await service.scheduleCampaignSyncs()
     await postService.schedulePostEngagementSyncs()
     await postService.handleExpiredPublisherPosts()
+    if (webhookCheckDue()) {
+      webhookCheck.lastRunAt = Date.now()
+      try {
+        const { checkWebhookSubscriptions } = await import('../../jobs/check-webhook-subscriptions.js')
+        await checkWebhookSubscriptions()
+      } catch (err) {
+        logger.warn({ err: err?.message }, 'Webhook subscription auto-check failed')
+      }
+    }
     balanceTick += 1
     if (balanceTick % 12 === 0) {
       balanceTick = 0

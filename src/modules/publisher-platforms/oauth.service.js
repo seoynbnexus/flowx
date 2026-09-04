@@ -7,16 +7,124 @@ import { NotFoundError, ConflictError } from '../../../shared/errors/AppError.js
 
 const STATE_MAP = new Map();
 
-export async function generateOAuthUrl(userId, platformCode = 'instagram') {
+export async function generateOAuthUrl(userId, platformCode = 'instagram', extra = {}) {
   if (!isMetaConfigured()) {
     throw new NotFoundError('Meta OAuth is not configured. Contact the administrator.');
   }
 
   const stateId = generateUuid();
-  STATE_MAP.set(stateId, { userId, platformCode, createdAt: Date.now() });
+  STATE_MAP.set(stateId, { userId, platformCode, createdAt: Date.now(), ...extra });
 
   const url = buildAuthUrl(stateId, platformCode);
   return { url };
+}
+
+export async function generateReauthUrl(userId) {
+  return generateOAuthUrl(userId, 'all', { reauthAll: true })
+}
+
+export async function reauthAllForUser(userId, freshUserToken, freshExpiresAt) {
+  const { query } = await import('../../../shared/database/connection.js')
+  const { uuidToBuffer } = await import('../../../shared/utils/uuid.utils.js')
+  const { encrypt } = await import('../../../shared/utils/crypto.utils.js')
+  const { getPageAccessToken } = await import('../../../shared/services/meta-graph.service.js')
+  const fbPlatform = await repo.findPlatformByCode('facebook')
+  const igPlatform = await repo.findPlatformByCode('instagram')
+  const pages = await query(
+    `SELECT upa.*, p.code as platform_code FROM user_platform_accounts upa
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE upa.user_id = ? AND upa.token_type = 'page'`,
+    [uuidToBuffer(userId)]
+  )
+  let refreshed = 0
+  let failed = 0
+  for (const row of pages) {
+    try {
+      let newToken = freshUserToken
+      let viaPageId = row.platform_user_id
+      if (row.platform_code === 'facebook') {
+        newToken = await getPageAccessToken(row.platform_user_id, freshUserToken)
+      } else if (row.platform_code === 'instagram') {
+        const igId = row.instagram_business_account_id || row.platform_user_id
+        let found = false
+        try {
+          const { getFacebookPages, getInstagramBusinessAccount } = await import('../../../shared/services/meta-graph.service.js')
+          const fbPages = await getFacebookPages(freshUserToken).catch(() => [])
+          for (const pg of fbPages) {
+            try {
+              const tok = await getPageAccessToken(pg.id, freshUserToken)
+              const ig = await getInstagramBusinessAccount(pg.id, tok)
+              if (ig && ig.id === igId) {
+                newToken = tok
+                viaPageId = pg.id
+                found = true
+                break
+              }
+            } catch {}
+          }
+          if (!found) {
+            const allPages = await query(
+              `SELECT platform_user_id FROM user_platform_accounts WHERE user_id = ? AND token_type = 'page' AND platform_id = (SELECT id FROM platforms WHERE code='facebook')`,
+              [uuidToBuffer(userId)]
+            )
+            for (const pr of allPages) {
+              try {
+                const tok = await getPageAccessToken(pr.platform_user_id, freshUserToken)
+                const ig = await getInstagramBusinessAccount(pr.platform_user_id, tok)
+                if (ig && ig.id === igId) { newToken = tok; viaPageId = pr.platform_user_id; found = true; break }
+              } catch {}
+            }
+          }
+          if (!found) {
+            try {
+              newToken = await getPageAccessToken(igId, freshUserToken)
+              viaPageId = igId
+              found = true
+            } catch {}
+          }
+        } catch {}
+        if (!found) {
+          newToken = freshUserToken
+        }
+      }
+      if (!newToken) throw new Error('No fresh token for reauth')
+      await query(
+        `UPDATE user_platform_accounts SET access_token = ?, token_expires_at = ?, token_issued_at = NOW(), webhook_last_checked_at = NOW() WHERE id = ?`,
+        [encrypt(newToken), freshExpiresAt, row.id]
+      )
+      refreshed++
+      try {
+        const { subscribePage, subscribeInstagram } = await import('../../../shared/services/meta-graph.service.js')
+        if (row.platform_code === 'facebook') {
+          await subscribePage(row.platform_user_id, newToken, ['feed'])
+          await query("UPDATE user_platform_accounts SET webhook_status='active', webhook_fields=?, webhook_subscribed_at=NOW(), webhook_last_error=NULL WHERE id=?", [JSON.stringify(['feed']), row.id])
+        } else if (row.platform_code === 'instagram') {
+          const igSubscribeId = row.instagram_business_account_id || row.platform_user_id
+          await subscribeInstagram(igSubscribeId, newToken, ['comments','story_insights','mentions'])
+          await query("UPDATE user_platform_accounts SET webhook_status='active', webhook_fields=?, webhook_subscribed_at=NOW(), webhook_last_error=NULL WHERE id=?", [JSON.stringify(['comments','story_insights','mentions']), row.id])
+        }
+      } catch (e) {
+        await query("UPDATE user_platform_accounts SET webhook_status='failed', webhook_last_error=? WHERE id=?", [String(e.message).slice(0,1000), row.id])
+      }
+    } catch (e) {
+      failed++
+      try {
+        await query("UPDATE user_platform_accounts SET webhook_status='failed', webhook_last_error=? WHERE id=?", [String(e.message).slice(0,1000), row.id])
+      } catch {}
+    }
+  }
+  try {
+    const fbRows = pages.filter(r => r.platform_code === 'facebook')
+    if (fbRows.length) {
+      const { query: q2 } = await import('../../../shared/database/connection.js')
+      const userLevelRows = await q2(`SELECT id FROM user_platform_accounts WHERE user_id = ? AND token_type='user' LIMIT 1`, [uuidToBuffer(userId)])
+      if (userLevelRows.length) {
+        const { encrypt: enc2 } = await import('../../../shared/utils/crypto.utils.js')
+        await q2(`UPDATE user_platform_accounts SET access_token=?, token_expires_at=?, token_issued_at=NOW() WHERE id=?`, [enc2(freshUserToken), freshExpiresAt, userLevelRows[0].id])
+      }
+    }
+  } catch {}
+  return { refreshed, failed, total: pages.length }
 }
 
 async function upsertUserLevelToken(userId, platform, data) {
@@ -105,6 +213,7 @@ export async function handleOAuthCallback(code, stateData) {
 
   const stateInfo = STATE_MAP.get(stateId);
   STATE_MAP.delete(stateId);
+  const reauthAll = !!stateInfo?.reauthAll;
 
   if (Date.now() - stateInfo.createdAt > 600000) {
     return { success: false, error: 'OAuth session expired. Please try again.', errorType: 'oauth' };
@@ -153,6 +262,18 @@ export async function handleOAuthCallback(code, stateData) {
       tokenIssuedAt,
       tokenStatus: 'active',
     })
+
+    if (reauthAll) {
+      const reauthResult = await reauthAllForUser(userId, accessToken, tokenExpiresAt)
+      return {
+        success: true,
+        reauthAll: true,
+        refreshed: reauthResult.refreshed,
+        failed: reauthResult.failed,
+        total: reauthResult.total,
+        platformCode: 'facebook',
+      }
+    }
 
     return {
       success: true,
@@ -238,6 +359,20 @@ export async function addPage(userId, platformUserId) {
     tokenExpiresAt: userToken.tokenExpiresAt,
     tokenIssuedAt: new Date(),
   })
+
+  try {
+    const { subscribePage } = await import('../../../shared/services/meta-graph.service.js')
+    await subscribePage(platformUserId, pageToken, ['feed'])
+    const { query } = await import('../../../shared/database/connection.js')
+    const { uuidToBuffer } = await import('../../../shared/utils/uuid.utils.js')
+    await query("UPDATE user_platform_accounts SET webhook_status = 'active', webhook_fields = ?, webhook_subscribed_at = NOW(), webhook_last_checked_at = NOW(), webhook_last_error = NULL WHERE id = ?", [JSON.stringify(['feed']), uuidToBuffer(account.id)])
+  } catch (e) {
+    try {
+      const { query } = await import('../../../shared/database/connection.js')
+      const { uuidToBuffer } = await import('../../../shared/utils/uuid.utils.js')
+      await query("UPDATE user_platform_accounts SET webhook_status = 'failed', webhook_last_error = ?, webhook_last_checked_at = NOW() WHERE id = ?", [String(e.message).slice(0, 1000), uuidToBuffer(account.id)])
+    } catch {}
+  }
 
   return { account }
 }
@@ -494,6 +629,20 @@ export async function addInstagramAccount(userId, igBusinessAccountId) {
     tokenExpiresAt: matchedPage.tokenExpiresAt || userToken.tokenExpiresAt,
     tokenIssuedAt: new Date(),
   })
+
+  try {
+    const { subscribeInstagram } = await import('../../../shared/services/meta-graph.service.js')
+    await subscribeInstagram(matchedIgAccount.id, matchedPage.accessToken, ['comments', 'story_insights', 'mentions'])
+    const { query } = await import('../../../shared/database/connection.js')
+    const { uuidToBuffer } = await import('../../../shared/utils/uuid.utils.js')
+    await query("UPDATE user_platform_accounts SET webhook_status = 'active', webhook_fields = ?, webhook_subscribed_at = NOW(), webhook_last_checked_at = NOW(), webhook_last_error = NULL WHERE id = ?", [JSON.stringify(['comments','story_insights','mentions']), uuidToBuffer(account.id)])
+  } catch (e) {
+    try {
+      const { query } = await import('../../../shared/database/connection.js')
+      const { uuidToBuffer } = await import('../../../shared/utils/uuid.utils.js')
+      await query("UPDATE user_platform_accounts SET webhook_status = 'failed', webhook_last_error = ?, webhook_last_checked_at = NOW() WHERE id = ?", [String(e.message).slice(0, 1000), uuidToBuffer(account.id)])
+    } catch {}
+  }
 
   return { account }
 }

@@ -2454,7 +2454,7 @@ export async function settleCampaignJob(campaignId) {
 }
 
 export async function getMetaSyncHealth() {
-  const [staleCampaigns, failedJobs, unsettledCount, runningCount, pausedCount, accountSnapshot, rateLimit, accounts, rateLimits, schedulerLease, chargedBudget, activeQueueJobs, deadQueueJobs, oldestQueued] = await Promise.all([
+  const [staleCampaigns, failedJobs, unsettledCount, runningCount, pausedCount, accountSnapshot, rateLimit, accounts, rateLimits, schedulerLease, chargedBudget, activeQueueJobs, deadQueueJobs, oldestQueued, webhookStats, webhookSubs] = await Promise.all([
     repo.findStaleRunningCampaigns(),
     repo.countFailedJobsByType(),
     repo.countUnsettledCampaigns(),
@@ -2469,6 +2469,18 @@ export async function getMetaSyncHealth() {
     repo.countActiveCampaignJobs(),
     repo.countDeadJobs(),
     repo.oldestQueuedJob(),
+    repo.getWebhookInboxStats().catch(() => null),
+    (async () => {
+      try {
+        const { query } = await import('../../../shared/database/connection.js')
+        const [active, failed, total] = await Promise.all([
+          query('SELECT COUNT(*) as c FROM user_platform_accounts WHERE webhook_status = ?', ['active']).then(r => Number(r[0]?.c || 0)),
+          query('SELECT COUNT(*) as c FROM user_platform_accounts WHERE webhook_status = ?', ['failed']).then(r => Number(r[0]?.c || 0)),
+          query('SELECT COUNT(*) as c FROM user_platform_accounts WHERE token_type = ?', ['page']).then(r => Number(r[0]?.c || 0)),
+        ])
+        return { active, failed, total }
+      } catch { return null }
+    })(),
   ])
 
   return {
@@ -2488,6 +2500,7 @@ export async function getMetaSyncHealth() {
       dead: deadQueueJobs,
       oldestQueuedAgeSeconds: oldestQueued ? Math.max(0, Math.floor((Date.now() - new Date(oldestQueued.runAfter).getTime()) / 1000)) : null,
     },
+    webhooks: webhookStats ? { ...webhookStats, subscriptions: webhookSubs } : null,
   }
 }
 

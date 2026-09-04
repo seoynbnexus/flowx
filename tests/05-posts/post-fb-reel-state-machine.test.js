@@ -134,7 +134,7 @@ describe('facebook reel durable publish state machine', () => {
     expect(detail.status).toBe('completed')
   })
 
-  it('prefers the echoed video_id as meta_object_id when Meta finishes a reel', async () => {
+  it('prefers the qualified post_id over video_id as meta_object_id when Meta finishes a reel (boostable object)', async () => {
     const { postId, targetId } = await createApprovedReel()
     await postService.fbReelJob(postId, targetId, {})
     metaMocks.getPageReelStatus.mockResolvedValue({ video_status: 'processing' })
@@ -145,7 +145,7 @@ describe('facebook reel durable publish state machine', () => {
     await postService.fbReelJob(postId, targetId, {})
     const target = await postRepo.findPostTargetById(targetId)
     expect(target.publishState).toBe('published')
-    expect(target.metaObjectId).toBe('mock_echoed_video')
+    expect(target.metaObjectId).toBe('fb_reel_sm_98765432')
   })
 
   it('qualifies a bare numeric post_id when Meta finishes without an echoed video_id', async () => {

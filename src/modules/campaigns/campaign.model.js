@@ -65,6 +65,7 @@ export const CAMPAIGN_JOB_TYPES = {
   SYNC_ACCOUNT_STATUS: 'sync_account_status',
   SYNC_ACCOUNT_INSIGHTS: 'sync_account_insights',
   SETTLE_CAMPAIGN: 'settle_campaign',
+  META_WEBHOOK: 'meta_webhook',
 }
 
 export const META_STATUS = {

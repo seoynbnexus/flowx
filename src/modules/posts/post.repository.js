@@ -40,6 +40,23 @@ function mapPostRow(row) {
     reviewNotes: row.review_notes,
     publishedAt: row.published_at,
     error: row.error || null,
+    boostEnabled: !!row.boost_enabled,
+    boostBudgetType: row.boost_budget_type || null,
+    boostBudgetAmount: row.boost_budget_amount != null ? Number(row.boost_budget_amount) : null,
+    boostSpendCap: row.boost_spend_cap != null ? Number(row.boost_spend_cap) : null,
+    boostEndTime: row.boost_end_time || null,
+    boostTargeting: typeof row.boost_targeting === 'string' ? JSON.parse(row.boost_targeting) : row.boost_targeting || null,
+    boostPlacement: typeof row.boost_placement === 'string' ? JSON.parse(row.boost_placement) : row.boost_placement || null,
+    boostBidStrategy: row.boost_bid_strategy || null,
+    boostOptimizationGoal: row.boost_optimization_goal || null,
+    boostObjective: row.boost_objective || null,
+    boostCallToAction: row.boost_call_to_action || null,
+    boostLink: row.boost_link || null,
+    boostHeadline: row.boost_headline || null,
+    boostDescription: row.boost_description || null,
+    adAccountDbId: row.ad_account_id ? bufferToUuid(row.ad_account_id) : null,
+    chargedBoostPaise: row.charged_boost_paise ? Number(row.charged_boost_paise) : 0,
+    boostError: row.boost_error || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -56,6 +73,11 @@ function mapPostTargetRow(row) {
     status: row.status,
     error: row.error || null,
     metaObjectId: row.meta_object_id || null,
+    promotableId: row.promotable_id || null,
+    isEligibleForPromotion: row.is_eligible_for_promotion != null ? !!row.is_eligible_for_promotion : null,
+    allowedObjectives: typeof row.allowed_objectives === 'string' ? JSON.parse(row.allowed_objectives) : row.allowed_objectives || null,
+    eligibilityCheckedAt: row.eligibility_checked_at || null,
+    eligibilityReason: row.eligibility_reason || null,
     containerId: row.container_id || null,
     postedAt: row.posted_at,
     publishState: row.publish_state || 'none',
@@ -71,6 +93,10 @@ function mapPostTargetRow(row) {
     unknownSince: row.unknown_since || null,
     createdAt: row.created_at,
     lastEngagementSyncAt: row.last_engagement_sync_at || null,
+    metaRemoteStatus: row.meta_remote_status || null,
+    metaDeletedAt: row.meta_deleted_at || null,
+    lastMetaEventAt: row.last_meta_event_at || null,
+    lastEngagementEventAt: row.last_engagement_event_at || null,
     platformCode: row.platform_code || null,
     platformUserId: row.platform_user_id || null,
     platformDisplayName: row.platform_display_name || null,
@@ -97,8 +123,11 @@ function mapReviewLogRow(row) {
 export async function createPost(id, clientId, data) {
   await query(
     `INSERT INTO posts (id, client_id, category_id, name, type, scheduled_at, run_on_publishers,
-       publisher_count, coins_per_publisher, caption, media_url, hashtags, text_body)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       publisher_count, coins_per_publisher, caption, media_url, hashtags, text_body,
+       boost_enabled, boost_budget_type, boost_budget_amount, boost_spend_cap, boost_end_time,
+       boost_targeting, boost_placement, boost_bid_strategy, boost_optimization_goal, boost_objective,
+       boost_call_to_action, boost_link, boost_headline, boost_description, ad_account_id, charged_boost_paise)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(clientId),
@@ -113,6 +142,22 @@ export async function createPost(id, clientId, data) {
       data.mediaUrl || null,
       data.hashtags || null,
       data.textBody || null,
+      data.boostEnabled ? 1 : 0,
+      data.boostBudgetType || null,
+      data.boostBudgetAmount || null,
+      data.boostSpendCap || null,
+      data.boostEndTime ? new Date(data.boostEndTime).toISOString().slice(0, 19).replace('T', ' ') : null,
+      data.boostTargeting ? JSON.stringify(data.boostTargeting) : null,
+      data.boostPlacement ? JSON.stringify(data.boostPlacement) : null,
+      data.boostBidStrategy || null,
+      data.boostOptimizationGoal || null,
+      data.boostObjective || null,
+      data.boostCallToAction || null,
+      data.boostLink || null,
+      data.boostHeadline || null,
+      data.boostDescription || null,
+      data.adAccountId ? uuidToBuffer(data.adAccountId) : null,
+      data.chargedBoostPaise || 0,
     ]
   )
   return findPostById(id)
@@ -220,6 +265,9 @@ export async function updatePost(id, data) {
   if (data.publisherResponseDeadlineAt !== undefined) { fields.push('publisher_response_deadline_at = ?'); params.push(data.publisherResponseDeadlineAt) }
   if (data.clientConfirmed !== undefined) { fields.push('client_confirmed = ?'); params.push(data.clientConfirmed ? 1 : 0) }
   if (data.clientConfirmedAt !== undefined) { fields.push('client_confirmed_at = ?'); params.push(data.clientConfirmedAt) }
+  if (data.boostError !== undefined) { fields.push('boost_error = ?'); params.push(data.boostError) }
+  if (data.chargedBoostPaise !== undefined) { fields.push('charged_boost_paise = ?'); params.push(data.chargedBoostPaise) }
+  if (data.adAccountId !== undefined) { fields.push('ad_account_id = ?'); params.push(data.adAccountId ? uuidToBuffer(data.adAccountId) : null) }
 
   if (fields.length === 0) return findPostById(id)
 
@@ -258,6 +306,9 @@ export async function updatePostWithStatusGuard(id, data, expectedStatus) {
   if (data.publisherResponseDeadlineAt !== undefined) { fields.push('publisher_response_deadline_at = ?'); params.push(data.publisherResponseDeadlineAt) }
   if (data.clientConfirmed !== undefined) { fields.push('client_confirmed = ?'); params.push(data.clientConfirmed ? 1 : 0) }
   if (data.clientConfirmedAt !== undefined) { fields.push('client_confirmed_at = ?'); params.push(data.clientConfirmedAt) }
+  if (data.boostError !== undefined) { fields.push('boost_error = ?'); params.push(data.boostError) }
+  if (data.chargedBoostPaise !== undefined) { fields.push('charged_boost_paise = ?'); params.push(data.chargedBoostPaise) }
+  if (data.adAccountId !== undefined) { fields.push('ad_account_id = ?'); params.push(data.adAccountId ? uuidToBuffer(data.adAccountId) : null) }
 
   if (fields.length === 0) return findPostById(id)
 
@@ -487,6 +538,15 @@ export async function updatePostTargetStatus(id, data) {
   if (data.lastMetaStatus !== undefined) { fields.push('last_meta_status = ?'); params.push(data.lastMetaStatus) }
   if (data.lastOperation !== undefined) { fields.push('last_operation = ?'); params.push(data.lastOperation) }
   if (data.lastOperationAt !== undefined) { fields.push('last_operation_at = ?'); params.push(data.lastOperationAt) }
+  if (data.metaRemoteStatus !== undefined) { fields.push('meta_remote_status = ?'); params.push(data.metaRemoteStatus) }
+  if (data.metaDeletedAt !== undefined) { fields.push('meta_deleted_at = ?'); params.push(data.metaDeletedAt) }
+  if (data.lastMetaEventAt !== undefined) { fields.push('last_meta_event_at = ?'); params.push(data.lastMetaEventAt) }
+  if (data.lastEngagementEventAt !== undefined) { fields.push('last_engagement_event_at = ?'); params.push(data.lastEngagementEventAt) }
+  if (data.promotableId !== undefined) { fields.push('promotable_id = ?'); params.push(data.promotableId) }
+  if (data.isEligibleForPromotion !== undefined) { fields.push('is_eligible_for_promotion = ?'); params.push(data.isEligibleForPromotion == null ? null : data.isEligibleForPromotion ? 1 : 0) }
+  if (data.allowedObjectives !== undefined) { fields.push('allowed_objectives = ?'); params.push(data.allowedObjectives ? JSON.stringify(data.allowedObjectives) : null) }
+  if (data.eligibilityCheckedAt !== undefined) { fields.push('eligibility_checked_at = ?'); params.push(data.eligibilityCheckedAt) }
+  if (data.eligibilityReason !== undefined) { fields.push('eligibility_reason = ?'); params.push(data.eligibilityReason) }
 
   if (fields.length === 0) return
 
@@ -566,13 +626,22 @@ export async function findPostAccountsForUser(userId) {
   }))
 }
 
-export async function findPostsDueForEngagementSync({ stalenessSeconds = 3600, limit = 20, storyMaxAgeHours = 26 } = {}) {
+export async function findPostsDueForEngagementSync({ stalenessSeconds = 3600, webhookStalenessSeconds = 21600, limit = 20, storyMaxAgeHours = 26 } = {}) {
   const rows = await query(
     `SELECT DISTINCT p.id FROM posts p
      JOIN post_targets pt ON pt.post_id = p.id
+     LEFT JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
      WHERE pt.status = 'posted'
        AND pt.meta_object_id IS NOT NULL
-       AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND)
+       AND pt.meta_deleted_at IS NULL
+       AND (
+         (upa.webhook_status = 'active'
+          AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND)
+          AND (pt.last_engagement_event_at IS NULL OR pt.last_engagement_event_at < NOW() - INTERVAL 1800 SECOND))
+         OR
+         (COALESCE(upa.webhook_status, 'unknown') != 'active'
+          AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND))
+       )
        AND (p.type != 'story' OR pt.posted_at IS NULL OR pt.posted_at >= NOW() - INTERVAL ? HOUR)
        AND NOT EXISTS (
          SELECT 1 FROM campaign_jobs j
@@ -580,7 +649,7 @@ export async function findPostsDueForEngagementSync({ stalenessSeconds = 3600, l
        )
      ORDER BY p.updated_at ASC
      LIMIT ?`,
-    [stalenessSeconds, String(storyMaxAgeHours), String(limit)]
+    [webhookStalenessSeconds, stalenessSeconds, String(storyMaxAgeHours), String(limit)]
   )
   return rows.map(r => bufferToUuid(r.id))
 }
@@ -1007,3 +1076,115 @@ export async function findExpiredPublisherPosts() {
   )
   return rows.map(r => bufferToUuid(r.id))
 }
+
+export async function createPostBoostTarget(postId, postTargetId, data) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO post_boost_targets (id, post_id, post_target_id, platform_account_id, object_type, object_id, status, boost_status, created_for_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(postId),
+      uuidToBuffer(postTargetId),
+      data.platformAccountId ? uuidToBuffer(data.platformAccountId) : null,
+      data.objectType,
+      data.objectId,
+      data.status || null,
+      data.boostStatus || 'pending',
+      data.createdForUserId ? uuidToBuffer(data.createdForUserId) : null,
+    ]
+  )
+  return id
+}
+
+export async function findPostBoostTargetsByPostId(postId) {
+  const rows = await query('SELECT * FROM post_boost_targets WHERE post_id = ? ORDER BY created_at ASC', [uuidToBuffer(postId)])
+  return rows.map(r => ({
+    id: bufferToUuid(r.id),
+    postId: bufferToUuid(r.post_id),
+    postTargetId: bufferToUuid(r.post_target_id),
+    platformAccountId: r.platform_account_id ? bufferToUuid(r.platform_account_id) : null,
+    objectType: r.object_type,
+    objectId: r.object_id,
+    status: r.status,
+    boostStatus: r.boost_status,
+    createdForUserId: r.created_for_user_id ? bufferToUuid(r.created_for_user_id) : null,
+    createdAt: r.created_at,
+  }))
+}
+
+export async function findPostBoostTargetsByTargetId(postTargetId) {
+  const rows = await query('SELECT * FROM post_boost_targets WHERE post_target_id = ? ORDER BY created_at ASC', [uuidToBuffer(postTargetId)])
+  return rows.map(r => ({
+    id: bufferToUuid(r.id),
+    postId: bufferToUuid(r.post_id),
+    postTargetId: bufferToUuid(r.post_target_id),
+    platformAccountId: r.platform_account_id ? bufferToUuid(r.platform_account_id) : null,
+    objectType: r.object_type,
+    objectId: r.object_id,
+    status: r.status,
+    boostStatus: r.boost_status,
+    createdForUserId: r.created_for_user_id ? bufferToUuid(r.created_for_user_id) : null,
+    createdAt: r.created_at,
+  }))
+}
+
+export async function deletePostBoostTargetsByTargetId(postTargetId) {
+  await query('DELETE FROM post_boost_targets WHERE post_target_id = ?', [uuidToBuffer(postTargetId)])
+}
+
+export async function updatePostBoostTargetStatus(postTargetId, status) {
+  await query('UPDATE post_boost_targets SET boost_status = ? WHERE post_target_id = ?', [status, uuidToBuffer(postTargetId)])
+}
+
+export async function insertPostBillingEntry(postId, entry) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO post_billing_entries (id, post_id, kind, paise, coins, rate, paid_from_monthly, paid_from_wallet, reason)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(postId),
+      entry.kind,
+      entry.paise || 0,
+      entry.coins || 0,
+      entry.rate || 0,
+      entry.paidFromMonthly || 0,
+      entry.paidFromWallet || 0,
+      entry.reason || null,
+    ]
+  )
+  return id
+}
+
+export async function findPostBillingEntries(postId) {
+  const rows = await query('SELECT * FROM post_billing_entries WHERE post_id = ? ORDER BY created_at ASC', [uuidToBuffer(postId)])
+  return rows.map(r => ({
+    id: bufferToUuid(r.id),
+    postId: bufferToUuid(r.post_id),
+    kind: r.kind,
+    paise: Number(r.paise),
+    coins: Number(r.coins),
+    rate: Number(r.rate),
+    paidFromMonthly: Number(r.paid_from_monthly),
+    paidFromWallet: Number(r.paid_from_wallet),
+    reason: r.reason,
+    createdAt: r.created_at,
+  }))
+}
+
+export async function findPostAdAccount(postId) {
+  const row = await queryOne(
+    `SELECT ma.* FROM posts p JOIN meta_ad_accounts ma ON ma.id = p.ad_account_id WHERE p.id = ? LIMIT 1`,
+    [uuidToBuffer(postId)]
+  )
+  return row ? {
+    id: bufferToUuid(row.id),
+    metaAccountId: row.account_id,
+    accessToken: row.token_encrypted ? decrypt(row.token_encrypted) : null,
+    monthlyCapPaise: Number(row.monthly_cap_paise) || 0,
+    isPrimary: !!row.is_primary,
+    status: row.status,
+  } : null
+}
+

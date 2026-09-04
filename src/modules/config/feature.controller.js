@@ -12,7 +12,6 @@ import {
   sendError,
 } from "../../../shared/utils/response.utils.js";
 import { HTTP_STATUS } from "../../../shared/constants/httpStatus.js";
-import fs from "fs";
 
 const FEATURE_VISIBILITY_KEY = "feature_visibility";
 
@@ -61,19 +60,9 @@ async function readFeatureVisibility() {
     [FEATURE_VISIBILITY_KEY],
   );
 
-  fs.appendFileSync(
-    "./logs/feature_visibility.log",
-    `[GET] row=${JSON.stringify(row)} pid=${process.pid} time=${new Date().toISOString()}\n`,
-  );
-
   if (!row) return null;
 
   const parsed = parseConfigValue(row.config_value);
-
-  fs.appendFileSync(
-    "./logs/feature_visibility.log",
-    `[GET] parsed=${JSON.stringify(parsed)} type=${typeof row.config_value} pid=${process.pid} time=${new Date().toISOString()}\n`,
-  );
 
   return parsed;
 }
@@ -112,10 +101,6 @@ export async function getFeatureVisibility(req, res, next) {
       ...(stored || {}),
     };
 
-    fs.appendFileSync(
-      "./logs/feature_visibility.log",
-      `[GET] response=${JSON.stringify(featureVisibility)} pid=${process.pid} time=${new Date().toISOString()}\n`,
-    );
     return sendSuccess(res, {
       featureVisibility: { ...DEFAULT_FEATURE_VISIBILITY, ...(stored || {}) },
     });
@@ -156,12 +141,6 @@ export async function updateFeatureVisibility(req, res, next) {
       );
       const storedRow = rows[0];
 
-      // log
-      fs.appendFileSync(
-        "./logs/feature_visibility.log",
-        `Admin req select query for config_key ${FEATURE_VISIBILITY_KEY}, storedRow: ${JSON.stringify(storedRow)} , timestamp: ${new Date().toISOString()}\n`,
-      );
-
       const stored = storedRow
         ? parseConfigValue(storedRow.config_value)
         : null;
@@ -181,12 +160,6 @@ export async function updateFeatureVisibility(req, res, next) {
         [FEATURE_VISIBILITY_KEY],
       );
 
-      // log
-      fs.appendFileSync(
-        "./logs/feature_visibility.log",
-        `Admin req select query for config_key ${FEATURE_VISIBILITY_KEY}, existing: ${JSON.stringify(existing)} , timestamp: ${new Date().toISOString()}\n`,
-      );
-
       if (existing.length > 0) {
         await conn.execute(
           "UPDATE app_config SET config_value = ?, updated_by = ?, version = version + 1 WHERE config_key = ?",
@@ -195,10 +168,6 @@ export async function updateFeatureVisibility(req, res, next) {
             uuidToBuffer(req.user.id),
             FEATURE_VISIBILITY_KEY,
           ],
-        );
-        fs.appendFileSync(
-          "./logs/feature_visibility.log",
-          `Admin req update query for config_key ${FEATURE_VISIBILITY_KEY}, nextMap: ${JSON.stringify(nextMap)} , timestamp: ${new Date().toISOString()}\n`,
         );
       } else {
         await conn.execute(
@@ -236,18 +205,8 @@ export async function updateFeatureVisibility(req, res, next) {
         ...fresh,
       };
 
-      fs.appendFileSync(
-        "./logs/feature_visibility.log",
-        `func persisted returning: ${JSON.stringify(persisted)}, timestamp=${new Date().toISOString()}\n`,
-      );
-
       return persisted;
     });
-    // log
-    fs.appendFileSync(
-      "./logs/feature_visibility.log",
-      `Admin req updateFeatureVisibility returning: ${JSON.stringify({ featureVisibility: persisted })} , timestamp: ${new Date().toISOString()}\n`,
-    );
 
     return sendSuccess(
       res,
@@ -255,12 +214,6 @@ export async function updateFeatureVisibility(req, res, next) {
       "Feature visibility updated",
     );
   } catch (error) {
-    //log
-    fs.appendFileSync(
-      "./logs/feature_visibility.log",
-      `Admin req updateFeatureVisibility error: ${error.message} , timestamp: ${new Date().toISOString()}\n`,
-    );
-
     next(error);
   }
 }

@@ -18,17 +18,21 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.set('trust proxy', 1);
 
+const WEBHOOK_MAX_BYTES = Number(process.env.META_WEBHOOK_MAX_BYTES) || 512 * 1024
+if (!process.env.META_WEBHOOK_APP_SECRET && !process.env.META_APP_SECRET) {
+  logger.warn('META_WEBHOOK_APP_SECRET and META_APP_SECRET are both missing — all Meta webhooks will be rejected (401)')
+}
 app.use('/api/v1/meta/webhook', (req, res, next) => {
-  if (req.method !== 'POST') return next();
-  const chunks = [];
-  req.on('data', (chunk) => chunks.push(chunk));
-  req.on('end', () => {
-    req.rawBody = Buffer.concat(chunks);
-    req._body = true;
-    next();
-  });
-  req.on('error', next);
-});
+  if (req.method === 'GET') return next()
+  return express.raw({ type: 'application/json', limit: WEBHOOK_MAX_BYTES })(req, res, (err) => {
+    if (err) return next(err)
+    if (Buffer.isBuffer(req.body)) {
+      req.rawBody = req.body
+      req._body = true
+    }
+    next()
+  })
+})
 
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
