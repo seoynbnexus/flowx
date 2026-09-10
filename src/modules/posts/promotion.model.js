@@ -1,0 +1,77 @@
+export const PROMOTION_STATUS = {
+  WAITING_FOR_POST: 'waiting_for_post',
+  VALIDATING: 'validating',
+  CREATING: 'creating',
+  PENDING_REVIEW: 'pending_review',
+  ACTIVE: 'active',
+  PAUSED: 'paused',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled',
+}
+
+export const PROMOTION_TARGET_STATUS = {
+  PENDING: 'pending',
+  VALIDATING: 'validating',
+  CREATING: 'creating',
+  ACTIVE: 'active',
+  PAUSED: 'paused',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled',
+}
+
+export const PROMOTION_TARGET_ELIGIBILITY = {
+  UNKNOWN: 'unknown',
+  ELIGIBLE: 'eligible',
+  INELIGIBLE: 'ineligible',
+}
+
+export const PROMOTION_JOB_TYPES = {
+  EXECUTE: 'promotion_execute',
+}
+
+export const PROMOTION_STATUS_LABELS = {
+  waiting_for_post: 'Waiting for Post',
+  validating: 'Validating',
+  creating: 'Creating',
+  pending_review: 'Pending Review',
+  active: 'Active',
+  paused: 'Paused',
+  completed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+}
+
+export const PROMOTION_TARGET_STATUS_LABELS = {
+  pending: 'Pending',
+  validating: 'Validating',
+  creating: 'Creating',
+  active: 'Active',
+  paused: 'Paused',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+}
+
+export const VALID_PROMOTION_TRANSITIONS = {
+  [PROMOTION_STATUS.WAITING_FOR_POST]: [PROMOTION_STATUS.VALIDATING, PROMOTION_STATUS.CANCELLED, PROMOTION_STATUS.FAILED],
+  [PROMOTION_STATUS.VALIDATING]: [PROMOTION_STATUS.CREATING, PROMOTION_STATUS.CANCELLED, PROMOTION_STATUS.FAILED],
+  [PROMOTION_STATUS.CREATING]: [PROMOTION_STATUS.ACTIVE, PROMOTION_STATUS.PAUSED, PROMOTION_STATUS.PENDING_REVIEW, PROMOTION_STATUS.CANCELLED, PROMOTION_STATUS.FAILED],
+  [PROMOTION_STATUS.PENDING_REVIEW]: [PROMOTION_STATUS.ACTIVE, PROMOTION_STATUS.PAUSED, PROMOTION_STATUS.CANCELLED, PROMOTION_STATUS.FAILED],
+  [PROMOTION_STATUS.ACTIVE]: [PROMOTION_STATUS.PAUSED, PROMOTION_STATUS.CANCELLED],
+  [PROMOTION_STATUS.PAUSED]: [PROMOTION_STATUS.ACTIVE, PROMOTION_STATUS.CANCELLED],
+  [PROMOTION_STATUS.COMPLETED]: [],
+  [PROMOTION_STATUS.FAILED]: [],
+  [PROMOTION_STATUS.CANCELLED]: [],
+}
+
+export const TERMINAL_PROMOTION_STATUSES = [
+  PROMOTION_STATUS.COMPLETED,
+  PROMOTION_STATUS.FAILED,
+  PROMOTION_STATUS.CANCELLED,
+]
+
+export const IN_FLIGHT_PROMOTION_TARGET_STATUSES = [
+  PROMOTION_TARGET_STATUS.PENDING,
+  PROMOTION_TARGET_STATUS.VALIDATING,
+  PROMOTION_TARGET_STATUS.CREATING,
+]

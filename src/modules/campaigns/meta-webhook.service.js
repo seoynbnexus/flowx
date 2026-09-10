@@ -5,6 +5,12 @@ import * as repo from './campaign.repository.js'
 import { CAMPAIGN_STATUS, META_STATUS, REVIEW_ACTIONS, CAMPAIGN_JOB_TYPES } from './campaign.model.js'
 import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
 import { sendAdminAlert } from '../../../shared/mailer/alert.mailer.js'
+import {
+  resolveBoostObjectRefs,
+  upsertBoostSpendOnly,
+  stampBoostWebhookAt,
+} from '../posts/boost-performance.repository.js'
+import { applyBoostMetaStatus } from '../posts/boost-performance.service.js'
 
 export function verifyWebhookSignature(rawBody, signature, secret) {
   if (!secret || !rawBody || !signature) return false
@@ -66,7 +72,7 @@ function detectPlatform(object, field) {
 function extractExternalIds(object, value, entryId) {
   const externalAccountId = String(entryId || value?.ad_account_id || value?.page_id || value?.ig_user_id || '')
   const externalObjectId = String(
-    value?.post_id || value?.media_id || value?.comment_id || value?.story_id ||
+    value?.post_id || value?.media_id || value?.media?.id || value?.comment_id || value?.story_id ||
     value?.campaign_id || value?.ad_id || value?.id || ''
   )
   return { externalAccountId: externalAccountId || null, externalObjectId: externalObjectId || null }
@@ -130,7 +136,20 @@ async function findCampaignByFbCampaignId(fbCampaignId) {
 async function handleStatusUpdate(event) {
   const status = String(event.value.status || '').toUpperCase()
   const campaign = await findCampaignByFbCampaignId(event.value.campaign_id)
-  if (!campaign) return { ignored: true, reason: 'unknown_campaign' }
+  if (!campaign) {
+    // boost campaigns are not FlowX campaigns — resolve to the owning PostTarget
+    if (event.value.campaign_id) {
+      const refs = await resolveBoostObjectRefs([String(event.value.campaign_id)])
+      const ref = refs.get(String(event.value.campaign_id))
+      if (ref) {
+        const outcome = await applyBoostMetaStatus(ref, status)
+        await stampBoostWebhookAt(ref.postTargetId)
+        await logMetaEvent({ action: 'boost_webhook_status', postId: ref.postId, postTargetId: ref.postTargetId, path: ref.path, status, applied: outcome.applied })
+        return { applied: outcome.applied, boost: true, status, ...outcome }
+      }
+    }
+    return { ignored: true, reason: 'unknown_campaign' }
+  }
 
   const transition = await applyMetaStatusTransitionLocal(campaign, status)
   return {
@@ -145,7 +164,27 @@ async function handleSpendEvent(event) {
   const amount = parseFloat(event.value.amount)
   if (!Number.isFinite(amount) || amount <= 0) return { ignored: true, reason: 'no_amount' }
   const campaign = await findCampaignByFbCampaignId(event.value.campaign_id)
-  if (!campaign) return { ignored: true, reason: 'unknown_campaign' }
+  if (!campaign) {
+    // boost fast-path: spend updates for boosted posts resolve to a PostTarget.
+    // amount is daily-cumulative for the stat_date bucket — the repository
+    // upsert keeps the bucket monotonic so retries can never double-count.
+    if (event.value.campaign_id) {
+      const fbId = String(event.value.campaign_id)
+      const refs = await resolveBoostObjectRefs([fbId])
+      const ref = refs.get(fbId)
+      if (ref) {
+        const spendPaise = Math.round(amount * 100)
+        const statDate = /^\d{4}-\d{2}-\d{2}$/.test(String(event.value.date || ''))
+          ? String(event.value.date)
+          : new Date().toISOString().slice(0, 10)
+        await upsertBoostSpendOnly(ref.postId, ref.postTargetId, statDate, spendPaise)
+        await stampBoostWebhookAt(ref.postTargetId)
+        await logMetaEvent({ action: 'boost_webhook_spend', postId: ref.postId, postTargetId: ref.postTargetId, path: ref.path, spendPaise, statDate })
+        return { applied: true, boost: true, spendPaise, statDate }
+      }
+    }
+    return { ignored: true, reason: 'unknown_campaign' }
+  }
 
   const spendPaise = Math.round(amount * 100)
   const statDate = event.value.date || new Date().toISOString().slice(0, 10)
@@ -161,7 +200,21 @@ async function handleSpendEvent(event) {
 async function handleDeliverySignals(event) {
   const value = event.value || {}
   const campaign = await findCampaignByFbCampaignId(value.campaign_id)
-  if (!campaign) return { ignored: true, reason: 'unknown_campaign' }
+  if (!campaign) {
+    // delivery signals may arrive at ad level for boosted posts
+    const candidates = [value.ad_id, value.campaign_id].map(v => (v != null ? String(v) : '')).filter(Boolean)
+    if (candidates.length) {
+      const refs = await resolveBoostObjectRefs(candidates)
+      const ref = refs.get(String(value.ad_id || '')) || refs.get(String(value.campaign_id || ''))
+      if (ref && value.status) {
+        const outcome = await applyBoostMetaStatus(ref, String(value.status).toUpperCase())
+        await stampBoostWebhookAt(ref.postTargetId)
+        await logMetaEvent({ action: 'boost_webhook_delivery_signal', postId: ref.postId, postTargetId: ref.postTargetId, path: ref.path, adId: value.ad_id || null, status: String(value.status).toUpperCase(), applied: outcome.applied })
+        return { applied: outcome.applied, boost: true, outcomes: [{ adId: value.ad_id || null, status: String(value.status).toUpperCase(), ...outcome }] }
+      }
+    }
+    return { ignored: true, reason: 'unknown_campaign' }
+  }
 
   const outcomes = []
   if (value.ad_id && value.status) {
@@ -305,17 +358,44 @@ async function handleFacebookPageFeed(event) {
     }
   }
 
-  if ((item === 'status' || item === 'post' || item === 'photo' || item === 'video' || item === 'share' || item === 'album' || item === 'link' || item === 'story' || item === 'event') && (verb === 'remove' || verb === 'delete' || verb === 'hide' || verb === 'hidden' || value.deleted_time || value.is_hidden || value.hidden || value.post?.is_published === false)) {
-    const { query } = await import('../../../shared/database/connection.js')
-    const { uuidToBuffer } = await import('../../../shared/utils/uuid.utils.js')
-    const eventTime = event.time ? new Date(event.time * 1000).toISOString().slice(0, 19).replace('T', ' ') : new Date().toISOString().slice(0, 19).replace('T', ' ')
+  const isDeletionVerb = verb === 'remove' || verb === 'delete' || !!value.deleted_time
+  const isHiddenSignal = !isDeletionVerb && (
+    verb === 'hide' || verb === 'hidden' || value.is_hidden || value.hidden || value.post?.is_published === false
+  )
+  if ((item === 'status' || item === 'post' || item === 'photo' || item === 'video' || item === 'share' || item === 'album' || item === 'link' || item === 'story' || item === 'event') && (isDeletionVerb || isHiddenSignal)) {
+    const { query, queryOne } = await import('../../../shared/database/connection.js')
+    const { uuidToBuffer, bufferToUuid } = await import('../../../shared/utils/uuid.utils.js')
     const should = await shouldProcessEvent(targetRow, event.time)
     if (!should) return { ignored: true, reason: 'stale_event' }
+    const eventTime = event.time ? new Date(event.time * 1000).toISOString().slice(0, 19).replace('T', ' ') : new Date().toISOString().slice(0, 19).replace('T', ' ')
+    // stories are excluded from deletion monitoring (expiry is
+    // indistinguishable from deletion) — legacy columns only
+    const postRow = await queryOne('SELECT type FROM posts WHERE id = ?', [uuidToBuffer(targetRow.post_id)])
+    if (postRow?.type === 'story') {
+      await query('UPDATE post_targets SET meta_remote_status = ?, meta_deleted_at = ?, last_meta_event_at = ? WHERE id = ?', ['deleted', eventTime, eventTime, uuidToBuffer(targetRow.id)])
+      return { applied: true, deleted: true, story: true, targetId: targetRow.id, postId: targetRow.post_id }
+    }
+    const { handleRemoteContentSignal } = await import('../posts/deletion-monitoring.service.js')
+    if (isHiddenSignal) {
+      // hidden != deleted: reversible marker only, no violation pipeline,
+      // no meta_deleted_at (intentional fix of the old hide=>deleted conflation)
+      await query('UPDATE post_targets SET last_meta_event_at = ? WHERE id = ?', [eventTime, uuidToBuffer(targetRow.id)])
+      const outcome = await handleRemoteContentSignal({ postTargetId: targetRow.id, remoteState: 'hidden', source: 'webhook' })
+      return { applied: true, hidden: true, targetId: targetRow.id, postId: targetRow.post_id, ...outcome }
+    }
+    // platform-asserted deletion: compat write (existing behavior) + the
+    // new review pipeline (flagged now, enforced after the grace re-verify)
     await query('UPDATE post_targets SET meta_remote_status = ?, meta_deleted_at = ?, last_meta_event_at = ? WHERE id = ?', ['deleted', eventTime, eventTime, uuidToBuffer(targetRow.id)])
-    return { applied: true, deleted: true, targetId: targetRow.id, postId: targetRow.post_id }
+    const outcome = await handleRemoteContentSignal({
+      postTargetId: targetRow.id,
+      remoteState: 'missing',
+      source: 'webhook',
+      reason: `Facebook feed ${verb || 'remove'} event`,
+    })
+    return { applied: true, deleted: true, targetId: targetRow.id, postId: targetRow.post_id, ...outcome }
   }
 
-  if (item === 'comment' || item === 'like' || item === 'reaction' || commentId || value.reaction_type || verb === 'add' || verb === 'edited' || verb === 'remove' || verb === 'delete') {
+  if (item === 'comment' || item === 'like' || item === 'reaction' || commentId || value.reaction_type) {
     const should = await shouldProcessEvent(targetRow, event.time)
     if (!should) return { ignored: true, reason: 'stale_event' }
     const { requeueAutoJob } = await import('./campaign.repository.js')
@@ -331,6 +411,35 @@ async function handleFacebookPageFeed(event) {
     const evtTime = event.time ? new Date(event.time * 1000).toISOString().slice(0, 19).replace('T', ' ') : new Date().toISOString().slice(0, 19).replace('T', ' ')
     await query('UPDATE post_targets SET last_engagement_event_at = ?, last_meta_event_at = ? WHERE id = ?', [evtTime, evtTime, uuidToBuffer(targetRow.id)])
     return { applied: true, engagementRefreshQueued: true, targetId: targetRow.id }
+  }
+
+  // content-item lifecycle events (post/photo/video/share/album/link/event/
+  // milestone) that are neither an asserted deletion/hide nor an engagement
+  // interaction — Meta fires `verb: edited` (and add/update variants) when a
+  // photo post is DELETED (the feed story loses its photo; live-observed
+  // Sep 2026, undocumented in the official webhook reference). Every such
+  // event expedited-rechecks remote existence (<=60s) instead of trusting
+  // verb semantics; the poller's evidence chain does the classification.
+  if (item === 'status' || item === 'post' || item === 'photo' || item === 'video' || item === 'share' || item === 'album' || item === 'link' || item === 'event' || item === 'milestone') {
+    const should = await shouldProcessEvent(targetRow, event.time)
+    if (!should) return { ignored: true, reason: 'stale_event' }
+    const { requeueAutoJob } = await import('./campaign.repository.js')
+    const { POST_JOB_TYPES } = await import('../posts/post.model.js')
+    await requeueAutoJob(targetRow.post_id, POST_JOB_TYPES.REMOTE_HEALTH, { targetId: targetRow.id }, {
+      runKey: `remote-health:${targetRow.id}`,
+      entityType: 'post',
+      runAfterSeconds: 60,
+    })
+    await requeueAutoJob(targetRow.post_id, POST_JOB_TYPES.SYNC_ENGAGEMENT_TARGET, { targetId: targetRow.id }, {
+      runKey: `eng-target:${targetRow.id}`,
+      entityType: 'post',
+      runAfterSeconds: 15,
+    })
+    const { query } = await import('../../../shared/database/connection.js')
+    const { uuidToBuffer } = await import('../../../shared/utils/uuid.utils.js')
+    const evtTime = event.time ? new Date(event.time * 1000).toISOString().slice(0, 19).replace('T', ' ') : new Date().toISOString().slice(0, 19).replace('T', ' ')
+    await query('UPDATE post_targets SET last_engagement_event_at = ?, last_meta_event_at = ? WHERE id = ?', [evtTime, evtTime, uuidToBuffer(targetRow.id)])
+    return { applied: true, remoteHealthQueued: true, engagementRefreshQueued: true, targetId: targetRow.id }
   }
 
   const should = await shouldProcessEvent(targetRow, event.time)
@@ -351,7 +460,7 @@ async function handleFacebookPageFeed(event) {
 
 async function handleInstagramComments(event) {
   const value = event.value || {}
-  const mediaId = value.media_id || value.mediaId || value.id || event.externalObjectId
+  const mediaId = value.media_id || value.mediaId || value.media?.id || value.id || event.externalObjectId
   if (!mediaId) return { ignored: true, reason: 'no_media_id' }
   const { findPostTargetByExternalId } = await import('./campaign.repository.js')
   const targetRow = await findPostTargetByExternalId(mediaId, 'instagram')
@@ -374,7 +483,7 @@ async function handleInstagramComments(event) {
 
 async function handleInstagramStoryInsights(event) {
   const value = event.value || {}
-  const mediaId = value.media_id || value.id || event.externalObjectId
+  const mediaId = value.media_id || value.media?.id || value.id || event.externalObjectId
   if (!mediaId) return { ignored: true, reason: 'no_media_id' }
   const { findPostTargetByExternalId } = await import('./campaign.repository.js')
   const targetRow = await findPostTargetByExternalId(mediaId, 'instagram')
@@ -523,7 +632,7 @@ export async function processMetaWebhookEvents(body) {
           eventTime: event.time,
           payload: { object: event.object, field: event.field, value: event.value, time: event.time },
         })
-        await query("UPDATE meta_webhook_events SET processing_status = ?, processed_at = NOW() WHERE id = ?", [outcome && outcome.ignored ? 'ignored' : 'processed', event.id])
+        await query("UPDATE meta_webhook_events SET processing_status = ?, last_error = ?, processed_at = NOW() WHERE id = ?", [outcome && outcome.ignored ? 'ignored' : 'processed', outcome && outcome.ignored ? String(outcome.reason || 'unknown').slice(0, 2000) : null, event.id])
         results.push({ id: event.id, providerEventKey: providerKey, field: event.field, status: 'processed', outcome })
       } catch (err) {
         await logMetaEvent({ action: 'webhook', field: event.field, error: err.message })
@@ -615,7 +724,7 @@ export async function processWebhookEventById(eventId) {
     }
     const outcome = await handleMetaWebhookEvent(normalized)
     const isIgnored = outcome && outcome.ignored
-    await query('UPDATE meta_webhook_events SET processing_status = ?, processed_at = NOW(), last_error = NULL WHERE id = ?', [isIgnored ? 'ignored' : 'processed', eventId])
+    await query('UPDATE meta_webhook_events SET processing_status = ?, processed_at = NOW(), last_error = ? WHERE id = ?', [isIgnored ? 'ignored' : 'processed', isIgnored ? String(outcome.reason || 'unknown').slice(0, 2000) : null, eventId])
     return outcome
   } catch (err) {
     const isRetryable = isWebhookRetryableError(err)

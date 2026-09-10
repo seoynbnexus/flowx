@@ -23,6 +23,7 @@ router.post('/:id/duplicate', authenticate, requireRole('client', 'super_admin')
 router.put('/:id/targets', authenticate, requireRole('client', 'super_admin'), validate(postTargetsSchema), controller.setPostTargets)
 router.get('/:id/targets', authenticate, requireRole('client', 'super_admin'), controller.getPostTargets)
 router.get('/:id/engagement', authenticate, requireRole('client', 'super_admin'), controller.getPostEngagement)
+router.get('/:id/boost-performance', authenticate, requireRole('client', 'super_admin'), controller.getBoostPerformance)
 router.post('/:id/retry', authenticate, requireRole('client', 'super_admin'), controller.retryPost)
 router.get('/:id/publisher-progress', authenticate, requireRole('client', 'super_admin'), controller.getPostPublisherProgress)
 

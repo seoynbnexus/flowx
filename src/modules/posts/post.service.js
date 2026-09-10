@@ -17,6 +17,37 @@ import { join } from 'node:path'
 import { resolveAccountContext, getCoinConversionRate } from '../campaigns/campaign.service.js'
 import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
 
+async function createPromotionIntentForPost(post, clientTargetIds) {
+  const { createPromotionIntentForPost: createIntent } = await import('./promotion.service.js')
+  return createIntent(post, clientTargetIds)
+}
+
+async function wakePromotionForTarget(target) {
+  const { onPostTargetPosted } = await import('./promotion.service.js')
+  return onPostTargetPosted(target)
+}
+
+async function createPromotionTargetsForPublisherTargets(post, postTargets) {
+  const { createPromotionTargetsForPostTargets } = await import('./promotion.service.js')
+  return createPromotionTargetsForPostTargets(post, postTargets)
+}
+
+async function promotionExistsForPost(postId) {
+  const { findPromotionByPostId } = await import('./promotion.repository.js')
+  const promotion = await findPromotionByPostId(postId)
+  return !!promotion
+}
+
+async function promotionsEnabled() {
+  const { isPromotionsEnabled } = await import('./promotion.service.js')
+  return isPromotionsEnabled()
+}
+
+async function chargePromotionOnApproval(post) {
+  const { chargePromotionForApproval } = await import('./promotion.service.js')
+  return chargePromotionForApproval(post)
+}
+
 async function isPostDuplicateEnabled() {
   try {
     const row = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', ['feature_visibility'])
@@ -111,7 +142,7 @@ async function getFbPageIdForIgTarget(target, clientId) {
   return null
 }
 
-async function buildPostBoostPayloads(post, target, coinRate) {
+export async function buildPostBoostPayloads(post, target, coinRate) {
   const budgetType = post.boostBudgetType || 'daily'
   const isDaily = budgetType === 'daily'
   const minBudgetInr = isDaily ? 241 : 100
@@ -220,15 +251,7 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
     await logMetaEvent({ action: 'post_boost_hard_fail', postId: post.id, targetId: target.id, error: `Boost not supported for platform ${target.platformCode}` })
     return { success: false, error: `Posts on ${target.platformCode} cannot be boosted.` }
   }
-  const igStoryPoll = {
-    intervalMs: 5000,
-    maxTries: 6,
-    requeueSeconds: 60,
-    maxRequeues: 8
-  }
-  // hard gate: check eligibility first (no dark-post fallback)
   if (target.platformCode === 'facebook') {
-    // lazy resolution: only video/reel posts store a video id needing post_id resolution; photo posts legitimately store bare photo ids
     if (target.metaObjectId && !String(target.metaObjectId).includes('_') && target.remoteVideoId && target.accessToken) {
       const resolvedId = await resolveFbPostObjectId(target.platformUserId, target.remoteVideoId, target.accessToken)
       if (resolvedId) {
@@ -240,7 +263,6 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
         return { requeueAfterSeconds: 60, attempts: 0 }
       }
     }
-    // lazy fetch promotability if not yet checked (backwards compat for old rows)
     if (target.isEligibleForPromotion == null && target.promotableId == null && target.metaObjectId) {
       const qualified = qualifyFbPostId(target.platformUserId, target.metaObjectId)
       await capturePostPromotability(target, qualified)
@@ -251,15 +273,13 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
         target.allowedObjectives = refreshed.allowedObjectives
       }
     }
-    // promotability fetch may have failed (token/permission) — don't hard-fail on unknown
     if (target.isEligibleForPromotion === false) {
       const reason = target.eligibilityReason || 'This post is not eligible to be boosted'
       await logMetaEvent({ action: 'post_boost_hard_fail', postId: post.id, targetId: target.id, error: reason })
       return { success: false, error: `Post ${target.metaObjectId} isn't eligible to be boosted — ${reason}. Help Center https://www.facebook.com/business/help/1575107409431290` }
     }
     if (target.allowedObjectives && Array.isArray(target.allowedObjectives) && target.allowedObjectives.length && post.boostObjective) {
-      const legacyMap = { REACH: 'OUTCOME_AWARENESS', IMPRESSIONS: 'OUTCOME_AWARENESS', BRAND_AWARENESS: 'OUTCOME_AWARENESS', VIDEO_VIEWS: 'OUTCOME_ENGAGEMENT', POST_ENGAGEMENT: 'OUTCOME_ENGAGEMENT', LINK_CLICKS: 'OUTCOME_TRAFFIC', MESSAGES: 'OUTCOME_ENGAGEMENT', PAGE_LIKES: 'OUTCOME_ENGAGEMENT', CONVERSIONS: 'OUTCOME_SALES', LEAD_GENERATION: 'OUTCOME_LEADS' }
-      const mapped = legacyMap[String(post.boostObjective).toUpperCase().trim()] || String(post.boostObjective).toUpperCase().trim()
+      const mapped = String(post.boostObjective).toUpperCase().trim()
       const allowed = new Set(target.allowedObjectives.map(s => String(s).toUpperCase()))
       if (!allowed.has(mapped)) {
         return { success: false, error: `Objective ${post.boostObjective} not allowed for this post — allowed: ${target.allowedObjectives.join(', ')}` }
@@ -301,8 +321,7 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
       return { success: false, error: `Instagram post ${target.metaObjectId} isn't eligible to be boosted — ${reason}. Help Center https://www.facebook.com/business/help/1575107409431290` }
     }
     if (target.allowedObjectives && Array.isArray(target.allowedObjectives) && target.allowedObjectives.length && post.boostObjective) {
-      const legacyMap = { REACH: 'OUTCOME_AWARENESS', IMPRESSIONS: 'OUTCOME_AWARENESS', BRAND_AWARENESS: 'OUTCOME_AWARENESS', VIDEO_VIEWS: 'OUTCOME_ENGAGEMENT', POST_ENGAGEMENT: 'OUTCOME_ENGAGEMENT', LINK_CLICKS: 'OUTCOME_TRAFFIC', MESSAGES: 'OUTCOME_ENGAGEMENT', PAGE_LIKES: 'OUTCOME_ENGAGEMENT', CONVERSIONS: 'OUTCOME_SALES', LEAD_GENERATION: 'OUTCOME_LEADS' }
-      const mapped = legacyMap[String(post.boostObjective).toUpperCase().trim()] || String(post.boostObjective).toUpperCase().trim()
+      const mapped = String(post.boostObjective).toUpperCase().trim()
       const allowed = new Set(target.allowedObjectives.map(s => String(s).toUpperCase()))
       if (!allowed.has(mapped)) {
         return { success: false, error: `Objective ${post.boostObjective} not allowed for this Instagram post — allowed: ${target.allowedObjectives.join(', ')}` }
@@ -310,14 +329,9 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
     }
   }
 
-  const { accountId: adAccountId, accessToken: systemToken, accountDbId } = await resolveAccountContext()
+  const { accountId: adAccountId, accessToken: systemToken } = await resolveAccountContext()
   const coinRate = await getCoinConversionRate()
-  let boostPayload
-  try {
-    boostPayload = await buildPostBoostPayloads(post, target, coinRate)
-  } catch (e) {
-    throw e
-  }
+  const boostPayload = await buildPostBoostPayloads(post, target, coinRate)
 
   logMetaEvent({ action: 'boost_post_payload_created', params: { payload: JSON.stringify(boostPayload), postId: post.id, targetId: target.id, adAccountId, pageId: target.platformUserId } })
 
@@ -331,12 +345,34 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
   }
 
   const pageId = target.platformCode === 'instagram' ? (target.igBusinessAccountId || target.platformUserId) : target.platformUserId
-  const rawObjectStoryId = target.metaObjectId
   const promotable = target.promotableId || null
-  let objectStoryId = target.platformCode === 'instagram' ? rawObjectStoryId : (target.platformCode === 'facebook' ? (promotable || qualifyFbPostId(pageId, rawObjectStoryId)) : rawObjectStoryId)
+  const objectStoryId = target.platformCode === 'instagram' ? target.metaObjectId : (promotable || qualifyFbPostId(pageId, target.metaObjectId))
 
-  logMetaEvent({ action: 'post_boost_create', postId: post.id, targetId: target.id, adAccountId, pageId: target.platformUserId })
+  return executeBoostCreation({
+    post, target, adAccountId, systemToken, boostPayload, objectStoryId, jobPayload,
+    logPrefix: 'post_boost',
+  }, {
+    existingIds: {},
+    onObjectCreated: async (type, id) => {
+      await repo.createPostBoostTarget(post.id, target.id, { platformAccountId: target.platformAccountId, objectType: type, objectId: id, status: type === 'ad_creative' ? null : 'PAUSED', boostStatus: 'pending', createdForUserId: post.clientId })
+    },
+    onCleanupDb: async () => {
+      await repo.deletePostBoostTargetsByTargetId(target.id)
+    },
+  })
+}
+
+export async function executeBoostCreation(ctx, opts = {}) {
+  const { post, target, adAccountId, systemToken, boostPayload, objectStoryId, jobPayload = {}, logPrefix = 'promotion' } = ctx
+  const { existingIds = {}, onObjectCreated = null, onCleanupDb = null } = opts
+  const igStoryPoll = { intervalMs: 5000, maxTries: 6, requeueSeconds: 60, maxRequeues: 8 }
+  const log = (action, params) => logMetaEvent({ action: `${logPrefix}_${action}`, ...params })
+
   const createdObjects = []
+  const markCreated = async (type, id) => {
+    createdObjects.push({ type, id })
+    if (onObjectCreated) await onObjectCreated(type, id)
+  }
 
   const validateStep = async (step, fn) => {
     try {
@@ -344,7 +380,7 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
       return null
     } catch (error) {
       const detail = extractMetaError(error)
-      await logMetaEvent({ postId: post.id, targetId: target.id, action: step, error: detail?.userMsg || error.message })
+      await log(step, { postId: post.id, targetId: target.id, error: detail?.userMsg || error.message })
       return detail?.userMsg || error.message
     }
   }
@@ -358,69 +394,106 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
       msg.includes('Invalid post_id') || msg.includes("can't be promoted") || msg.includes('cannot be promoted') || msg.includes('Invalid post_id parameter') || msg.includes("This post can't be boosted")
     )
   }
+  const isTransientMetaError = (err) => {
+    if (!err) return false
+    if (err.statusCode && err.statusCode >= 500) return true
+    if (err.metaAmbiguous) return true
+    const d = extractMetaError(err)
+    if (d?.code === 1 && !d?.subcode) return true
+    if (d && [2, 4, 17, 613, 80004].includes(Number(d.code))) return true
+    if (err.statusCode === 429) return true
+    if (!err.statusCode && !d && String(err.message).match(/fetch failed|network|timeout|ECONNRESET|ETIMEDOUT|ENOTFOUND/i)) return true
+    return false
+  }
   const isUnpromotableAdError = (err) => {
     const d = extractMetaError(err)
     const msg = String(err.message)
     return d?.code === 100 && (d?.subcode === 1487472 || d?.subcode === 2446187 || msg.includes("can't be promoted") || msg.includes("Page post can't be used") || msg.includes("This post can't be boosted"))
   }
 
-  try {
-    const tryObjectStoryValidate = async () => {
-      if (target.platformCode === 'instagram') {
-        const igActorId = target.igBusinessAccountId || target.platformUserId
-        const fbPageIdForIg = await getFbPageIdForIgTarget(target, post.clientId)
-        await createAdCreativeFromInstagramPost(adAccountId, objectStoryId, igActorId, fbPageIdForIg, `Boost ${post.name}`, systemToken, true)
-      } else {
-        await createAdCreativeFromPost(adAccountId, objectStoryId, `Boost ${post.name}`, systemToken, true)
+  const cleanupCreatedBoostObjects = async (objects, token) => {
+    const order = ['ad', 'ad_creative', 'ad_set', 'facebook_campaign']
+    for (const type of order) {
+      const obj = objects.find(o => o.type === type)
+      if (!obj) continue
+      try {
+        if (type === 'ad_creative') await deleteAdCreative(obj.id, token)
+        else if (type === 'ad_set') await deleteAdSet(obj.id, token)
+        else if (type === 'facebook_campaign') await deleteAdCampaign(obj.id, token)
+      } catch (cleanupErr) {
+        const cleanupDetail = extractMetaError(cleanupErr)
+        await log('cleanup_error', { postId: post.id, targetId: target.id, objectType: type, objectId: obj.id, error: cleanupDetail?.userMsg || cleanupErr.message })
       }
     }
+  }
+
+  try {
     let creativeValidationError = null
-    try {
-      await tryObjectStoryValidate()
-    } catch (err) {
-      const d = extractMetaError(err)
-      const hardMsg = d?.userMsg || err.message
-      if (isInvalidPostIdError(err)) {
-        await logMetaEvent({ postId: post.id, targetId: target.id, action: 'validate_creative_hard_fail', error: `object_story_id ${objectStoryId} not promotable: ${hardMsg}` })
-        creativeValidationError = `${hardMsg} — This post can't be boosted. Help Center https://www.facebook.com/business/help/1575107409431290`
-      } else {
-        creativeValidationError = hardMsg
+    if (!existingIds.creativeId) {
+      try {
+        if (target.platformCode === 'instagram') {
+          const igActorId = target.igBusinessAccountId || target.platformUserId
+          const fbPageIdForIg = await getFbPageIdForIgTarget(target, post.clientId)
+          await createAdCreativeFromInstagramPost(adAccountId, objectStoryId, igActorId, fbPageIdForIg, `Boost ${post.name}`, systemToken, true)
+        } else {
+          await createAdCreativeFromPost(adAccountId, objectStoryId, `Boost ${post.name}`, systemToken, true)
+        }
+      } catch (err) {
+        const d = extractMetaError(err)
+        const hardMsg = d?.userMsg || err.message
+        if (isInvalidPostIdError(err)) {
+          await log('validate_creative_hard_fail', { postId: post.id, targetId: target.id, error: `object_story_id ${objectStoryId} not promotable: ${hardMsg}` })
+          creativeValidationError = `${hardMsg} — This post can't be boosted. Help Center https://www.facebook.com/business/help/1575107409431290`
+        } else if (isTransientMetaError(err)) {
+          await log('validate_creative_transient', { postId: post.id, targetId: target.id, error: hardMsg })
+          return { requeueAfterSeconds: 30, transient: true, attempts: { ...jobPayload } }
+        } else {
+          creativeValidationError = hardMsg
+        }
       }
     }
     if (creativeValidationError) return { success: false, error: creativeValidationError }
 
-    const campaignValidationError = await validateStep('validate_campaign', () =>
-      createAdCampaign(adAccountId, boostPayload.fbCampaignName, boostPayload.campaignObjective, 'PAUSED', systemToken, { spendCap: boostPayload.spendCapInPaise }, true)
-    )
-    if (campaignValidationError) return { success: false, error: campaignValidationError }
-
-    const t0 = Date.now()
-    const fbCampaign = await createAdCampaign(adAccountId, boostPayload.fbCampaignName, boostPayload.campaignObjective, 'PAUSED', systemToken, { spendCap: boostPayload.spendCapInPaise })
-    createdObjects.push({ type: 'facebook_campaign', id: fbCampaign.id, postId: post.id, targetId: target.id })
-    await repo.createPostBoostTarget(post.id, target.id, { platformAccountId: target.platformAccountId, objectType: 'facebook_campaign', objectId: fbCampaign.id, status: 'PAUSED', boostStatus: 'pending', createdForUserId: post.clientId })
-
-    const adSetValidationError = await validateStep('validate_ad_set', () =>
-      createAdSet(adAccountId, fbCampaign.id, boostPayload.targeting, boostPayload.adSetBudget, boostPayload.adSetSchedule, boostPayload.adSetPlacement, systemToken, true)
-    )
-    if (adSetValidationError) {
-      await repo.deletePostBoostTargetsByTargetId(target.id)
-      return { success: false, error: adSetValidationError }
+    if (!existingIds.campaignId) {
+      const campaignValidationError = await validateStep('validate_campaign', () =>
+        createAdCampaign(adAccountId, boostPayload.fbCampaignName, boostPayload.campaignObjective, 'PAUSED', systemToken, { spendCap: boostPayload.spendCapInPaise }, true)
+      )
+      if (campaignValidationError) return { success: false, error: campaignValidationError }
     }
 
-    const t1 = Date.now()
-    const fbAdSet = await createAdSet(adAccountId, fbCampaign.id, boostPayload.targeting, boostPayload.adSetBudget, boostPayload.adSetSchedule, boostPayload.adSetPlacement, systemToken)
-    createdObjects.push({ type: 'ad_set', id: fbAdSet.id, postId: post.id, targetId: target.id })
-    await repo.createPostBoostTarget(post.id, target.id, { platformAccountId: target.platformAccountId, objectType: 'ad_set', objectId: fbAdSet.id, status: 'PAUSED', boostStatus: 'pending', createdForUserId: post.clientId })
+    let fbCampaignId = existingIds.campaignId || null
+    if (!fbCampaignId) {
+      const fbCampaign = await createAdCampaign(adAccountId, boostPayload.fbCampaignName, boostPayload.campaignObjective, 'PAUSED', systemToken, { spendCap: boostPayload.spendCapInPaise })
+      fbCampaignId = fbCampaign.id
+      await markCreated('facebook_campaign', fbCampaignId)
+    }
 
-    const t2 = Date.now()
+    let fbAdSetId = existingIds.adsetId || null
+    if (!fbAdSetId) {
+      const adSetValidationError = await validateStep('validate_ad_set', () =>
+        createAdSet(adAccountId, fbCampaignId, boostPayload.targeting, boostPayload.adSetBudget, boostPayload.adSetSchedule, boostPayload.adSetPlacement, systemToken, true)
+      )
+      if (adSetValidationError) {
+        await log('cleanup_start', { postId: post.id, targetId: target.id, reason: 'adset_validation_failed', objects: createdObjects.length })
+        await cleanupCreatedBoostObjects(createdObjects, systemToken)
+        if (onCleanupDb) await onCleanupDb()
+        return { success: false, error: adSetValidationError }
+      }
+      const fbAdSet = await createAdSet(adAccountId, fbCampaignId, boostPayload.targeting, boostPayload.adSetBudget, boostPayload.adSetSchedule, boostPayload.adSetPlacement, systemToken)
+      fbAdSetId = fbAdSet.id
+      await markCreated('ad_set', fbAdSetId)
+    }
+
     let fbCreative
+    const creativeWasPreExisting = !!existingIds.creativeId
     try {
-      if (target.platformCode === 'instagram') {
+      if (creativeWasPreExisting) {
+        fbCreative = { id: existingIds.creativeId }
+      } else if (target.platformCode === 'instagram') {
         const igActorId = target.igBusinessAccountId || target.platformUserId
         const fbPageIdForIg = await getFbPageIdForIgTarget(target, post.clientId)
         fbCreative = await createAdCreativeFromInstagramPost(adAccountId, objectStoryId, igActorId, fbPageIdForIg, `Boost ${post.name}`, systemToken)
 
-        // IG story-id verification poll: wait for Meta to resolve the media into a Facebook shadow post
         let storyId = await getCreativeStoryId(fbCreative.id, systemToken)
         let storyAttempts = 0
         while (!storyId && storyAttempts < igStoryPoll.maxTries) {
@@ -430,30 +503,15 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
         }
         if (!storyId) {
           const nextAttempts = (Number(jobPayload.storyAttempts) || 0) + 1
+          await log('cleanup_start', { postId: post.id, targetId: target.id, reason: 'story_poll_unresolved', objects: createdObjects.length + 1 })
+          await cleanupCreatedBoostObjects([...createdObjects, { type: 'ad_creative', id: fbCreative.id }], systemToken)
+          if (onCleanupDb) await onCleanupDb()
           if (nextAttempts >= igStoryPoll.maxRequeues) {
-            try { await deleteAdCreative(fbCreative.id, systemToken) } catch {}
-            await repo.deletePostBoostTargetsByTargetId(target.id)
-            for (const obj of createdObjects) {
-              try {
-                if (obj.type === 'facebook_campaign') await deleteAdCampaign(obj.id, systemToken)
-                else if (obj.type === 'ad_set') await deleteAdSet(obj.id, systemToken)
-              } catch {}
-            }
-            return { success: false, error: `Instagram post ${rawObjectStoryId} not ready for boosting — Meta is still indexing the media. Retry in a few minutes (attempt ${nextAttempts}/${igStoryPoll.maxRequeues})` }
+            return { success: false, error: `Instagram post ${objectStoryId} not ready for boosting — Meta is still indexing the media. Retry in a few minutes (attempt ${nextAttempts}/${igStoryPoll.maxRequeues})` }
           }
-          try { await deleteAdCreative(fbCreative.id, systemToken) } catch {}
-          await repo.deletePostBoostTargetsByTargetId(target.id)
-          for (const obj of createdObjects) {
-            try {
-              if (obj.type === 'facebook_campaign') await deleteAdCampaign(obj.id, systemToken)
-              else if (obj.type === 'ad_set') await deleteAdSet(obj.id, systemToken)
-            } catch {}
-          }
-          await logMetaEvent({ action: 'post_boost_story_pending', postId: post.id, targetId: target.id, error: `effective_object_story_id not yet available for ${fbCreative.id} — requeueing (${nextAttempts}/${igStoryPoll.maxRequeues})` })
+          await log('story_pending', { postId: post.id, targetId: target.id, error: `effective_object_story_id not yet available for ${fbCreative.id} — requeueing (${nextAttempts}/${igStoryPoll.maxRequeues})` })
           return { requeueAfterSeconds: igStoryPoll.requeueSeconds, attempts: { ...jobPayload, storyAttempts: nextAttempts } }
         }
-        // storyId now available — use it as the effective object story id going forward
-        objectStoryId = storyId
       } else {
         fbCreative = await createAdCreativeFromPost(adAccountId, objectStoryId, `Boost ${post.name}`, systemToken)
       }
@@ -461,65 +519,79 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
       if (isInvalidPostIdError(err)) {
         const d = extractMetaError(err)
         const hardMsg = d?.userMsg || err.message
-        await logMetaEvent({ postId: post.id, targetId: target.id, action: 'create_creative_hard_fail', error: `object_story_id ${objectStoryId} not promotable: ${hardMsg}` })
+        await log('create_creative_hard_fail', { postId: post.id, targetId: target.id, error: `object_story_id ${objectStoryId} not promotable: ${hardMsg}` })
         throw new ValidationError(`${hardMsg} — This post can't be boosted. Help Center https://www.facebook.com/business/help/1575107409431290`)
+      }
+      if (isTransientMetaError(err)) {
+        await log('cleanup_start', { postId: post.id, targetId: target.id, reason: 'creative_transient', objects: createdObjects.length })
+        await cleanupCreatedBoostObjects(createdObjects, systemToken)
+        if (onCleanupDb) await onCleanupDb()
+        return { requeueAfterSeconds: 30, transient: true, attempts: { ...jobPayload } }
       }
       throw err
     }
-    if (target.platformCode !== 'instagram') {
-      createdObjects.push({ type: 'ad_creative', id: fbCreative.id, postId: post.id, targetId: target.id })
-      await repo.createPostBoostTarget(post.id, target.id, { platformAccountId: target.platformAccountId, objectType: 'ad_creative', objectId: fbCreative.id, status: null, boostStatus: 'pending', createdForUserId: post.clientId })
-    } else {
-      // Instagram: still persist the creative and add to createdObjects
-      createdObjects.push({ type: 'ad_creative', id: fbCreative.id, postId: post.id, targetId: target.id })
-      await repo.createPostBoostTarget(post.id, target.id, { platformAccountId: target.platformAccountId, objectType: 'ad_creative', objectId: fbCreative.id, status: null, boostStatus: 'pending', createdForUserId: post.clientId })
+    if (!creativeWasPreExisting) {
+      await markCreated('ad_creative', fbCreative.id)
     }
 
-    const adValidationError = await validateStep('validate_ad', () =>
-      createAd(adAccountId, fbAdSet.id, fbCreative.id, `Boost ${post.name}`, systemToken, 'PAUSED', {}, true)
-    )
-    if (adValidationError) {
-      const isUnpromotable = adValidationError.includes("can't be promoted") || adValidationError.includes("Page post can't be used") || adValidationError.includes("This post can't be boosted")
-      const hardMsg = isUnpromotable ? `${adValidationError} — This post can't be boosted. Help Center https://www.facebook.com/business/help/1575107409431290` : adValidationError
-      await repo.deletePostBoostTargetsByTargetId(target.id)
-      return { success: false, error: hardMsg }
-    }
-
-    const t3 = Date.now()
-    let fbAd
-    try {
-      fbAd = await createAd(adAccountId, fbAdSet.id, fbCreative.id, `Boost ${post.name}`, systemToken, 'PAUSED')
-    } catch (adErr) {
-      if (isUnpromotableAdError(adErr)) {
-        const d = extractMetaError(adErr)
-        const hardMsg = d?.userMsg || adErr.message
-        await repo.deletePostBoostTargetsByTargetId(target.id)
-        return { success: false, error: `${hardMsg} — This post can't be boosted. Help Center https://www.facebook.com/business/help/1575107409431290` }
+    let fbAdId = existingIds.adId || null
+    if (!fbAdId) {
+      const adValidationError = await validateStep('validate_ad', () =>
+        createAd(adAccountId, fbAdSetId, fbCreative.id, `Boost ${post.name}`, systemToken, 'PAUSED', {}, true)
+      )
+      if (adValidationError) {
+        const isUnpromotable = adValidationError.includes("can't be promoted") || adValidationError.includes("Page post can't be used") || adValidationError.includes("This post can't be boosted")
+        const hardMsg = isUnpromotable ? `${adValidationError} — This post can't be boosted. Help Center https://www.facebook.com/business/help/1575107409431290` : adValidationError
+        await log('cleanup_start', { postId: post.id, targetId: target.id, reason: 'ad_validation_failed', objects: createdObjects.length })
+        await cleanupCreatedBoostObjects(createdObjects, systemToken)
+        if (onCleanupDb) await onCleanupDb()
+        return { success: false, error: hardMsg }
       }
-      throw adErr
-    }
-    createdObjects.push({ type: 'ad', id: fbAd.id, postId: post.id, targetId: target.id })
-    await repo.createPostBoostTarget(post.id, target.id, { platformAccountId: target.platformAccountId, objectType: 'ad', objectId: fbAd.id, status: 'PAUSED', boostStatus: 'pending', createdForUserId: post.clientId })
 
-    await logMetaEvent({ action: 'post_boost_created', postId: post.id, targetId: target.id, objects: createdObjects.length })
-    return { success: true, objects: createdObjects }
-   
-   }
-    catch (error) {
+      try {
+        const fbAd = await createAd(adAccountId, fbAdSetId, fbCreative.id, `Boost ${post.name}`, systemToken, 'PAUSED')
+        fbAdId = fbAd.id
+      } catch (adErr) {
+        if (isUnpromotableAdError(adErr)) {
+          const d = extractMetaError(adErr)
+          const hardMsg = d?.userMsg || adErr.message
+          await log('cleanup_start', { postId: post.id, targetId: target.id, reason: 'ad_unpromotable', objects: createdObjects.length })
+          await cleanupCreatedBoostObjects(createdObjects, systemToken)
+          if (onCleanupDb) await onCleanupDb()
+          return { success: false, error: `${hardMsg} — This post can't be boosted. Help Center https://www.facebook.com/business/help/1575107409431290` }
+        }
+        throw adErr
+      }
+      await markCreated('ad', fbAdId)
+    }
+
+    await log('created', { postId: post.id, targetId: target.id, objects: createdObjects.length, reused: { campaign: !!existingIds.campaignId, adset: !!existingIds.adsetId, creative: !!existingIds.creativeId, ad: !!existingIds.adId } })
+    return { success: true, objects: createdObjects, finalIds: { campaignId: fbCampaignId, adsetId: fbAdSetId, creativeId: fbCreative.id, adId: fbAdId } }
+  } catch (error) {
     const detail = extractMetaError(error)
     const message = detail?.userMsg || error.message
-    console.error('[postBoost] create error stack', error.stack)
-    await logMetaEvent({ action: 'post_boost_create', postId: post.id, targetId: target.id, error: message + ' | stack: ' + String(error.stack).slice(0,500) })
-    await repo.deletePostBoostTargetsByTargetId(target.id)
+    if (isTransientMetaError(error)) {
+      await log('cleanup_start', { postId: post.id, targetId: target.id, reason: 'create_transient', objects: createdObjects.length })
+      await cleanupCreatedBoostObjects(createdObjects, systemToken)
+      if (onCleanupDb) await onCleanupDb()
+      return { requeueAfterSeconds: 30, transient: true, attempts: { ...jobPayload } }
+    }
+    await log('create_error', { postId: post.id, targetId: target.id, error: message + ' | stack: ' + String(error.stack).slice(0,500) })
+    await log('cleanup_start', { postId: post.id, targetId: target.id, reason: 'create_error', objects: createdObjects.length })
+    await cleanupCreatedBoostObjects(createdObjects, systemToken)
+    if (onCleanupDb) await onCleanupDb()
     return { success: false, error: message + ' | ' + String(error.stack).slice(0,200) }
   }
 }
 
+
 export async function queuePostBoosts(postId) {
   const post = await repo.findPostById(postId)
   if (!post || !post.boostEnabled) return { enqueued: 0, skipped: true }
+  if (await promotionExistsForPost(postId)) return { enqueued: 0, skipped: true, suppressedByPromotion: true }
   const targets = await repo.findPostTargetsByPostId(postId)
-  const posted = targets.filter(t => t.status === POST_TARGET_STATUS.POSTED && t.metaObjectId)
+  const posted = targets.filter(t => t.status === POST_TARGET_STATUS.POSTED && t.metaObjectId
+    && t.deletionReviewState !== 'confirmed' && t.remoteContentState !== 'missing')
   if (!posted.length) return { enqueued: 0, skipped: true }
   let enqueued = 0
   let skippedIneligible = 0
@@ -825,6 +897,7 @@ async function publishToInstagram(target, message, postType, mediaUrl) {
   const container = await createInstagramMedia(igId, mediaUrl, message, target.accessToken, {
     mediaType: isVideo ? 'REELS' : 'IMAGE',
     videoUrl: isVideo ? mediaUrl : undefined,
+    shareToFeed: isVideo ? true : undefined,
   })
   if (isVideo) {
     try {
@@ -841,6 +914,23 @@ export async function createPost(userId, data) {
   validatePublisherConfig(data)
   validateBoostConfig(data)
   const boostCost = data.boostEnabled ? calculatePostBoostCost(data) : 0
+
+  if (boostCost > 0 && (await promotionsEnabled())) {
+    const id = generateUuid()
+    const { targetAccountIds, ...postData } = data
+    const { accountDbId } = await resolveAccountContext()
+    await transaction(async () => {
+      await repo.createPost(id, userId, { ...postData, adAccountId: accountDbId, chargedBoostPaise: 0 })
+      if (targetAccountIds && targetAccountIds.length > 0) {
+        await setPostTargets(userId, id, targetAccountIds)
+      }
+      const createdPost = await repo.findPostById(id)
+      if (createdPost) {
+        await createPromotionIntentForPost(createdPost, targetAccountIds)
+      }
+    })
+    return repo.findPostById(id)
+  }
 
   if (boostCost > 0) {
     const coinRate = await getCoinConversionRate()
@@ -869,7 +959,11 @@ export async function createPost(userId, data) {
       if (targetAccountIds && targetAccountIds.length > 0) {
         await setPostTargets(userId, id, targetAccountIds)
       }
-      return repo.findPostById(id)
+      const createdPost = await repo.findPostById(id)
+      if (createdPost) {
+        await createPromotionIntentForPost(createdPost, targetAccountIds)
+      }
+      return createdPost
     })
   }
 
@@ -1011,15 +1105,27 @@ export async function cancelPost(userId, postId) {
   }
 
   if (post.boostEnabled && post.chargedBoostPaise > 0) {
-    try {
-      const coinService = await import('../../../shared/services/coin.service.js')
-      const coinRate = await getCoinConversionRate()
-      const refundCoins = Math.round(post.chargedBoostPaise / (coinRate * 100))
-      if (refundCoins > 0) {
-        await coinService.refundWithDetail(post.clientId, refundCoins, 'post_boost', post.id, `Refund: post cancelled — boost refund for "${post.name}"`, { fromMonthly: 0, fromWallet: refundCoins })
-        await repo.insertPostBillingEntry(post.id, { kind: 'refund', paise: post.chargedBoostPaise, coins: refundCoins, rate: coinRate, paidFromMonthly: 0, paidFromWallet: refundCoins, reason: 'Boost refund on cancel' })
-      }
-    } catch {}
+    const ownedByPromotion = await promotionExistsForPost(postId)
+    if (!ownedByPromotion) {
+      try {
+        const coinService = await import('../../../shared/services/coin.service.js')
+        const coinRate = await getCoinConversionRate()
+        const refundCoins = Math.round(post.chargedBoostPaise / (coinRate * 100))
+        if (refundCoins > 0) {
+          await coinService.refundWithDetail(post.clientId, refundCoins, 'post_boost', post.id, `Refund: post cancelled — boost refund for "${post.name}"`, { fromMonthly: 0, fromWallet: refundCoins })
+          await repo.insertPostBillingEntry(post.id, { kind: 'refund', paise: post.chargedBoostPaise, coins: refundCoins, rate: coinRate, paidFromMonthly: 0, paidFromWallet: refundCoins, reason: 'Boost refund on cancel' })
+        }
+      } catch {}
+    } else {
+      try {
+        const { findPromotionByPostId } = await import('./promotion.repository.js')
+        const { cancelPromotionById } = await import('./promotion.service.js')
+        const promotion = await findPromotionByPostId(postId)
+        if (promotion && !['completed', 'failed', 'cancelled'].includes(promotion.status)) {
+          await cancelPromotionById(promotion.id)
+        }
+      } catch {}
+    }
   }
 
   const updated = await repo.updatePostWithStatusGuard(postId, { status: POST_STATUS.CANCELLED }, post.status)
@@ -1092,6 +1198,10 @@ export async function approvePost(adminId, postId, data) {
   }
 
   const now = new Date().toISOString().slice(0, 19).replace('T', ' ')
+
+  if (post.boostEnabled && (await promotionsEnabled())) {
+    await chargePromotionOnApproval(post)
+  }
 
   if (post.runOnPublishers) {
     if (!post.categoryId || !post.publisherCount || !post.coinsPerPublisher) {
@@ -1433,6 +1543,14 @@ export async function completePostPublisherRequest(publisherId, requestId) {
   const post = await repo.findPostById(request.postId)
   if (!post) throw new NotFoundError('Post not found')
 
+  // payout block: a confirmed-deleted post target means the publisher removed
+  // paid content — no coins leave until an admin reviews (dismiss lifts this)
+  const { findConfirmedDeletionTargetsByRequestId } = await import('./deletion-monitoring.repository.js')
+  const deletedTargets = await findConfirmedDeletionTargetsByRequestId(requestId)
+  if (deletedTargets.length > 0) {
+    throw new ValidationError('Post deleted from platform — payout blocked pending admin review')
+  }
+
   await transaction(async () => {
     await repo.lockPostById(post.id)
     await repo.updatePostPublisherRequestStatusWithGuard(
@@ -1471,11 +1589,13 @@ export async function goLiveForFilledPost(postId) {
       throw new ValidationError('No accepted publisher slots to go live')
     }
 
+    const createdPublisherTargetIds = []
     for (const ar of accepted) {
       const ids = ar.platformAccountIds?.length ? ar.platformAccountIds : (ar.platformAccountId ? [ar.platformAccountId] : [])
       for (const accountId of [...new Set(ids)]) {
         if (!accountId) continue
-        await repo.createPublisherTarget(postId, ar.id, accountId)
+        const targetId = await repo.createPublisherTarget(postId, ar.id, accountId)
+        createdPublisherTargetIds.push(targetId)
       }
     }
 
@@ -1483,6 +1603,12 @@ export async function goLiveForFilledPost(postId) {
     await repo.updatePostWithStatusGuard(postId, { status: afterStatus }, POST_STATUS.AWAITING_PUBLISHERS)
     await repo.createReviewLog(postId, null, REVIEW_ACTIONS.SUBMITTED, POST_STATUS.AWAITING_PUBLISHERS,
       `Publisher slots filled — post ${afterStatus === POST_STATUS.RUNNING ? 'is now running' : 'scheduled'}`)
+
+    if (createdPublisherTargetIds.length > 0) {
+      const allTargets = await repo.findPostTargetsByPostId(postId)
+      const newTargets = allTargets.filter(t => createdPublisherTargetIds.includes(t.id))
+      await createPromotionTargetsForPublisherTargets(post, newTargets)
+    }
   })
 
   await queuePostPublish(postId, isFutureSchedule ? scheduledAtRaw : null)
@@ -1862,6 +1988,7 @@ async function reelPublished(target, postId) {
     } catch {}
   }
   await syncPublisherRequestOnPost({ ...target, status: POST_TARGET_STATUS.POSTED })
+  await wakePromotionForTarget({ ...target, metaObjectId: postId })
   await refreshPostStatus(target.postId)
   return { done: true }
 }
@@ -2380,6 +2507,7 @@ async function igContainerCreate(post, target, igId, product, attempts) {
       container = await createInstagramMedia(igId, post.mediaUrl, buildPostMessage(post), target.accessToken, {
         mediaType: 'REELS',
         videoUrl: post.mediaUrl,
+        shareToFeed: true,
       })
     }
   } catch (err) {
@@ -2591,9 +2719,12 @@ export async function publishPostJob(postId) {
         await capturePostPromotability(target, qualifyFbPostId(target.platformUserId, objectId))
       }
       await syncPublisherRequestOnPost({ ...target, status: POST_TARGET_STATUS.POSTED })
+      await wakePromotionForTarget({ ...target, metaObjectId: objectId })
       if (post.boostEnabled) {
         try {
-          await enqueueReelJob(POST_JOB_TYPES.BOOST, `post_boost:${target.id}`, { postId: post.id, postTargetId: target.id })
+          if (!(await promotionExistsForPost(post.id))) {
+            await enqueueReelJob(POST_JOB_TYPES.BOOST, `post_boost:${target.id}`, { postId: post.id, postTargetId: target.id })
+          }
         } catch {}
       }
       successCount += 1
@@ -2699,7 +2830,7 @@ export async function syncPostEngagementJob(postId, options = {}) {
   if (!post) throw new NotFoundError('Post not found')
 
   const targets = await repo.findPostTargetsByPostId(postId)
-  let posted = targets.filter(t => t.status === POST_TARGET_STATUS.POSTED && t.metaObjectId)
+  let posted = targets.filter(t => t.status === POST_TARGET_STATUS.POSTED && t.metaObjectId && t.remoteContentState !== 'missing')
   if (posted.length === 0) return { synced: 0 }
 
   if (options && options.targetId) {

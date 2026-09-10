@@ -97,6 +97,17 @@ function mapPostTargetRow(row) {
     metaDeletedAt: row.meta_deleted_at || null,
     lastMetaEventAt: row.last_meta_event_at || null,
     lastEngagementEventAt: row.last_engagement_event_at || null,
+    remoteContentState: row.remote_content_state || 'visible',
+    remoteStateCheckedAt: row.remote_state_checked_at || null,
+    remoteStateSource: row.remote_state_source || null,
+    remoteTokenKey: row.remote_token_key || null,
+    remoteVerifiedAt: row.remote_verified_at || null,
+    deletionReviewState: row.deletion_review_state || 'none',
+    deletionFlaggedAt: row.deletion_flagged_at || null,
+    deletionConfirmedAt: row.deletion_confirmed_at || null,
+    deletionReason: row.deletion_reason || null,
+    violationCounted: !!row.violation_counted,
+    boostPausedByDeletion: !!row.boost_paused_by_deletion,
     platformCode: row.platform_code || null,
     platformUserId: row.platform_user_id || null,
     platformDisplayName: row.platform_display_name || null,
@@ -547,6 +558,18 @@ export async function updatePostTargetStatus(id, data) {
   if (data.allowedObjectives !== undefined) { fields.push('allowed_objectives = ?'); params.push(data.allowedObjectives ? JSON.stringify(data.allowedObjectives) : null) }
   if (data.eligibilityCheckedAt !== undefined) { fields.push('eligibility_checked_at = ?'); params.push(data.eligibilityCheckedAt) }
   if (data.eligibilityReason !== undefined) { fields.push('eligibility_reason = ?'); params.push(data.eligibilityReason) }
+  if (data.remoteContentState !== undefined) { fields.push('remote_content_state = ?'); params.push(data.remoteContentState) }
+  if (data.remoteStateCheckedAt !== undefined) { fields.push('remote_state_checked_at = ?'); params.push(data.remoteStateCheckedAt) }
+  if (data.remoteStateSource !== undefined) { fields.push('remote_state_source = ?'); params.push(data.remoteStateSource) }
+  if (data.remoteTokenKey !== undefined) { fields.push('remote_token_key = ?'); params.push(data.remoteTokenKey) }
+  if (data.remoteVerifiedAt !== undefined) { fields.push('remote_verified_at = ?'); params.push(data.remoteVerifiedAt) }
+  if (data.status === 'posted') { fields.push('remote_verified_at = NOW()') }
+  if (data.deletionReviewState !== undefined) { fields.push('deletion_review_state = ?'); params.push(data.deletionReviewState) }
+  if (data.deletionFlaggedAt !== undefined) { fields.push('deletion_flagged_at = ?'); params.push(data.deletionFlaggedAt) }
+  if (data.deletionConfirmedAt !== undefined) { fields.push('deletion_confirmed_at = ?'); params.push(data.deletionConfirmedAt) }
+  if (data.deletionReason !== undefined) { fields.push('deletion_reason = ?'); params.push(data.deletionReason) }
+  if (data.violationCounted !== undefined) { fields.push('violation_counted = ?'); params.push(data.violationCounted ? 1 : 0) }
+  if (data.boostPausedByDeletion !== undefined) { fields.push('boost_paused_by_deletion = ?'); params.push(data.boostPausedByDeletion ? 1 : 0) }
 
   if (fields.length === 0) return
 

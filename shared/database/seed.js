@@ -186,6 +186,8 @@ const APP_CONFIG_SEEDS = [
   }, is_public: 1, description: 'Feature visibility toggles per role (true = visible). Managed by super admin via /admin/config/features.' },
   { key: 'publisher_max_accounts_per_request', value: 5, is_public: 1, description: 'Max verified accounts a publisher may select per post request (1..10). Managed by super admin.' },
   { key: 'publisher_response_deadline_hours', value: 48, is_public: 1, description: 'General waiting time for publishers to accept post/campaign requests (hours, 1..720). Capped by scheduled time if scheduled.' },
+  { key: 'promotions_enabled', value: false, is_public: 0, description: 'Master feature flag for the new Promotion/PromotionTarget boost architecture. When false, no new Promotions are created or executed; the legacy post_boost path continues unchanged.' },
+  { key: 'promotion_publish_trigger_enabled', value: false, is_public: 0, description: 'Wake-hook trigger flag: enqueue promotion_execute when a PostTarget becomes POSTED. Requires promotions_enabled as well. Allows staged rollout of the trigger layer.' },
 ]
 
 const report = []

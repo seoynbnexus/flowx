@@ -1,6 +1,9 @@
 import * as repo from './campaign.repository.js'
 import * as service from './campaign.service.js'
 import * as postService from '../posts/post.service.js'
+import * as promotionService from '../posts/promotion.service.js'
+import * as boostPerfService from '../posts/boost-performance.service.js'
+import * as deletionService from '../posts/deletion-monitoring.service.js'
 import { AppError } from '../../../shared/errors/AppError.js'
 import { CAMPAIGN_JOB_TYPES } from './campaign.model.js'
 import { POST_JOB_TYPES } from '../posts/post.model.js'
@@ -41,6 +44,9 @@ const HANDLERS = {
   [POST_JOB_TYPES.PUBLISHER_GO_LIVE]: (postId) => postService.goLiveForFilledPost(postId),
   [POST_JOB_TYPES.EXPIRE_PUBLISHER_REQUESTS]: (postId) => postService.expirePublisherPosts([postId]),
   [POST_JOB_TYPES.BOOST]: (campaignId, actorId, payload) => postService.postBoostJob(payload?.postId, payload?.postTargetId, payload),
+  [POST_JOB_TYPES.SYNC_BOOST_PERFORMANCE]: (campaignId, actorId, payload) => boostPerfService.syncBoostPerformanceJob(payload || {}),
+  [POST_JOB_TYPES.REMOTE_HEALTH]: (campaignId, actorId, payload) => deletionService.runRemoteHealthJob(payload || {}),
+  'promotion_execute': (campaignId, actorId, payload) => promotionService.runPromotionTargetJob(payload?.promotionTargetId, payload),
 }
 
 function isPermanentError(error) {
@@ -188,7 +194,22 @@ async function tickSyncScheduler() {
     }
     await service.scheduleCampaignSyncs()
     await postService.schedulePostEngagementSyncs()
+    try {
+      await boostPerfService.schedulePostBoostPerformanceSyncs()
+    } catch (err) {
+      logger.warn({ err: err?.message }, 'Boost performance scheduler sweep failed')
+    }
     await postService.handleExpiredPublisherPosts()
+    try {
+      await promotionService.recoverStuckPromotionTargets()
+    } catch (err) {
+      logger.warn({ err: err?.message }, 'Promotion recovery sweep failed')
+    }
+    try {
+      await deletionService.scheduleDeletionMonitoring()
+    } catch (err) {
+      logger.warn({ err: err?.message }, 'Deletion monitoring sweep failed')
+    }
     if (webhookCheckDue()) {
       webhookCheck.lastRunAt = Date.now()
       try {

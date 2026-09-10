@@ -69,6 +69,8 @@ export const POST_JOB_TYPES = {
   PUBLISHER_GO_LIVE: 'post_publisher_go_live',
   EXPIRE_PUBLISHER_REQUESTS: 'post_expire_publisher_requests',
   BOOST: 'post_boost',
+  SYNC_BOOST_PERFORMANCE: 'post_sync_boost_performance',
+  REMOTE_HEALTH: 'post_remote_health',
 }
 
 export const REVIEW_ACTIONS = {

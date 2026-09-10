@@ -469,7 +469,7 @@ describe('post publishing', () => {
       'https://example.com/reel.mp4',
       'Reel time',
       'mock_page_token',
-      { mediaType: 'REELS', videoUrl: 'https://example.com/reel.mp4' }
+      { mediaType: 'REELS', videoUrl: 'https://example.com/reel.mp4', shareToFeed: true }
     )
     expect(metaMocks.getContainerStatus).toHaveBeenCalledTimes(1)
     expect(metaMocks.getContainerStatus).toHaveBeenCalledWith('mock_ig_container_1', 'mock_page_token')
@@ -596,11 +596,34 @@ describe('post publishing', () => {
         'https://cdn.example.com/abc123',
         'Video',
         'mock_page_token',
-        { mediaType: 'REELS', videoUrl: 'https://cdn.example.com/abc123' }
+        { mediaType: 'REELS', videoUrl: 'https://cdn.example.com/abc123', shareToFeed: true }
       )
       expect(metaMocks.getContainerStatus).toHaveBeenCalledTimes(1)
     } finally {
       globalThis.fetch = realFetch
     }
+  })
+
+  it('should not request share_to_feed for image containers', async () => {
+    const post = await postService.createPost(client.id, {
+      name: 'Image post',
+      type: 'post',
+      caption: 'Image',
+      mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [igAccountId],
+    })
+    await postService.submitPost(client.id, post.id)
+    await postService.approvePost(admin.id, post.id, {})
+    await drainCampaignJobs()
+
+    const detail = await postService.getPost(client.id, post.id)
+    expect(detail.status).toBe('completed')
+    expect(metaMocks.createInstagramMedia).toHaveBeenCalledWith(
+      '17841411111111111',
+      'https://example.com/img.jpg',
+      'Image',
+      'mock_page_token',
+      { mediaType: 'IMAGE', videoUrl: undefined, shareToFeed: undefined }
+    )
   })
 })

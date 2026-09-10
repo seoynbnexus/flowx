@@ -38,6 +38,27 @@ function mapEnumToOptions(enumObj, labelMap) {
   }));
 }
 
+const PROMOTION_FLAG_KEYS = ['promotions_enabled', 'promotion_publish_trigger_enabled']
+
+async function readPromotionFlags() {
+  const flags = {}
+  for (const key of PROMOTION_FLAG_KEYS) {
+    flags[key] = false
+  }
+  try {
+    const placeholders = PROMOTION_FLAG_KEYS.map(() => '?').join(', ')
+    const rows = await query(
+      `SELECT config_key, config_value FROM app_config WHERE config_key IN (${placeholders})`,
+      PROMOTION_FLAG_KEYS
+    )
+    for (const row of rows) {
+      const v = typeof row.config_value === 'string' ? JSON.parse(row.config_value) : row.config_value
+      flags[row.config_key] = v === true || v === 'true' || v === 1
+    }
+  } catch {}
+  return flags
+}
+
 async function getCountryCodes() {
   const rows = await query(
     'SELECT code, iso2, name, pattern FROM country_codes WHERE is_active = 1 ORDER BY priority ASC, name ASC'
@@ -72,10 +93,11 @@ async function getDropdownOptions() {
 }
 
 export async function getPublicConfig() {
-  const [staticRows, dropdownOptions, countryCodes] = await Promise.all([
+  const [staticRows, dropdownOptions, countryCodes, promotionFlags] = await Promise.all([
     query('SELECT config_key, config_value FROM app_config WHERE is_public = 1'),
     getDropdownOptions(),
     getCountryCodes(),
+    readPromotionFlags(),
   ]);
   const raw = transformConfigRows(staticRows);
 
@@ -93,7 +115,7 @@ export async function getPublicConfig() {
       maxFileBytes: raw.post_media_max_file_bytes ?? null,
     },
     coinConversionRate: raw.coin_conversion_rate ?? null,
-    featureVisibility: { ...DEFAULT_FEATURE_VISIBILITY, ...(raw.feature_visibility || {}) },
+    featureVisibility: { ...DEFAULT_FEATURE_VISIBILITY, ...(raw.feature_visibility || {}), ...promotionFlags },
     publisherMaxAccounts: Number(raw.publisher_max_accounts_per_request) || 5,
     publisherDeadlineHours: Number(raw.publisher_response_deadline_hours) || 48,
   };

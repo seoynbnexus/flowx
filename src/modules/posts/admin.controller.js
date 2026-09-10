@@ -1,4 +1,7 @@
 import * as service from './post.service.js'
+import * as boostPerfService from './boost-performance.service.js'
+import * as deletionService from './deletion-monitoring.service.js'
+import { findViolationTargetsByPostId, findRequestViolationInfo } from './deletion-monitoring.repository.js'
 import { sendSuccess, sendPaginated, sendAccepted } from '../../../shared/utils/response.utils.js'
 
 export async function listAllPosts(req, res, next) {
@@ -59,6 +62,15 @@ export async function getPostEngagement(req, res, next) {
   }
 }
 
+export async function getBoostPerformance(req, res, next) {
+  try {
+    const result = await boostPerfService.getBoostPerformance(null, req.params.id, req.query, { skipOwnership: true, includeDebug: true })
+    return sendSuccess(res, result)
+  } catch (error) {
+    next(error)
+  }
+}
+
 export async function getPostPublisherRequests(req, res, next) {
   try {
     const requests = await service.adminListPostPublisherRequests(req.params.id)
@@ -81,6 +93,29 @@ export async function expirePublisherRequests(req, res, next) {
   try {
     const result = await service.adminExpirePostPublisherRequests(req.params.id)
     return sendAccepted(res, result, 'Post publisher requests expired')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function getPostViolations(req, res, next) {
+  try {
+    const targets = await findViolationTargetsByPostId(req.params.id)
+    const requestIds = [...new Set(targets.map(t => t.publisherRequestId).filter(Boolean))]
+    const requests = {}
+    for (const requestId of requestIds) {
+      requests[requestId] = await findRequestViolationInfo(requestId)
+    }
+    return sendSuccess(res, { targets, requests })
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function reviewPostViolation(req, res, next) {
+  try {
+    const result = await deletionService.reviewDeletionViolation(req.params.targetId, req.user.id, req.body?.action)
+    return sendSuccess(res, result, req.body?.action === 'clawback' ? 'Clawback processed' : 'Violation dismissed')
   } catch (error) {
     next(error)
   }

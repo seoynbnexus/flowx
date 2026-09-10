@@ -609,6 +609,8 @@ export async function createInstagramMedia(igBusinessAccountId, mediaUrl, captio
   const mediaType = options.mediaType || 'IMAGE'
   if (mediaType !== 'IMAGE') params.media_type = mediaType
 
+  if (mediaType === 'REELS' && options.shareToFeed) params.share_to_feed = true
+
   if (options.videoUrl || (mediaType !== 'IMAGE' && /\.(mp4|mov)$/i.test(mediaUrl || ''))) {
     params.video_url = options.videoUrl || mediaUrl
   } else {
@@ -948,6 +950,98 @@ export async function deleteInstagramContainer(mediaContainerId, accessToken) {
   return data
 }
 
+/**
+ * Strict platform-object remote-state classification for deletion monitoring.
+ *
+ * Documented mapping (established in this integration — unknown codes stay
+ * UNKNOWN by design):
+ *   VISIBLE  — 2xx with the object; FB `is_hidden=true` → HIDDEN
+ *   MISSING  — HTTP 404; (code 100, subcode 33 "does not exist" — established
+ *              in cleanupOrphanContainers); or (code 100 + documented message
+ *              patterns). Live-proven (Sep 2026): a DELETED page object under
+ *              the OWNER page token returns code 10 with the message "Object
+ *              does not exist, cannot be loaded due to missing permission…"
+ *              while the same token 200s a live control object — so the
+ *              code-10 permission family carries deletion evidence ONLY when
+ *              context proves the token itself is healthy
+ *              (ownerTokenUsed + tokenHealthy + hasVerifiedBaseline +
+ *              tokenKeyMatches). Without full context it stays
+ *              permissionAmbiguous UNKNOWN.
+ *   UNKNOWN  — permission codes without evidence (10|200|210|282, established
+ *              in isPermissionError), session invalidation (190/460), rate
+ *              limits (80004|613|4|17|2446079, HTTP 429), network/timeout
+ *              (metaAmbiguous), and ANY other error. UNKNOWN never creates or
+ *              confirms a publisher violation — only the 48h grace re-verify
+ *              can move a candidate to confirmed.
+ *
+ * classifyRemoteStateError(error, context = {}) returns
+ *   { state, detail } — UNKNOWN permission failures additionally carry
+ *   { permissionAmbiguous: true, error } so callers can re-classify after a
+ *   token-health control probe.
+ */
+const REMOTE_STATE_PERMISSION_CODES = new Set([10, 200, 210, 282])
+
+export function classifyRemoteStateError(error, context = {}) {
+  const detail = extractMetaError(error) || {}
+  const message = String(error?.message || error || '')
+  const code = Number(detail.code)
+  const subcode = Number(detail.subcode)
+  const http = error?.metaHttpStatus ?? error?.statusCode ?? null
+  if (http === 404) return { state: 'missing', detail: message.slice(0, 240) }
+  if (isRateLimitError(error) || http === 429) return { state: 'unknown', detail: message.slice(0, 240) }
+  if (Number.isFinite(code) && code === 190) return { state: 'unknown', detail: message.slice(0, 240) }
+  if (Number.isFinite(code) && code === 100 && (subcode === 33 || /does not exist|nonexisting|has been deleted/i.test(message))) {
+    return { state: 'missing', detail: message.slice(0, 240) }
+  }
+  if (Number.isFinite(code) && REMOTE_STATE_PERMISSION_CODES.has(code)) {
+    const evidence = context.ownerTokenUsed === true
+      && context.tokenHealthy === true
+      && context.hasVerifiedBaseline === true
+      && context.tokenKeyMatches !== false
+    if (evidence) {
+      return { state: 'missing', detail: message.slice(0, 240), evidence: 'owner_token_page_health_verified_baseline' }
+    }
+    return { state: 'unknown', detail: message.slice(0, 240), permissionAmbiguous: true, error }
+  }
+  return { state: 'unknown', detail: message.slice(0, 240) }
+}
+
+export async function getObjectRemoteState(objectId, accessToken, platform, context = {}) {
+  if (!objectId || !accessToken) return { state: 'unknown', detail: 'no_object_or_token' }
+  const code = String(platform || '').toLowerCase()
+  try {
+    if (code === 'facebook') {
+      const data = await graphGet(`${objectId}`, { access_token: accessToken, fields: 'id,is_hidden' })
+      if (!data || !data.id) return { state: 'unknown', detail: 'empty_response' }
+      if (data.is_hidden === true) return { state: 'hidden', hidden: true }
+      return { state: 'visible' }
+    }
+    const data = await graphGet(`${objectId}`, { access_token: accessToken, fields: 'id' })
+    if (!data || !data.id) return { state: 'unknown', detail: 'empty_response' }
+    return { state: 'visible' }
+  } catch (err) {
+    return classifyRemoteStateError(err, context)
+  }
+}
+
+/**
+ * Token-health control probe: the page node itself under the SAME page token.
+ * A 200 here proves the token is healthy while the object 400s code 10 — the
+ * live-proven deleted-vs-permission discriminator. Any failure is UNKNOWN
+ * (never evidence for or against deletion).
+ */
+export async function getPageRemoteState(pageId, accessToken) {
+  if (!pageId || !accessToken) return { state: 'unknown', detail: 'no_page_or_token' }
+  try {
+    const data = await graphGet(`${pageId}`, { access_token: accessToken, fields: 'id' })
+    if (!data || !data.id) return { state: 'unknown', detail: 'empty_response' }
+    return { state: 'visible' }
+  } catch (err) {
+    const detail = extractMetaError(err) || {}
+    return { state: 'unknown', detail: String(err?.message || err).slice(0, 240), code: detail.code != null ? Number(detail.code) : null }
+  }
+}
+
 export async function createInstagramStory(igBusinessAccountId, mediaUrl, accessToken, options = {}) {
   const params = {
     access_token: accessToken,
@@ -981,7 +1075,13 @@ export async function getCampaignInsights(campaignId, accessToken, datePreset = 
   return data.data || []
 }
 
-export const INSIGHTS_FIELDS = 'impressions,reach,frequency,clicks,unique_clicks,ctr,cpc,cpm,spend,actions,cost_per_action_type'
+// campaign_id is REQUIRED, not optional. Async report rows contain only
+// explicitly requested fields; both account-batch fan-outs
+// (syncAccountInsightsJob, syncBoostPerformanceJob) group rows by
+// row.campaign_id. Without it every row is silently dropped (0 rows
+// persisted, though the report itself succeeds), verified live 2026-09-08.
+// Extra row fields are ignored by the persist functions.
+export const INSIGHTS_FIELDS = 'campaign_id,campaign_name,impressions,reach,frequency,clicks,unique_clicks,ctr,cpc,cpm,spend,actions,cost_per_action_type'
 
 export async function createInsightsReport(adAccountId, { accessToken, level = 'campaign', timeIncrement = 1, since, until, fields = INSIGHTS_FIELDS, filtering } = {}) {
   const params = {

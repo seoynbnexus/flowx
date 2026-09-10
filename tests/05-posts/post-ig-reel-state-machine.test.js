@@ -142,6 +142,13 @@ describe('instagram durable video publish state machine', () => {
     expect(target.publishState).toBe('uploading')
     expect(target.containerId).toBe('mock_ig_container_1')
     expect(metaMocks.createInstagramMedia).toHaveBeenCalledTimes(1)
+    expect(metaMocks.createInstagramMedia).toHaveBeenCalledWith(
+      expect.any(String),
+      'https://example.com/reel.mp4',
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({ mediaType: 'REELS', shareToFeed: true })
+    )
 
     const second = await postService.igReelJob(postId, targetId, {})
     expect(second.requeueAfterSeconds).toBe(0)

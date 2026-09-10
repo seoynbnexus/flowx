@@ -136,3 +136,7 @@ export const rejectPostSchema = z.object({
 export const duplicatePostSchema = z.object({
   name: z.string().min(1).max(255).optional(),
 })
+
+export const violationReviewSchema = z.object({
+  action: z.enum(['dismiss', 'clawback']),
+})

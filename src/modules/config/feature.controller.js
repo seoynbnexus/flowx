@@ -15,6 +15,11 @@ import { HTTP_STATUS } from "../../../shared/constants/httpStatus.js";
 
 const FEATURE_VISIBILITY_KEY = "feature_visibility";
 
+const PROMOTION_FLAG_KEYS = [
+  "promotions_enabled",
+  "promotion_publish_trigger_enabled",
+];
+
 export const DEFAULT_FEATURE_VISIBILITY = {
   client_campaigns: true,
   publisher_campaign_requests: true,
@@ -92,17 +97,66 @@ async function writeFeatureVisibility(value, adminId) {
   }
 }
 
+async function readPromotionFlags() {
+  const flags = {};
+  for (const key of PROMOTION_FLAG_KEYS) {
+    flags[key] = false;
+  }
+  try {
+    const placeholders = PROMOTION_FLAG_KEYS.map(() => "?").join(", ");
+    const rows = await query(
+      `SELECT config_key, config_value FROM app_config WHERE config_key IN (${placeholders})`,
+      PROMOTION_FLAG_KEYS
+    );
+    for (const row of rows) {
+      const v =
+        typeof row.config_value === "string"
+          ? JSON.parse(row.config_value)
+          : row.config_value;
+      flags[row.config_key] = v === true || v === "true" || v === 1;
+    }
+  } catch {}
+  return flags;
+}
+
+async function writeStandaloneConfigKey(key, value, adminId) {
+  const json = JSON.stringify(value);
+  const existing = await queryOne(
+    "SELECT id FROM app_config WHERE config_key = ?",
+    [key]
+  );
+  if (existing) {
+    await query(
+      "UPDATE app_config SET config_value = ?, updated_by = ?, version = version + 1 WHERE config_key = ?",
+      [json, uuidToBuffer(adminId), key]
+    );
+  } else {
+    await query(
+      `INSERT INTO app_config (id, config_key, config_value, is_public, description, version, updated_by)
+       VALUES (?, ?, ?, 0, ?, 1, ?)`,
+      [
+        uuidToBuffer(generateUuid()),
+        key,
+        json,
+        "Feature flag managed via /admin/config/features",
+        uuidToBuffer(adminId),
+      ]
+    );
+  }
+}
+
 export async function getFeatureVisibility(req, res, next) {
   try {
     const stored = await readFeatureVisibility();
-    //for logging
+    const promotionFlags = await readPromotionFlags();
     const featureVisibility = {
       ...DEFAULT_FEATURE_VISIBILITY,
       ...(stored || {}),
+      ...promotionFlags,
     };
 
     return sendSuccess(res, {
-      featureVisibility: { ...DEFAULT_FEATURE_VISIBILITY, ...(stored || {}) },
+      featureVisibility: { ...DEFAULT_FEATURE_VISIBILITY, ...(stored || {}), ...promotionFlags },
     });
   } catch (error) {
     next(error);
@@ -135,6 +189,24 @@ export async function updateFeatureVisibility(req, res, next) {
     }
 
     const persisted = await transaction(async (conn) => {
+      if (PROMOTION_FLAG_KEYS.includes(key)) {
+        await writeStandaloneConfigKey(key, visible, req.user.id);
+        const promotionFlags = await readPromotionFlags();
+        const storedRows = await conn.execute(
+          "SELECT config_value FROM app_config WHERE config_key = ?",
+          [FEATURE_VISIBILITY_KEY]
+        );
+        const storedRow = storedRows[0][0];
+        const stored = storedRow
+          ? parseConfigValue(storedRow.config_value)
+          : null;
+        return {
+          ...DEFAULT_FEATURE_VISIBILITY,
+          ...(stored || {}),
+          ...promotionFlags,
+        };
+      }
+
       const [rows] = await conn.execute(
         "SELECT config_value FROM app_config WHERE config_key = ? FOR UPDATE",
         [FEATURE_VISIBILITY_KEY],

@@ -1075,7 +1075,7 @@ export async function findPostTargetByExternalId(externalId, platform) {
   const candidates = [...set]
   if (!candidates.length) return null
   const inClause = `(${candidates.map(() => '?').join(', ')})`
-  const params = [...candidates, ...candidates, ...candidates]
+  const params = [...candidates, ...candidates, ...candidates, ...candidates]
   let platformClause = ''
   if (platform) {
     platformClause = ' AND p.code = ?'
@@ -1085,7 +1085,7 @@ export async function findPostTargetByExternalId(externalId, platform) {
     `SELECT pt.*, p.code as platform_code FROM post_targets pt
      JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
      JOIN platforms p ON p.id = upa.platform_id
-     WHERE (pt.meta_object_id IN ${inClause} OR pt.remote_video_id IN ${inClause} OR pt.container_id IN ${inClause})${platformClause}
+     WHERE (pt.meta_object_id IN ${inClause} OR pt.remote_video_id IN ${inClause} OR pt.container_id IN ${inClause} OR pt.promotable_id IN ${inClause})${platformClause}
      ORDER BY pt.created_at DESC LIMIT 1`,
     params
   )
@@ -1190,12 +1190,8 @@ export async function findAutoJobByRunKey(runKey) {
 
 export async function enqueueTargetJob(jobType, runKey, payload = {}, { runAfterSeconds = 0, entityType = 'post' } = {}) {
   const result = await query(
-    `INSERT INTO campaign_jobs (id, campaign_id, job_type, run_key, entity_type, status, run_after, payload)
-     SELECT ?, NULL, ?, ?, ?, 'queued', DATE_ADD(NOW(), INTERVAL ? SECOND), ?
-     FROM DUAL
-     WHERE NOT EXISTS (
-       SELECT 1 FROM campaign_jobs WHERE run_key = ? AND status IN ('queued', 'running')
-     )`,
+    `INSERT IGNORE INTO campaign_jobs (id, campaign_id, job_type, run_key, entity_type, status, run_after, payload)
+     VALUES (?, NULL, ?, ?, ?, 'queued', DATE_ADD(NOW(), INTERVAL ? SECOND), ?)`,
     [
       uuidToBuffer(generateUuid()),
       jobType,
@@ -1203,13 +1199,31 @@ export async function enqueueTargetJob(jobType, runKey, payload = {}, { runAfter
       entityType,
       runAfterSeconds,
       JSON.stringify(payload),
-      runKey,
     ]
   )
-  return result.affectedRows > 0
+  if (result.affectedRows > 0) return true
+
+  const resurrected = await query(
+    `UPDATE campaign_jobs
+       SET status = 'queued', attempts = 0, error = NULL,
+           run_after = DATE_ADD(NOW(), INTERVAL ? SECOND),
+           payload = ?, started_at = NULL, finished_at = NULL
+     WHERE run_key = ? AND job_type = ? AND status NOT IN ('queued', 'running')`,
+    [runAfterSeconds, JSON.stringify(payload), runKey, jobType]
+  )
+  return resurrected.affectedRows > 0
 }
 
 export async function requeueReelJob(id, backoffSeconds, attempts) {
+  if (attempts != null && typeof attempts === 'object') {
+    await query(
+      `UPDATE campaign_jobs SET status = 'queued', attempts = 0, error = NULL,
+         run_after = DATE_ADD(NOW(), INTERVAL ? SECOND), payload = ?, started_at = NULL, finished_at = NULL
+       WHERE id = ? AND status = 'running'`,
+      [backoffSeconds, JSON.stringify(attempts), uuidToBuffer(id)]
+    )
+    return
+  }
   if (attempts == null) {
     await query(
       `UPDATE campaign_jobs SET status = 'queued', attempts = 0, error = NULL,

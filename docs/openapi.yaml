@@ -602,6 +602,114 @@ paths:
         "200":
           description: Media config updated
 
+  /posts/{id}/boost-performance:
+    get:
+      tags: [Posts]
+      summary: Ad performance of a boosted post (client, DB-cached; raw Meta IDs excluded)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: refresh
+          required: false
+          schema:
+            type: boolean
+          description: Enqueue an asynchronous performance sync and return stored data with queued=true
+      responses:
+        "200":
+          description: Per-target daily stats, totals and freshness
+        "403":
+          description: Not your post
+        "404":
+          description: Post not found
+
+  /admin/posts/{id}/boost-performance:
+    get:
+      tags: [Posts Admin]
+      summary: Ad performance of a boosted post (admin; includes Meta-ID debug block)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: refresh
+          required: false
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Per-target daily stats, totals and freshness
+        "404":
+          description: Post not found
+
+  /admin/posts/{id}/violations:
+    get:
+      tags: [Posts Admin]
+      summary: Deletion-violation targets of a post (admin; flagged/confirmed/dismissed + request accounting)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Violation targets and per-request violation/clawback state
+
+  /admin/posts/{id}/violations/{targetId}/review:
+    post:
+      tags: [Posts Admin]
+      summary: Review a confirmed deletion violation (dismiss clears the violation decision only; clawback is strict all-or-nothing; deletion stays terminal)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: targetId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [dismiss, clawback]
+      responses:
+        "200":
+          description: Review applied
+        "404":
+          description: Post target not found
+        "409":
+          description: Already reviewed / already clawed back
+        "422":
+          description: Not a confirmed violation, or insufficient publisher balance for clawback
+
   /health:
     get:
       tags: [Health]

@@ -1,4 +1,5 @@
 import * as service from './post.service.js'
+import * as boostPerfService from './boost-performance.service.js'
 import { sendSuccess, sendCreated, sendPaginated, sendAccepted } from '../../../shared/utils/response.utils.js'
 
 export async function createPost(req, res, next) {
@@ -108,6 +109,15 @@ export async function retryPost(req, res, next) {
 export async function getPostEngagement(req, res, next) {
   try {
     const result = await service.getPostEngagement(req.user.id, req.params.id, req.query)
+    return sendSuccess(res, result)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function getBoostPerformance(req, res, next) {
+  try {
+    const result = await boostPerfService.getBoostPerformance(req.user.id, req.params.id, req.query)
     return sendSuccess(res, result)
   } catch (error) {
     next(error)

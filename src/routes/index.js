@@ -29,6 +29,8 @@ import notificationRoutes from '../modules/notifications/notifications.routes.js
 import postRoutes from '../modules/posts/post.routes.js';
 import adminPostRoutes from '../modules/posts/admin.routes.js';
 import publisherPostRoutes from '../modules/posts/publisher-post.routes.js';
+import promotionRoutes from '../modules/posts/promotion.routes.js';
+import promotionsRoutes from '../modules/posts/promotions.routes.js';
 import mediaRoutes from '../modules/media-library/media.routes.js';
 import adminMediaRoutes from '../modules/media-library/admin.routes.js';
 import dashboardRoutes from '../modules/dashboard/dashboard.routes.js';
@@ -61,6 +63,8 @@ router.use('/payments', paymentRoutes);
 router.use('/admin/payments', adminPaymentRoutes);
 router.use('/notifications', notificationRoutes);
 router.use('/posts', postRoutes);
+router.use('/posts', promotionRoutes);
+router.use('/promotions', promotionsRoutes);
 router.use('/admin/posts', adminPostRoutes);
 router.use('/publisher', publisherPostRoutes);
 router.use('/media', mediaRoutes);

@@ -85,7 +85,6 @@ export const META_RULES = {
         maxChromaSubsampling: '4:2:0',
         minDurationSeconds: 3,
         maxDurationSeconds: 900,
-        warnDurationSeconds: 90,
       },
     },
     story: {
