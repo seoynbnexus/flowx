@@ -363,6 +363,39 @@ describe('boost webhook status', () => {
 })
 
 describe('boost insights sync', () => {
+  it('writes a fan-out chunk as one multi-row INSERT (genuinely bulk, spend stays monotonic)', async () => {
+    const user = await createTestUser({ email: `bpb-${Date.now()}@flowx-test.com`, password: 'Test@123' })
+    const { accountId } = await insertPageAccount(user.id)
+    const seed = await insertBoostedPost(user.id, accountId, `BoostPerf bulk ${Date.now()}`, { secondTarget: true })
+    const [t1, t2] = seed.targetIds
+    const conn = await import('../../shared/database/connection.js')
+    const querySpy = vi.spyOn(conn, 'query')
+    const written = await bpRepo.upsertBoostDailyStatsBulk([
+      { postId: seed.postId, postTargetId: t1, statDate: '2026-08-04', impressions: 100, spendPaise: 1000 },
+      { postId: seed.postId, postTargetId: t1, statDate: '2026-08-05', impressions: 10, spendPaise: 100 },
+      { postId: seed.postId, postTargetId: t2, statDate: '2026-08-04', impressions: 50, spendPaise: 500 },
+    ])
+    expect(written).toBe(3)
+    const inserts = querySpy.mock.calls.filter(([sql]) => /INSERT INTO post_boost_daily_stats/.test(sql))
+    expect(inserts).toHaveLength(1)
+    expect(inserts[0][0]).toMatch(/VALUES \(.+\), \(.+\), \(.+\)/)
+    expect(JSON.stringify(inserts[0][0])).toContain('ON DUPLICATE KEY UPDATE')
+    expect(JSON.stringify(inserts[0][0])).toContain('GREATEST(spend_paise')
+    querySpy.mockRestore()
+
+    const rows = await bpRepo.findBoostDailyStatsByPostId(seed.postId)
+    expect(rows.length).toBe(3)
+    // re-run with lower spend: countables replace, spend never decreases
+    await bpRepo.upsertBoostDailyStatsBulk([
+      { postId: seed.postId, postTargetId: t1, statDate: '2026-08-04', impressions: 999, spendPaise: 1 },
+    ])
+    const rows2 = await bpRepo.findBoostDailyStatsByPostId(seed.postId)
+    expect(rows2.length).toBe(3)
+    const t1d4 = rows2.find(r => r.postTargetId === t1 && r.statDate.slice(0, 10) === '2026-08-04')
+    expect(t1d4.impressions).toBe(999)
+    expect(t1d4.spendPaise).toBe(1000)
+  })
+
   it('fans out report rows to isolated per-target daily rows', async () => {
     const user = await createTestUser({ email: `bp10-${Date.now()}@flowx-test.com`, password: 'Test@123' })
     const { accountId } = await insertPageAccount(user.id)

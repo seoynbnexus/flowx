@@ -1,6 +1,7 @@
 import { META_CONFIG } from './meta-oauth.config.js'
 import { apiFetch } from '../utils/api-logger.js'
 import { recordUsage, tokenKeyFor } from './meta-rate-limiter.js'
+import { metaRequest, GATE_PRIORITY, tokenFingerprint } from './meta-request-gate.js'
 import { fetchBoundedBytes } from './media-url.js'
 import { logMetaEvent } from './meta-logger.service.js'
 import { ValidationError } from '../errors/AppError.js'
@@ -77,7 +78,15 @@ async function graphPost(path, params = {}) {
   }
 
   const key = accountKeyFromPath(path) || tokenKeyFor(params.access_token)
-  const res = await apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_ads', operation: `POST ${path}` })
+  const res = await metaRequest({
+    method: 'POST',
+    path,
+    params,
+    accountKey: key,
+    token: params.access_token,
+    operation: `POST ${path}`,
+    metaFetch: () => apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_ads', operation: `POST ${path}` }),
+  })
   recordUsage(res.headers, key)
   if (!res.ok) {
     const error = await res.text()
@@ -92,7 +101,14 @@ async function graphPost(path, params = {}) {
 async function graphDelete(path, accessToken) {
   const url = `${META_CONFIG.graphUrl}/${path}?access_token=${accessToken}`
   const key = accountKeyFromPath(path) || tokenKeyFor(accessToken)
-  const res = await apiFetch(url, { method: 'DELETE' }, { service: 'meta_ads', operation: `DELETE ${path}` })
+  const res = await metaRequest({
+    method: 'DELETE',
+    path,
+    accountKey: key,
+    token: accessToken,
+    operation: `DELETE ${path}`,
+    metaFetch: () => apiFetch(url, { method: 'DELETE' }, { service: 'meta_ads', operation: `DELETE ${path}` }),
+  })
   recordUsage(res.headers, key)
   if (!res.ok) {
     const error = await res.text()
@@ -114,7 +130,15 @@ async function graphGet(path, params = {}) {
   qs.append('access_token', params.access_token)
   const url = `${META_CONFIG.graphUrl}/${path}?${qs.toString()}`
   const key = accountKeyFromPath(path) || tokenKeyFor(params.access_token)
-  const res = await apiFetch(url, {}, { service: 'meta_ads', operation: `GET ${path}` })
+  const res = await metaRequest({
+    method: 'GET',
+    path,
+    params,
+    accountKey: key,
+    token: params.access_token,
+    operation: `GET ${path}`,
+    metaFetch: () => apiFetch(url, {}, { service: 'meta_ads', operation: `GET ${path}` }),
+  })
   recordUsage(res.headers, key)
   if (!res.ok) {
     const error = await res.text()
@@ -367,26 +391,40 @@ export async function resolveFbPostObjectId(pageId, rawId, pageToken) {
 }
 
 async function uploadHostedVideo(uploadUrl, fileUrl, accessToken) {
-  const hosted = await apiFetch(uploadUrl, {
+  const hosted = await metaRequest({
     method: 'POST',
-    headers: { Authorization: `OAuth ${accessToken}`, 'file_url': fileUrl },
-  }, { service: 'meta_ads', operation: 'POST rupload (hosted)' })
+    path: 'rupload (hosted)',
+    accountKey: tokenKeyFor(accessToken),
+    token: accessToken,
+    operation: 'POST rupload (hosted)',
+    metaFetch: () => apiFetch(uploadUrl, {
+      method: 'POST',
+      headers: { Authorization: `OAuth ${accessToken}`, 'file_url': fileUrl },
+    }, { service: 'meta_ads', operation: 'POST rupload (hosted)' }),
+  })
   if (hosted.ok) return hosted.json()
   const hostedBody = await hosted.text().catch(() => '(empty)')
   let fallbackBody = null
   try {
     const { bytes, truncated } = await fetchBoundedBytes(fileUrl, { maxBytes: HOSTED_UPLOAD_MAX_BYTES })
     if (truncated || !bytes || !bytes.length) throw new Error('could not download full media (truncated or empty)')
-    const res = await apiFetch(uploadUrl, {
+    const res = await metaRequest({
       method: 'POST',
-      headers: {
-        Authorization: `OAuth ${accessToken}`,
-        'Content-Type': 'application/octet-stream',
-        offset: '0',
-        file_size: String(bytes.length),
-      },
-      body: bytes,
-    }, { service: 'meta_ads', operation: 'POST rupload (binary)' })
+      path: 'rupload (binary)',
+      accountKey: tokenKeyFor(accessToken),
+      token: accessToken,
+      operation: 'POST rupload (binary)',
+      metaFetch: () => apiFetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `OAuth ${accessToken}`,
+          'Content-Type': 'application/octet-stream',
+          offset: '0',
+          file_size: String(bytes.length),
+        },
+        body: bytes,
+      }, { service: 'meta_ads', operation: 'POST rupload (binary)' }),
+    })
     if (res.ok) return res.json()
     fallbackBody = await res.text().catch(() => '(empty)')
   } catch (downloadErr) {
@@ -648,6 +686,11 @@ function isPermissionError(error) {
   return /"code"\s*:\s*(10|200|210|282)/.test(String(error?.message || error))
 }
 
+function isInsightsMetricError(error) {
+  const msg = String(error?.message || error)
+  return /"code"\s*:\s*100/.test(msg) && /valid insights metric/.test(msg)
+}
+
 function systemToken() {
   return process.env.META_SYSTEM_USER_TOKEN || null
 }
@@ -904,25 +947,29 @@ async function getFacebookMediaEngagement(mediaId, accessToken, mediaKind = 'pos
       result.insights.shares = basic.shares?.count != null ? Number(basic.shares.count) : 0
     }
   } catch (err) {
-    const sys = systemToken()
-    if (sys && isPermissionError(err)) {
-      try {
-        const fallback = await graphGet(`${mediaId}${kind === 'video' ? '/video_insights' : '/insights'}`, {
-          access_token: sys,
-          metric: kind === 'video' ? 'total_video_views' : 'post_impressions,post_engaged_users',
-        })
-        for (const entry of fallback.data || []) {
-          result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
+    if (isInsightsMetricError(err)) {
+      result.insightsUnsupported = true
+    } else {
+      const sys = systemToken()
+      if (sys && isPermissionError(err)) {
+        try {
+          const fallback = await graphGet(`${mediaId}${kind === 'video' ? '/video_insights' : '/insights'}`, {
+            access_token: sys,
+            metric: kind === 'video' ? 'total_video_views' : 'post_impressions,post_engaged_users',
+          })
+          for (const entry of fallback.data || []) {
+            result.insights[entry.name] = Number(entry.values?.[0]?.value) || 0
+          }
+          if (kind === 'video') {
+            result.insights.views = result.insights.total_video_views || 0
+          } else {
+            result.insights.reach = result.insights.post_impressions || 0
+            result.insights.interactions = result.insights.post_engaged_users || 0
+            result.insights.shares = basic.shares?.count != null ? Number(basic.shares.count) : 0
+          }
+        } catch {
+          // metrics unavailable — base row still returned
         }
-        if (kind === 'video') {
-          result.insights.views = result.insights.total_video_views || 0
-        } else {
-          result.insights.reach = result.insights.post_impressions || 0
-          result.insights.interactions = result.insights.post_engaged_users || 0
-          result.insights.shares = basic.shares?.count != null ? Number(basic.shares.count) : 0
-        }
-      } catch {
-        // metrics unavailable — base row still returned
       }
     }
   }

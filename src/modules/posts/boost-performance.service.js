@@ -164,47 +164,50 @@ async function fanOutBoostInsightsRows(rowsData) {
   const fbIds = [...new Set((rowsData || []).map(r => String(r.campaign_id || '')).filter(Boolean))]
   if (!fbIds.length) return { rows: 0, targets: [] }
   const refs = await bpRepo.resolveBoostObjectRefs(fbIds)
-  const grouped = {}
+  const bulkRows = []
+  const targetIds = new Set()
   for (const row of rowsData || []) {
     const ref = refs.get(String(row.campaign_id || ''))
     if (!ref || !ref.postTargetId) continue
     // stat_date is the Meta ad-account timezone date (time_increment=1).
     const statDate = String(row.date_start || '').slice(0, 10)
     if (!/^\d{4}-\d{2}-\d{2}$/.test(statDate)) continue
-    if (!grouped[ref.postTargetId]) grouped[ref.postTargetId] = { ref, rows: [] }
-    grouped[ref.postTargetId].rows.push({ ...row, statDate })
+    const { actions, costPerActionType } = parseActionsRow(row)
+    bulkRows.push({
+      postId: ref.postId,
+      postTargetId: ref.postTargetId,
+      statDate,
+      impressions: Number(row.impressions) || 0,
+      reach: Number(row.reach) || 0,
+      frequency: Number(row.frequency) || 0,
+      clicks: Number(row.clicks) || 0,
+      uniqueClicks: Number(row.unique_clicks) || 0,
+      ctr: Number(row.ctr) || 0,
+      cpc: Number(row.cpc) || 0,
+      cpm: Number(row.cpm) || 0,
+      spendPaise: Math.round(parseFloat(row.spend || '0') * 100),
+      actions,
+      costPerActionType,
+    })
+    targetIds.add(ref.postTargetId)
   }
   let count = 0
-  for (const { ref, rows } of Object.values(grouped)) {
-    for (const row of rows) {
+  try {
+    count = await bpRepo.upsertBoostDailyStatsBulk(bulkRows)
+  } catch (err) {
+    // bulk-write failure falls back to per-row writes with per-row isolation
+    for (const r of bulkRows) {
       try {
-        const { actions, costPerActionType } = parseActionsRow(row)
-        await bpRepo.upsertBoostDailyStat({
-          postId: ref.postId,
-          postTargetId: ref.postTargetId,
-          statDate: row.statDate,
-          impressions: Number(row.impressions) || 0,
-          reach: Number(row.reach) || 0,
-          frequency: Number(row.frequency) || 0,
-          clicks: Number(row.clicks) || 0,
-          uniqueClicks: Number(row.unique_clicks) || 0,
-          ctr: Number(row.ctr) || 0,
-          cpc: Number(row.cpc) || 0,
-          cpm: Number(row.cpm) || 0,
-          spendPaise: Math.round(parseFloat(row.spend || '0') * 100),
-          actions,
-          costPerActionType,
-        })
+        await bpRepo.upsertBoostDailyStat(r)
         count += 1
-      } catch (err) {
-        // per-target isolation: one bad row never blocks the rest
-        await logMetaEvent({ action: 'boost_insights_row_error', postTargetId: ref.postTargetId, postId: ref.postId, error: err?.message || String(err) })
+      } catch (rowErr) {
+        await logMetaEvent({ action: 'boost_insights_row_error', postTargetId: r.postTargetId, postId: r.postId, error: rowErr?.message || String(rowErr) })
       }
     }
+    await logMetaEvent({ action: 'boost_insights_bulk_fallback', rows: bulkRows.length, error: err?.message || String(err) })
   }
-  const targetIds = Object.keys(grouped)
-  if (targetIds.length) await bpRepo.stampBoostSyncAt(targetIds)
-  return { rows: count, targets: targetIds }
+  const stamped = [...targetIds]
+  return { rows: count, targets: stamped }
 }
 
 async function piggybackBoostStatuses(adAccountId, systemToken, fbCampaignIds) {

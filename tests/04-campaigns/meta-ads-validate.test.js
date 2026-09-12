@@ -258,6 +258,42 @@ describe('getFacebookMediaEngagement hybrid token handling', () => {
     expect(result.storyInsightError).toBeUndefined()
     delete process.env.META_SYSTEM_USER_TOKEN
   })
+
+  it('returns a base row without a system-token retry when /insights rejects the metric set (code 100)', async () => {
+    process.env.META_SYSTEM_USER_TOKEN = 'sys_token'
+    apiFetch.mockReset()
+    apiFetch.mockResolvedValueOnce(errJson(100, 'some video fields missing')) // video fields fail
+      .mockResolvedValueOnce(errJson(100, 'some photo fields missing')) // photo fields fail
+      .mockResolvedValueOnce(okJson(postObject)) // post fields succeed → kind = 'post'
+      .mockResolvedValueOnce(errJson(100, '(#100) The value must be a valid insights metric')) // insights: metric unsupported for this object
+      .mockResolvedValueOnce(okJson({ data: [{ id: 'c1', message: 'nice', from: { name: 'Bob' }, created_time: '2026-08-19T13:00:00+0000' }] })) // comments still attempted
+    const result = await getMediaEngagement('page_123', 'owner_token', { platform: 'facebook' })
+    expect(result.mediaType).toBe('post')
+    expect(result.permalink).toBe(postObject.permalink_url)
+    expect(result.likeCount).toBe(3)
+    expect(result.commentsCount).toBe(1)
+    expect(result.insights).toEqual({})
+    expect(result.insightsUnsupported).toBe(true)
+    expect(result.comments).toHaveLength(1)
+    expect(result.comments[0].text).toBe('nice')
+    delete process.env.META_SYSTEM_USER_TOKEN
+  })
+
+  it('makes exactly 5 API calls for the invalid-metric path — no sixth system-token insights request', async () => {
+    process.env.META_SYSTEM_USER_TOKEN = 'sys_token'
+    apiFetch.mockReset()
+    apiFetch.mockResolvedValueOnce(errJson(100, 'some video fields missing')) // 1: video classify fail
+      .mockResolvedValueOnce(errJson(100, 'some photo fields missing')) // 2: photo classify fail
+      .mockResolvedValueOnce(okJson(postObject)) // 3: post classify success
+      .mockResolvedValueOnce(errJson(100, '(#100) The value must be a valid insights metric')) // 4: insights invalid metric
+      .mockResolvedValueOnce(okJson({ data: [] })) // 5: comments
+    await getMediaEngagement('page_123', 'owner_token', { platform: 'facebook' })
+    expect(apiFetch).toHaveBeenCalledTimes(5)
+    const insightsUrls = apiFetch.mock.calls.map(c => String(c[0])).filter(u => u.includes('/insights'))
+    expect(insightsUrls).toHaveLength(1)
+    expect(insightsUrls[0]).toContain('access_token=owner_token')
+    delete process.env.META_SYSTEM_USER_TOKEN
+  })
 })
 
 describe('createAdCreativeFromInstagramPost minimal-first behavior', () => {

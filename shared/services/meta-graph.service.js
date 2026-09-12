@@ -1,6 +1,7 @@
 import { META_CONFIG } from './meta-oauth.config.js';
 import { apiFetch } from '../utils/api-logger.js'
 import { recordUsage, setCooldown, tokenKeyFor } from './meta-rate-limiter.js'
+import { metaRequest } from './meta-request-gate.js'
 
 const RATE_LIMIT_CODES = new Set([80004, 613, 4, 17])
 const RATE_LIMIT_SUBCODE = 2446079
@@ -26,7 +27,15 @@ async function graphGet(path, params = {}) {
   const query = new URLSearchParams({ ...params, access_token: params.access_token });
   const url = `${META_CONFIG.graphUrl}/${path}?${query.toString()}`;
   const key = tokenKeyFor(params.access_token)
-  const res = await apiFetch(url, {}, { service: 'meta_graph', operation: path })
+  const res = await metaRequest({
+    method: 'GET',
+    path,
+    params,
+    accountKey: key,
+    token: params.access_token,
+    operation: `GET ${path}`,
+    metaFetch: () => apiFetch(url, {}, { service: 'meta_graph', operation: path }),
+  })
   recordUsage(res.headers, key)
   if (!res.ok) {
     const error = await res.text();
@@ -180,9 +189,18 @@ export { extractIgBusinessId };
 export async function subscribePage(pageId, pageToken, fields = ['feed']) {
   const { apiFetch } = await import('../utils/api-logger.js')
   const { META_CONFIG } = await import('./meta-oauth.config.js')
+  const { metaRequest } = await import('./meta-request-gate.js')
+  const { tokenKeyFor } = await import('./meta-rate-limiter.js')
   const url = `${META_CONFIG.graphUrl}/${pageId}/subscribed_apps?access_token=${pageToken}`
   const body = new URLSearchParams({ subscribed_fields: fields.join(',') })
-  const res = await apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_graph', operation: `POST ${pageId}/subscribed_apps` })
+  const res = await metaRequest({
+    method: 'POST',
+    path: `${pageId}/subscribed_apps`,
+    accountKey: tokenKeyFor(pageToken),
+    token: pageToken,
+    operation: `POST ${pageId}/subscribed_apps`,
+    metaFetch: () => apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_graph', operation: `POST ${pageId}/subscribed_apps` }),
+  })
   if (!res.ok) {
     const err = await res.text()
     throw new Error(`Subscribe page ${pageId} failed: ${err}`)
@@ -193,9 +211,18 @@ export async function subscribePage(pageId, pageToken, fields = ['feed']) {
 export async function subscribeInstagram(igUserId, accessToken, fields = ['comments', 'story_insights', 'mentions']) {
   const { apiFetch } = await import('../utils/api-logger.js')
   const { META_CONFIG } = await import('./meta-oauth.config.js')
+  const { metaRequest } = await import('./meta-request-gate.js')
+  const { tokenKeyFor } = await import('./meta-rate-limiter.js')
   const url = `${META_CONFIG.graphUrl}/${igUserId}/subscribed_apps?access_token=${accessToken}`
   const body = new URLSearchParams({ subscribed_fields: fields.join(',') })
-  const res = await apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_graph', operation: `POST ${igUserId}/subscribed_apps` })
+  const res = await metaRequest({
+    method: 'POST',
+    path: `${igUserId}/subscribed_apps`,
+    accountKey: tokenKeyFor(accessToken),
+    token: accessToken,
+    operation: `POST ${igUserId}/subscribed_apps`,
+    metaFetch: () => apiFetch(url, { method: 'POST', body: body.toString() }, { service: 'meta_graph', operation: `POST ${igUserId}/subscribed_apps` }),
+  })
   if (!res.ok) {
     const err = await res.text()
     throw new Error(`Subscribe Instagram ${igUserId} failed: ${err}`)

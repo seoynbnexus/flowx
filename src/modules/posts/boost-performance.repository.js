@@ -174,6 +174,66 @@ export async function upsertBoostSpendOnly(postId, postTargetId, statDate, spend
   )
 }
 
+const BOOST_STATS_CHUNK = 500
+
+/**
+ * Genuinely bulk boost daily-stats upsert: one multi-row INSERT ... ON
+ * DUPLICATE KEY UPDATE per bounded chunk (≤500 rows). Same semantics as
+ * upsertBoostDailyStat (metrics REPLACE, spend monotonic via GREATEST).
+ * `rows` entries carry { postId, postTargetId, statDate, ... }.
+ */
+export async function upsertBoostDailyStatsBulk(rows) {
+  const list = (rows || []).filter(r => r && r.statDate && r.postTargetId)
+  if (!list.length) return 0
+  let written = 0
+  for (let offset = 0; offset < list.length; offset += BOOST_STATS_CHUNK) {
+    const chunk = list.slice(offset, offset + BOOST_STATS_CHUNK)
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
+    const params = []
+    for (const r of chunk) {
+      params.push(
+        uuidToBuffer(generateUuid()),
+        uuidToBuffer(r.postId),
+        uuidToBuffer(r.postTargetId),
+        r.statDate,
+        r.impressions ?? 0,
+        r.reach ?? 0,
+        r.frequency ?? 0,
+        r.clicks ?? 0,
+        r.uniqueClicks ?? 0,
+        r.ctr ?? 0,
+        r.cpc ?? 0,
+        r.cpm ?? 0,
+        r.spendPaise ?? 0,
+        JSON.stringify(r.actions ?? {}),
+        JSON.stringify(r.costPerActionType ?? {}),
+        'insights'
+      )
+    }
+    await query(
+      `INSERT INTO post_boost_daily_stats
+         (id, post_id, post_target_id, stat_date, impressions, reach, frequency, clicks, unique_clicks, ctr, cpc, cpm, spend_paise, actions, cost_per_action_type, last_source)
+       VALUES ${placeholders}
+       ON DUPLICATE KEY UPDATE
+         impressions = VALUES(impressions),
+         reach = VALUES(reach),
+         frequency = VALUES(frequency),
+         clicks = VALUES(clicks),
+         unique_clicks = VALUES(unique_clicks),
+         ctr = VALUES(ctr),
+         cpc = VALUES(cpc),
+         cpm = VALUES(cpm),
+         spend_paise = GREATEST(spend_paise, VALUES(spend_paise)),
+         actions = VALUES(actions),
+         cost_per_action_type = VALUES(cost_per_action_type),
+         last_source = VALUES(last_source)`,
+      params
+    )
+    written += chunk.length
+  }
+  return written
+}
+
 export async function findBoostDailyStatsByPostId(postId) {
   const rows = await query(
     `SELECT s.*,

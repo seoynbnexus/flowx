@@ -171,6 +171,12 @@ describe('post engagement sync', () => {
   it('should upsert the same stat date instead of duplicating', async () => {
     const postId = await createPublishedPost([igAccountId])
     await postService.syncPostEngagementJob(postId)
+    // per-target freshness floor now skips a target synced seconds ago —
+    // backdate the stamp so the second sync re-reads and overwrites the row
+    const targets = await postRepo.findPostTargetsByPostId(postId)
+    for (const t of targets) {
+      await query("UPDATE post_targets SET last_engagement_sync_at = DATE_SUB(NOW(), INTERVAL 3700 SECOND) WHERE id = ?", [uuidToBuffer(t.id)])
+    }
     metaMocks.getMediaEngagement.mockResolvedValue({
       mediaId: 'mock_ig_post_1',
       mediaType: 'VIDEO',
@@ -228,12 +234,22 @@ describe('post engagement sync', () => {
     const postId = await createPublishedPost([igAccountId])
     const first = await postService.schedulePostEngagementSyncs()
     expect(first.enqueued).toContain(postId)
+    // reset the sweep gate: the intent here is job-level dedupe, not the sweep throttle
+    postService.engagementSweep.lastRunAt = 0
+    // the queued job itself is the dedupe — the post is no longer due
     const second = await postService.schedulePostEngagementSyncs()
     expect(second.enqueued).not.toContain(postId)
 
     await drainCampaignJobs()
     const rows = await postRepo.findPostEngagement(postId)
     expect(rows.length).toBeGreaterThan(0)
+
+    // after completion, the 300s resurrection floor blocks immediate re-enqueue
+    postService.engagementSweep.lastRunAt = 0
+    await query("UPDATE post_targets SET last_engagement_sync_at = DATE_SUB(NOW(), INTERVAL 3700 SECOND) WHERE post_id = ?", [uuidToBuffer(postId)])
+    const third = await postService.schedulePostEngagementSyncs()
+    expect(third.floored).toContain(postId)
+    expect(third.enqueued).not.toContain(postId)
   })
 
   it('should return cached engagement grouped by target for the owner', async () => {

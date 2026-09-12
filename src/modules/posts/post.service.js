@@ -2811,18 +2811,45 @@ export async function publishPostJob(postId) {
 
 const POST_ENGAGEMENT_SYNC_SECONDS = Number(process.env.POST_ENGAGEMENT_SYNC_SECONDS) || 3600
 const POST_ENGAGEMENT_SYNC_LIMIT = 20
+export const POST_ENGAGEMENT_MIN_REQUEUE_SECONDS = Number(process.env.POST_ENGAGEMENT_MIN_REQUEUE_SECONDS) || 300
+export const POST_ENGAGEMENT_MANUAL_REFRESH_SECONDS = Number(process.env.POST_ENGAGEMENT_MANUAL_REFRESH_SECONDS) || 30
+export const POST_ENGAGEMENT_TARGET_FLOOR_SECONDS = Number(process.env.POST_ENGAGEMENT_TARGET_FLOOR_SECONDS) || 60
+
+export const engagementSweep = {
+  intervalMs: (Number(process.env.POST_ENGAGEMENT_SWEEP_SECONDS) || 60) * 1000,
+  lastRunAt: 0,
+}
 
 export async function schedulePostEngagementSyncs() {
+  if (Date.now() - engagementSweep.lastRunAt < engagementSweep.intervalMs) {
+    return { skipped: true, reason: 'sweep_throttle' }
+  }
+  engagementSweep.lastRunAt = Date.now()
   const due = await repo.findPostsDueForEngagementSync({
     stalenessSeconds: POST_ENGAGEMENT_SYNC_SECONDS,
     limit: POST_ENGAGEMENT_SYNC_LIMIT,
   })
   const enqueued = []
+  const floored = []
   for (const postId of due) {
-    await repo.requeuePostEngagementJob(postId)
-    enqueued.push(postId)
+    const result = await repo.requeuePostEngagementJob(postId, { floorSeconds: POST_ENGAGEMENT_MIN_REQUEUE_SECONDS })
+    if (result.enqueued) enqueued.push(postId)
+    else if (result.floored) floored.push(postId)
   }
-  return { enqueued }
+  return { enqueued, floored }
+}
+
+function engagementTargetFreshSeconds(options) {
+  if (options?.manual) return Math.min(POST_ENGAGEMENT_MANUAL_REFRESH_SECONDS, POST_ENGAGEMENT_SYNC_SECONDS)
+  if (options?.targetId) return POST_ENGAGEMENT_TARGET_FLOOR_SECONDS
+  return POST_ENGAGEMENT_SYNC_SECONDS
+}
+
+function isTargetSyncFresh(target, freshSeconds, nowMs = Date.now()) {
+  if (!target.lastEngagementSyncAt) return false
+  const last = new Date(target.lastEngagementSyncAt).getTime()
+  if (!Number.isFinite(last)) return false
+  return (nowMs - last) < freshSeconds * 1000
 }
 
 export async function syncPostEngagementJob(postId, options = {}) {
@@ -2830,14 +2857,27 @@ export async function syncPostEngagementJob(postId, options = {}) {
   if (!post) throw new NotFoundError('Post not found')
 
   const targets = await repo.findPostTargetsByPostId(postId)
-  let posted = targets.filter(t => t.status === POST_TARGET_STATUS.POSTED && t.metaObjectId && t.remoteContentState !== 'missing')
+  let posted = targets.filter(t => t.status === POST_TARGET_STATUS.POSTED && t.metaObjectId)
   if (posted.length === 0) return { synced: 0 }
 
   if (options && options.targetId) {
     const filtered = posted.filter(t => t.id === options.targetId)
     if (filtered.length) posted = filtered
   }
-  posted = posted.filter(t => !t.metaDeletedAt)
+
+  const unsyncable = posted.filter(t => t.remoteContentState === 'missing' || t.metaDeletedAt)
+  for (const target of unsyncable) {
+    if (!target.lastEngagementSyncAt) await repo.stampPostEngagementSync(target.id)
+  }
+  posted = posted.filter(t => t.remoteContentState !== 'missing' && !t.metaDeletedAt)
+
+  if (posted.length === 0) return { synced: 0 }
+
+  const freshSeconds = engagementTargetFreshSeconds(options)
+  const fresh = posted.filter(t => isTargetSyncFresh(t, freshSeconds))
+  const stale = posted.filter(t => !isTargetSyncFresh(t, freshSeconds))
+  posted = stale
+  if (posted.length === 0) return { synced: 0, skippedFresh: fresh.length }
 
   if (posted.length === 0) return { synced: 0 }
 
@@ -2929,7 +2969,7 @@ export async function syncPostEngagementJob(postId, options = {}) {
     }
   }
 
-  return { synced: synced.length, total: posted.length }
+  return { synced: synced.length, total: posted.length, skippedFresh: fresh.length }
 }
 
 export async function getPostEngagement(userId, postId, query = {}, { skipOwnership = false } = {}) {
@@ -2938,8 +2978,11 @@ export async function getPostEngagement(userId, postId, query = {}, { skipOwners
   if (!skipOwnership && post.clientId !== userId) throw new ForbiddenError('Not your post')
 
   if (query?.refresh) {
-    const enqueued = await repo.requeuePostEngagementJob(postId)
-    return { queued: true, enqueued }
+    const enqueued = await repo.requeuePostEngagementJob(postId, {
+      floorSeconds: POST_ENGAGEMENT_MANUAL_REFRESH_SECONDS,
+      payload: { manual: true },
+    })
+    return { queued: true, enqueued: enqueued.enqueued, floored: !!enqueued.floored }
   }
 
   const rows = await repo.findPostEngagement(postId)

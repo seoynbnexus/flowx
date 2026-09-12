@@ -358,4 +358,118 @@ describe('campaign meta batch sync', () => {
       resetRateLimitState()
     })
   })
+
+  describe('campaign-level batch rate gate key (regression: accountDbId vs adAccountId)', () => {
+    it('rate-limit state keyed by act_<id> skips the campaign-level batch GET (old code keyed by DB UUID and never fired)', async () => {
+      const { fbCampaignId } = await seedRunningCampaign(client.id, { adSuffix: 'rlkey' })
+      metaMocks.listAccountAds.mockResolvedValue({
+        rows: [{ id: `ad_rlkey`, status: 'PENDING_REVIEW', effective_status: 'PENDING_REVIEW' }],
+        truncated: false,
+      })
+      resetRateLimitState()
+      recordUsage({ 'x-app-usage': { used: { call_count: 0.95, total_cputime: 0.95 } } }, 'act_test_account')
+      expect(isRateLimited('act_test_account')).toBe(true)
+      metaMocks.getCampaignStatusesBatch.mockClear()
+
+      await campaignService.syncAccountStatusJob('act_test_account')
+
+      expect(metaMocks.getCampaignStatusesBatch).not.toHaveBeenCalled()
+      resetRateLimitState()
+    })
+
+    it('healthy act_ key still fetches the campaign-level batch (gate fires only when actually throttled)', async () => {
+      resetRateLimitState()
+      metaMocks.listAccountAds.mockResolvedValue({
+        rows: [{ id: `ad_rlkey`, status: 'PENDING_REVIEW', effective_status: 'PENDING_REVIEW' }],
+        truncated: false,
+      })
+      metaMocks.getCampaignStatusesBatch.mockResolvedValue({})
+      metaMocks.getCampaignStatusesBatch.mockClear()
+
+      await campaignService.syncAccountStatusJob('act_test_account')
+      expect(metaMocks.getCampaignStatusesBatch).toHaveBeenCalledTimes(1)
+      resetRateLimitState()
+    })
+  })
+
+  describe('insights bulk persistence', () => {
+    it('upsertDailyStatsBulk writes multi-row stats in ONE SQL statement per chunk', async () => {
+      const { campaignId } = await seedRunningCampaign(client.id, { adSuffix: 'bulk1' })
+      const querySpy = vi.spyOn(await import('../../shared/database/connection.js'), 'query')
+
+      const written = await campaignRepo.upsertDailyStatsBulk(campaignId, [
+        { statDate: '2026-07-01', impressions: 10, clicks: 1, spendPaise: 100 },
+        { statDate: '2026-07-02', impressions: 20, clicks: 2, spendPaise: 200 },
+        { statDate: '2026-07-03', impressions: 30, clicks: 3, spendPaise: 300 },
+      ])
+
+      expect(written).toBe(3)
+      const insertCalls = querySpy.mock.calls.filter(([sql]) => /INSERT INTO campaign_daily_stats/.test(sql))
+      expect(insertCalls).toHaveLength(1)
+      expect(insertCalls[0][0]).toMatch(/VALUES \(.+\), \(.+\), \(.+\)/)
+      expect(JSON.stringify(insertCalls[0][0])).toContain('ON DUPLICATE KEY UPDATE')
+      querySpy.mockRestore()
+
+      const stats = await campaignRepo.findDailyStats(campaignId)
+      expect(stats).toHaveLength(3)
+      expect(stats.map((s) => new Date(s.statDate).toISOString().slice(0, 10)).sort()).toEqual(['2026-07-01', '2026-07-02', '2026-07-03'])
+    })
+
+    it('account insights job fans report rows out through the bulk writer (idempotent re-run)', async () => {
+      const first = await seedRunningCampaign(client.id, {
+        adSuffix: 'bulkf',
+        scheduledAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
+      })
+      await query('DELETE FROM meta_sync_state WHERE run_key = ?', ['insights:act_test_account'])
+      metaMocks.createInsightsReport.mockResolvedValue({ report_run_id: 'run_bulkf_1' })
+      await campaignService.syncAccountInsightsJob('act_test_account')
+
+      const querySpy = vi.spyOn(await import('../../shared/database/connection.js'), 'query')
+      await campaignRepo.saveMetaSyncState('insights:act_test_account', {
+        reportRunId: 'run_bulkf_1',
+        nextPollAt: Date.now() - 1000,
+      })
+      metaMocks.getInsightsReport.mockResolvedValue({ async_status: 'Job Completed' })
+      metaMocks.getInsightsReportData.mockResolvedValue([
+        { campaign_id: first.fbCampaignId, date_start: '2026-07-05', impressions: '100', clicks: '5', spend: '10.00' },
+        { campaign_id: first.fbCampaignId, date_start: '2026-07-06', impressions: '150', clicks: '6', spend: '12.00' },
+      ])
+
+      const completed = await campaignService.syncAccountInsightsJob('act_test_account')
+      expect(completed.rows).toBe(2)
+
+      // exactly ONE multi-row INSERT statement for the two daily rows
+      const insertCalls = querySpy.mock.calls.filter(([sql]) => /INSERT INTO campaign_daily_stats/.test(sql))
+      expect(insertCalls).toHaveLength(1)
+      expect(insertCalls[0][0]).toMatch(/VALUES \(.+\), \(.+\)/)
+      querySpy.mockRestore()
+
+      const stats = await campaignRepo.findDailyStats(first.campaignId)
+      expect(stats).toHaveLength(2)
+    })
+  })
+
+  describe('account balance polling cadence', () => {
+    it('balance snapshot is written per poll and consumers only read the latest row (admin card) — no 60s consumer', async () => {
+      const { insertAccountSnapshot, findLatestAccountSnapshot } = campaignRepo
+      await insertAccountSnapshot({ adAccountId: 'act_test_account', balancePaise: 123400, currency: 'INR', accountStatus: 1, disableReason: null })
+      const snap = await findLatestAccountSnapshot()
+      expect(snap).toBeTruthy()
+      expect(snap.balancePaise).toBe(123400)
+    })
+
+    it('balancePoll gate enforces the configured interval', async () => {
+      const { balancePoll, balancePollDue } = await import('../../src/modules/campaigns/campaign.jobs.js')
+      const originalInterval = balancePoll.intervalMs
+      balancePoll.intervalMs = 900 * 1000
+      balancePoll.lastRunAt = Date.now()
+      expect(balancePollDue()).toBe(false)
+
+      balancePoll.lastRunAt = Date.now() - 901 * 1000
+      expect(balancePollDue()).toBe(true)
+
+      balancePoll.intervalMs = originalInterval
+      balancePoll.lastRunAt = 0
+    })
+  })
 })

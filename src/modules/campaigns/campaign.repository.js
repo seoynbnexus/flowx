@@ -933,28 +933,44 @@ export async function requeueStaleCampaignJobs(minutes = 10) {
   )
 }
 
-export async function purgeTerminalJobs(days = 7) {
-  const result = await query(
-    `DELETE FROM campaign_jobs WHERE status IN ('done', 'dead') AND finished_at < NOW() - INTERVAL ? DAY`,
-    [Math.max(1, Math.floor(Number(days)))]
-  )
-  return { removed: result.affectedRows }
+const RETENTION_TABLES_BY_LEGACY_NAME = {
+  campaign_jobs: 'campaign_jobs',
+  post_engagement_daily: 'post_engagement_daily',
+  meta_webhook_events: 'meta_webhook_events',
 }
 
-export async function purgeOldEngagementRows(days = 90) {
-  const result = await query(
-    'DELETE FROM post_engagement_daily WHERE created_at < NOW() - INTERVAL ? DAY',
-    [Math.max(1, Math.floor(Number(days)))]
-  )
-  return { removed: result.affectedRows }
+async function purgeViaRetentionRegistry(table) {
+  const { findTablePurge, runTablePurge } = await import('../../../shared/database/retention.js')
+  const entry = findTablePurge(RETENTION_TABLES_BY_LEGACY_NAME[table] || table)
+  if (!entry) throw new Error(`No retention policy registered for table ${table}`)
+  const result = await runTablePurge(entry)
+  return { removed: result.removed, ...result }
 }
 
-export async function purgeOldWebhookEvents(days = 90) {
-  const result = await query(
-    'DELETE FROM meta_webhook_events WHERE created_at < NOW() - INTERVAL ? DAY',
-    [Math.max(1, Math.floor(Number(days)))]
-  )
-  return { removed: result.affectedRows }
+/**
+ * Delegates to the central retention registry (shared/database/retention.js).
+ * Policy: done/dead jobs older than JOB_RETENTION_DAYS=7, bounded batches.
+ */
+export async function purgeTerminalJobs() {
+  return purgeViaRetentionRegistry('campaign_jobs')
+}
+
+/**
+ * Delegates to the central retention registry. Policy unchanged: engagement
+ * rows older than ENGAGEMENT_RETENTION_DAYS=90 — batching is a lock-safety
+ * change only, not a retention-policy change.
+ */
+export async function purgeOldEngagementRows() {
+  return purgeViaRetentionRegistry('post_engagement_daily')
+}
+
+/**
+ * Delegates to the central retention registry. Policy: webhook events older
+ * than WEBHOOK_RETENTION_DAYS=30 (production always passed 30; the old
+ * default of 90 here was misleading and is removed — actual policy unchanged).
+ */
+export async function purgeOldWebhookEvents() {
+  return purgeViaRetentionRegistry('meta_webhook_events')
 }
 
 export async function insertWebhookEventAtomic(event) {
@@ -1458,6 +1474,62 @@ export async function upsertSpendOnly(campaignId, statDate, spendPaise) {
      ON DUPLICATE KEY UPDATE spend_paise = GREATEST(spend_paise, VALUES(spend_paise))`,
     [uuidToBuffer(id), uuidToBuffer(campaignId), statDate, spendPaise]
   )
+}
+
+const DAILY_STATS_CHUNK = 500
+
+/**
+ * Genuinely bulk daily-stats upsert: one multi-row INSERT ... ON DUPLICATE
+ * KEY UPDATE per bounded chunk (≤500 rows), not a wrapper around per-row
+ * writes. `snapshots` entries carry { statDate, impressions, reach, ... }.
+ */
+export async function upsertDailyStatsBulk(campaignId, snapshots) {
+  const list = (snapshots || []).filter(s => s && s.statDate)
+  if (!list.length) return 0
+  let written = 0
+  for (let offset = 0; offset < list.length; offset += DAILY_STATS_CHUNK) {
+    const chunk = list.slice(offset, offset + DAILY_STATS_CHUNK)
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
+    const params = []
+    for (const s of chunk) {
+      params.push(
+        uuidToBuffer(generateUuid()),
+        uuidToBuffer(campaignId),
+        s.statDate,
+        s.impressions || 0,
+        s.reach || 0,
+        s.frequency || 0,
+        s.clicks || 0,
+        s.uniqueClicks || 0,
+        s.ctr || 0,
+        s.cpc || 0,
+        s.cpm || 0,
+        s.spendPaise || 0,
+        JSON.stringify(s.actions || {}),
+        JSON.stringify(s.costPerActionType || {})
+      )
+    }
+    await query(
+      `INSERT INTO campaign_daily_stats
+         (id, campaign_id, stat_date, impressions, reach, frequency, clicks, unique_clicks, ctr, cpc, cpm, spend_paise, actions, cost_per_action_type)
+       VALUES ${placeholders}
+       ON DUPLICATE KEY UPDATE
+         impressions = VALUES(impressions),
+         reach = VALUES(reach),
+         frequency = VALUES(frequency),
+         clicks = VALUES(clicks),
+         unique_clicks = VALUES(unique_clicks),
+         ctr = VALUES(ctr),
+         cpc = VALUES(cpc),
+         cpm = VALUES(cpm),
+         spend_paise = VALUES(spend_paise),
+         actions = VALUES(actions),
+         cost_per_action_type = VALUES(cost_per_action_type)`,
+      params
+    )
+    written += chunk.length
+  }
+  return written
 }
 
 export async function findDailyStats(campaignId, { from, to } = {}) {

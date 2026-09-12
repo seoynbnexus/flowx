@@ -657,21 +657,22 @@ export async function findPostsDueForEngagementSync({ stalenessSeconds = 3600, w
      WHERE pt.status = 'posted'
        AND pt.meta_object_id IS NOT NULL
        AND pt.meta_deleted_at IS NULL
+       AND (pt.remote_content_state IS NULL OR pt.remote_content_state != 'missing')
        AND (
-         (upa.webhook_status = 'active'
-          AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND)
-          AND (pt.last_engagement_event_at IS NULL OR pt.last_engagement_event_at < NOW() - INTERVAL 1800 SECOND))
-         OR
-         (COALESCE(upa.webhook_status, 'unknown') != 'active'
-          AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND))
-       )
-       AND (p.type != 'story' OR pt.posted_at IS NULL OR pt.posted_at >= NOW() - INTERVAL ? HOUR)
-       AND NOT EXISTS (
-         SELECT 1 FROM campaign_jobs j
-         WHERE j.campaign_id = p.id AND j.job_type = 'post_sync_engagement' AND j.status IN ('queued', 'running')
-       )
-     ORDER BY p.updated_at ASC
-     LIMIT ?`,
+          (upa.webhook_status = 'active'
+           AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND)
+           AND (pt.last_engagement_event_at IS NULL OR pt.last_engagement_event_at < NOW() - INTERVAL 1800 SECOND))
+          OR
+          (COALESCE(upa.webhook_status, 'unknown') != 'active'
+           AND (pt.last_engagement_sync_at IS NULL OR pt.last_engagement_sync_at < NOW() - INTERVAL ? SECOND))
+        )
+        AND (p.type != 'story' OR COALESCE(pt.posted_at, pt.created_at) >= NOW() - INTERVAL ? HOUR)
+        AND NOT EXISTS (
+          SELECT 1 FROM campaign_jobs j
+          WHERE j.campaign_id = p.id AND j.job_type = 'post_sync_engagement' AND j.status IN ('queued', 'running')
+        )
+      ORDER BY p.updated_at ASC
+      LIMIT ?`,
     [webhookStalenessSeconds, stalenessSeconds, String(storyMaxAgeHours), String(limit)]
   )
   return rows.map(r => bufferToUuid(r.id))
@@ -778,8 +779,32 @@ export async function stampPostEngagementSync(targetId) {
   )
 }
 
-export async function requeuePostEngagementJob(postId) {
-  return requeueAutoJob(postId, POST_JOB_TYPES.SYNC_ENGAGEMENT, {}, { entityType: 'post' })
+export function engagementRunKey(postId) {
+  return `eng:${postId}`
+}
+
+export async function findRecentlyFinishedEngagementJob(postId, floorSeconds) {
+  const row = await queryOne(
+    `SELECT id, finished_at FROM campaign_jobs
+      WHERE job_type = ? AND run_key = ? AND status IN ('done', 'dead')
+        AND finished_at IS NOT NULL AND finished_at > NOW() - INTERVAL ? SECOND
+      LIMIT 1`,
+    [POST_JOB_TYPES.SYNC_ENGAGEMENT, engagementRunKey(postId), Math.max(0, Math.floor(Number(floorSeconds) || 0))]
+  )
+  return row ? { id: bufferToUuid(row.id), finishedAt: row.finished_at } : null
+}
+
+export async function requeuePostEngagementJob(postId, { floorSeconds = 0, runAfterSeconds = 0, payload = {} } = {}) {
+  if (floorSeconds > 0) {
+    const recent = await findRecentlyFinishedEngagementJob(postId, floorSeconds)
+    if (recent) return { enqueued: false, floored: true, finishedAt: recent.finishedAt }
+  }
+  const enqueued = await requeueAutoJob(postId, POST_JOB_TYPES.SYNC_ENGAGEMENT, payload, {
+    entityType: 'post',
+    runKey: engagementRunKey(postId),
+    runAfterSeconds,
+  })
+  return { enqueued, floored: false }
 }
 
 function mapPostPublisherRequestRow(row) {

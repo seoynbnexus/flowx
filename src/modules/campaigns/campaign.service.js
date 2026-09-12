@@ -2084,7 +2084,7 @@ export async function syncAccountStatusJob(adAccountId = process.env.META_AD_ACC
     })
     .filter(Boolean)
 
-  if (needCampaignCheck.length > 0 && !isRateLimited(accountDbId)) {
+  if (needCampaignCheck.length > 0 && !isRateLimited(adAccountId)) {
     try {
       const campaignStatuses = await getCampaignStatusesBatch(adAccountId, systemToken, needCampaignCheck)
       for (const fbId of needCampaignCheck) {
@@ -2212,7 +2212,7 @@ function computeInsightsBackfillStart(campaign) {
 }
 
 async function persistInsightsRows(campaignId, rows) {
-  let count = 0
+  const snapshots = []
   for (const row of rows || []) {
     const actions = {}
     for (const action of row.actions || []) {
@@ -2222,7 +2222,7 @@ async function persistInsightsRows(campaignId, rows) {
     for (const cost of row.cost_per_action_type || []) {
       if (cost?.action_type) costPerActionType[cost.action_type] = cost.value
     }
-    await repo.upsertDailyStat(campaignId, {
+    snapshots.push({
       statDate: row.date_start,
       impressions: row.impressions,
       reach: row.reach,
@@ -2236,9 +2236,9 @@ async function persistInsightsRows(campaignId, rows) {
       actions,
       costPerActionType,
     })
-    count += 1
   }
-  return count
+  if (!snapshots.length) return 0
+  return repo.upsertDailyStatsBulk(campaignId, snapshots)
 }
 
 export async function syncCampaignInsightsJob(campaignId) {
@@ -2483,7 +2483,9 @@ export async function getMetaSyncHealth() {
     })(),
   ])
 
-  return {
+  const { getGateStats } = await import('../../../shared/services/meta-request-gate.js')
+
+  const health = {
     runningCount,
     pausedCount,
     staleCampaigns,
@@ -2494,7 +2496,9 @@ export async function getMetaSyncHealth() {
     accounts,
     rateLimits,
     schedulerLease,
+    workerLease: await repo.getSchedulerLease('campaign_job_worker'),
     chargedBudget,
+    metaTraffic: getGateStats(),
     queue: {
       active: activeQueueJobs,
       dead: deadQueueJobs,
@@ -2502,6 +2506,25 @@ export async function getMetaSyncHealth() {
     },
     webhooks: webhookStats ? { ...webhookStats, subscriptions: webhookSubs } : null,
   }
+
+  try {
+    const { getDbGrowthSnapshot } = await import('../../../shared/database/retention.js')
+    const growth = await getDbGrowthSnapshot()
+    if (growth) {
+      health.dbGrowth = growth
+    }
+  } catch {
+    // backend-only telemetry — never fails the health endpoint
+  }
+
+  try {
+    const { readRetentionHealth } = await import('../../../shared/database/retention.js')
+    health.retention = await readRetentionHealth()
+  } catch {
+    // backend-only telemetry — never fails the health endpoint
+  }
+
+  return health
 }
 
 export async function forceSyncCampaign(campaignId) {
