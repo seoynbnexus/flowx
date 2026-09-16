@@ -8,16 +8,51 @@ const contentFields = {
   textBody: z.string().max(5000).optional().nullable(),
 }
 
-const BOOST_OBJECTIVES = ['OUTCOME_AWARENESS','OUTCOME_TRAFFIC','OUTCOME_ENGAGEMENT']
-const BOOST_GOALS = ['REACH','IMPRESSIONS','LINK_CLICKS','LANDING_PAGE_VIEWS','POST_ENGAGEMENT','PAGE_LIKES','THRUPLAY','CONVERSATIONS']
+const BOOST_OBJECTIVES = ['OUTCOME_TRAFFIC','OUTCOME_ENGAGEMENT']
+const BOOST_GOALS = ['REACH','LINK_CLICKS','LANDING_PAGE_VIEWS','POST_ENGAGEMENT']
+
+const boostGeoSchema = z.object({
+  countries: z.array(z.string().min(1).max(4)).max(30).optional(),
+  regions: z.array(z.any()).max(200).optional(),
+  cities: z.array(z.any()).max(200).optional(),
+  zips: z.array(z.any()).max(200).optional(),
+  custom_locations: z.array(z.any()).max(200).optional(),
+  location_types: z.array(z.string()).max(10).optional(),
+}).catchall(z.any()).optional()
+
+const boostTargetingSchema = z.object({
+  age_min: z.coerce.number().int().optional(),
+  age_max: z.coerce.number().int().optional(),
+  genders: z.array(z.any()).max(2).optional(),
+  geo_locations: boostGeoSchema,
+  excluded_geo_locations: z.any().optional(),
+  interests: z.array(z.any()).max(200).optional(),
+  behaviors: z.array(z.any()).max(200).optional(),
+  languages: z.array(z.any()).max(100).optional(),
+  device_platforms: z.array(z.string().max(50)).max(10).optional(),
+}).catchall(z.any())
+
+const boostPlacementSchema = z.object({
+  publisher_platforms: z.array(z.string().max(50)).max(10).optional(),
+  publisherPlatforms: z.array(z.string().max(50)).max(10).optional(),
+  facebook_positions: z.array(z.string().max(50)).max(20).optional(),
+  instagram_positions: z.array(z.string().max(50)).max(20).optional(),
+  messenger_positions: z.array(z.string().max(50)).max(20).optional(),
+  audience_network_positions: z.array(z.string().max(50)).max(20).optional(),
+  feedPositions: z.array(z.string().max(50)).max(20).optional(),
+  instagramPositions: z.array(z.string().max(50)).max(20).optional(),
+  adSchedule: z.array(z.any()).max(100).optional(),
+  frequencyControl: z.array(z.any()).max(20).optional(),
+}).catchall(z.any())
+
 const boostFields = {
   boostEnabled: z.boolean().optional().default(false),
   boostBudgetType: z.enum(['daily', 'lifetime']).optional().nullable(),
   boostBudgetAmount: z.coerce.number().positive().optional().nullable(),
   boostSpendCap: z.coerce.number().positive().optional().nullable(),
   boostEndTime: z.string().datetime().optional().nullable(),
-  boostTargeting: z.any().optional().nullable(),
-  boostPlacement: z.any().optional().nullable(),
+  boostTargeting: boostTargetingSchema.optional().nullable(),
+  boostPlacement: boostPlacementSchema.optional().nullable(),
   boostBidStrategy: z.string().max(100).optional().nullable(),
   boostOptimizationGoal: z.enum(BOOST_GOALS).optional().nullable(),
   boostObjective: z.enum(BOOST_OBJECTIVES).optional().nullable(),

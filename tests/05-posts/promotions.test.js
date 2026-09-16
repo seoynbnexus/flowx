@@ -227,6 +227,10 @@ describe('promotions architecture', () => {
       targetAccountIds: [igAccountId],
     })
     const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await grantCoins(client.id, 10000)
+    await postService.submitPost(client.id, post.id)
+    const adminExec = await createTestUser({ email: `promo-admx-exec-${generateUuid()}@flowx-test.com`, password: 'Test@123', role: 'admin' })
+    await postService.approvePost(adminExec.id, post.id, {})
     await markTargetPosted(post.id, targets[0].id, `ig_exec_${generateUuid().slice(0, 8)}`)
     const promotion = await promoRepo.findPromotionByPostId(post.id)
     const ptgts = await promoRepo.findPromotionTargetsByPromotionId(promotion.id)
@@ -254,6 +258,10 @@ describe('promotions architecture', () => {
       targetAccountIds: [igAccountId],
     })
     const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await grantCoins(client.id, 10000)
+    await postService.submitPost(client.id, post.id)
+    const adminIdem = await createTestUser({ email: `promo-admx-idem-${generateUuid()}@flowx-test.com`, password: 'Test@123', role: 'admin' })
+    await postService.approvePost(adminIdem.id, post.id, {})
     await markTargetPosted(post.id, targets[0].id, `ig_idem_${generateUuid().slice(0, 8)}`)
     const promotion = await promoRepo.findPromotionByPostId(post.id)
     const ptgts = await promoRepo.findPromotionTargetsByPromotionId(promotion.id)
@@ -278,6 +286,10 @@ describe('promotions architecture', () => {
       targetAccountIds: [igAccountId],
     })
     const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await grantCoins(client.id, 10000)
+    await postService.submitPost(client.id, post.id)
+    const adminResume = await createTestUser({ email: `promo-admx-resume-${generateUuid()}@flowx-test.com`, password: 'Test@123', role: 'admin' })
+    await postService.approvePost(adminResume.id, post.id, {})
     await markTargetPosted(post.id, targets[0].id, `ig_resume_${generateUuid().slice(0, 8)}`)
     const promotion = await promoRepo.findPromotionByPostId(post.id)
     const ptgts = await promoRepo.findPromotionTargetsByPromotionId(promotion.id)
@@ -302,6 +314,10 @@ describe('promotions architecture', () => {
     const targets = await postRepo.findPostTargetsByPostId(post.id)
     const igTarget = targets.find(t => t.platformCode === 'instagram')
     const fbTarget = targets.find(t => t.platformCode === 'facebook')
+    await grantCoins(client.id, 10000)
+    await postService.submitPost(client.id, post.id)
+    const adminMulti = await createTestUser({ email: `promo-admx-multi-${generateUuid()}@flowx-test.com`, password: 'Test@123', role: 'admin' })
+    await postService.approvePost(adminMulti.id, post.id, {})
     await markTargetPosted(post.id, igTarget.id, `ig_multi_${generateUuid().slice(0, 8)}`)
     await markTargetPosted(post.id, fbTarget.id, `fb_multi_${generateUuid().slice(0, 8)}`)
     const promotion = await promoRepo.findPromotionByPostId(post.id)
@@ -427,6 +443,7 @@ describe('promotions architecture', () => {
 
     const result = await promotionService.createPromotionForPublishedPost(client.id, post.id, {
       budgetType: 'daily', budgetAmount: 500,
+      targeting: { geo_locations: { countries: ['IN'] } },
     })
     expect(result.promotion.status).toBe('waiting_for_post')
     expect(result.promotionTargetIds.length).toBe(1)
@@ -435,6 +452,214 @@ describe('promotions architecture', () => {
     expect(runResult.done).toBe(true)
     const ptgt = await promoRepo.findPromotionTargetById(result.promotionTargetIds[0])
     expect(ptgt.status).toBe('active')
+  })
+
+  it('Flow B invalid config: THRUPLAY goal → 422 before charge, zero coins moved', async () => {
+    await setFlag('promotions_enabled', true)
+    const post = await postService.createPost(client.id, {
+      name: `Promo BadGoal ${generateUuid().slice(0, 8)}`,
+      type: 'post', caption: 'bad goal', mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [igAccountId],
+    })
+    await postService.submitPost(client.id, post.id)
+    const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await markTargetPosted(post.id, targets[0].id, `ig_badgeoal_${generateUuid().slice(0, 8)}`)
+    await grantCoins(client.id, 10000)
+    const walletBefore = (await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(client.id)])).coins
+
+    await expect(promotionService.createPromotionForPublishedPost(client.id, post.id, {
+      budgetType: 'daily', budgetAmount: 500,
+      objective: 'OUTCOME_ENGAGEMENT', optimizationGoal: 'THRUPLAY',
+      targeting: { geo_locations: { countries: ['IN'] } },
+    })).rejects.toMatchObject({ statusCode: 422 })
+
+    expect(await promoRepo.findPromotionByPostId(post.id)).toBeNull()
+    const walletAfter = (await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(client.id)])).coins
+    expect(walletAfter).toBe(walletBefore)
+    const billing = await query('SELECT COUNT(*) as c FROM post_billing_entries WHERE post_id = ?', [uuidToBuffer(post.id)])
+    expect(billing[0].c).toBe(0)
+  })
+
+  it('Flow B invalid config: story post → 422 before charge (stories not boostable)', async () => {
+    await setFlag('promotions_enabled', true)
+    const post = await postService.createPost(client.id, {
+      name: `Promo Story ${generateUuid().slice(0, 8)}`,
+      type: 'story', caption: '', mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [fbAccountId],
+    })
+    await postService.submitPost(client.id, post.id)
+    const targets = await postRepo.findPostTargetsByPostId(post.id)
+    const fbTarget = targets.find(t => t.platformCode === 'facebook')
+    await markTargetPosted(post.id, fbTarget.id, `fb_story_${generateUuid().slice(0, 8)}`)
+    await grantCoins(client.id, 10000)
+
+    await expect(promotionService.createPromotionForPublishedPost(client.id, post.id, {
+      budgetType: 'daily', budgetAmount: 500,
+      targeting: { geo_locations: { countries: ['IN'] } },
+    })).rejects.toMatchObject({ statusCode: 422 })
+    expect(await promoRepo.findPromotionByPostId(post.id)).toBeNull()
+  })
+
+  it('Flow B invalid config: no geo → 422 before charge (no silent IN default)', async () => {
+    await setFlag('promotions_enabled', true)
+    const post = await postService.createPost(client.id, {
+      name: `Promo NoGeo ${generateUuid().slice(0, 8)}`,
+      type: 'post', caption: 'no geo', mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [igAccountId],
+    })
+    await postService.submitPost(client.id, post.id)
+    const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await markTargetPosted(post.id, targets[0].id, `ig_nogeo_${generateUuid().slice(0, 8)}`)
+    await grantCoins(client.id, 10000)
+    const walletBefore = (await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(client.id)])).coins
+
+    await expect(promotionService.createPromotionForPublishedPost(client.id, post.id, {
+      budgetType: 'daily', budgetAmount: 500,
+      targeting: { geo_locations: { countries: [] } },
+    })).rejects.toMatchObject({ statusCode: 422 })
+
+    expect(await promoRepo.findPromotionByPostId(post.id)).toBeNull()
+    const walletAfter = (await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(client.id)])).coins
+    expect(walletAfter).toBe(walletBefore)
+  })
+
+  it('Flow B persists resolved snapshot at charge; raw config untouched', async () => {
+    await setFlag('promotions_enabled', true)
+    const post = await postService.createPost(client.id, {
+      name: `Promo Snap ${generateUuid().slice(0, 8)}`,
+      type: 'post', caption: 'snap', mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [igAccountId],
+    })
+    await postService.submitPost(client.id, post.id)
+    const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await markTargetPosted(post.id, targets[0].id, `ig_snap_${generateUuid().slice(0, 8)}`)
+    await grantCoins(client.id, 10000)
+
+    const result = await promotionService.createPromotionForPublishedPost(client.id, post.id, {
+      budgetType: 'daily', budgetAmount: 500,
+      targeting: { geo_locations: { countries: ['IN'] } },
+      placement: { publisher_platforms: ['facebook', 'instagram'], facebook_positions: ['feed'] },
+    })
+    const promo = await promoRepo.findPromotionById(result.promotion.id)
+    expect(promo.resolvedAt).toBeTruthy()
+    expect(promo.resolvedGraphVersion).toBe('v25.0')
+    expect(promo.resolvedTargeting.targets[targets[0].id].geo_locations.countries).toEqual(['IN'])
+    expect(promo.resolvedTargeting.objective).toBe('OUTCOME_ENGAGEMENT')
+    expect(promo.resolvedPlacement.targets[targets[0].id].publisher_platforms).toEqual(['facebook', 'instagram'])
+    expect(promo.resolvedPlacement.targets[targets[0].id].facebook_positions).toEqual(['feed'])
+    expect(promo.targeting).toEqual({ geo_locations: { countries: ['IN'] } })
+    expect(promo.placement.publisher_platforms).toEqual(['facebook', 'instagram'])
+  })
+
+  it('execution uses the frozen snapshot even after raw config is tampered', async () => {
+    await setFlag('promotions_enabled', true)
+    const post = await postService.createPost(client.id, {
+      name: `Promo Frozen ${generateUuid().slice(0, 8)}`,
+      type: 'post', caption: 'frozen', mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [igAccountId],
+    })
+    await postService.submitPost(client.id, post.id)
+    const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await markTargetPosted(post.id, targets[0].id, `ig_frozen_${generateUuid().slice(0, 8)}`)
+    await grantCoins(client.id, 10000)
+
+    const result = await promotionService.createPromotionForPublishedPost(client.id, post.id, {
+      budgetType: 'daily', budgetAmount: 500,
+      targeting: { geo_locations: { countries: ['IN'] } },
+    })
+    await query('UPDATE promotions SET targeting = ? WHERE id = ?', [JSON.stringify({ geo_locations: { countries: ['US'] } }), uuidToBuffer(result.promotion.id)])
+
+    metaMocks.createAdSet.mockClear()
+    const runResult = await promotionService.runPromotionTargetJob(result.promotionTargetIds[0], {})
+    expect(runResult.done).toBe(true)
+    expect(metaMocks.createAdSet.mock.calls.length).toBeGreaterThan(0)
+    const adsetTargeting = metaMocks.createAdSet.mock.calls[0][2]
+    expect(adsetTargeting.geo_locations.countries).toEqual(['IN'])
+    const ptgt = await promoRepo.findPromotionTargetById(result.promotionTargetIds[0])
+    expect(ptgt.status).toBe('active')
+  })
+
+  it('execution without snapshot fails safe: no Meta calls, surfaced for handling', async () => {
+    await setFlag('promotions_enabled', true)
+    const post = await postService.createPost(client.id, {
+      name: `Promo Nosnap ${generateUuid().slice(0, 8)}`,
+      type: 'post', caption: 'nosnap', mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [igAccountId],
+    })
+    await postService.submitPost(client.id, post.id)
+    const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await markTargetPosted(post.id, targets[0].id, `ig_nosnap_${generateUuid().slice(0, 8)}`)
+
+    const promotionId = generateUuid()
+    await promoRepo.createPromotion(promotionId, post.id, client.id, {
+      status: 'waiting_for_post', budgetType: 'daily', budgetAmount: 500,
+      objective: 'OUTCOME_ENGAGEMENT', targeting: { geo_locations: { countries: ['IN'] } },
+      chargedPaise: 0,
+    })
+    const ptgtId = generateUuid()
+    await promoRepo.createPromotionTarget(ptgtId, promotionId, targets[0].id, 'instagram', targets[0].platformAccountId)
+
+    metaMocks.createAdCampaign.mockClear()
+    metaMocks.createAdSet.mockClear()
+    const runResult = await promotionService.runPromotionTargetJob(ptgtId, {})
+    expect(runResult.done).toBe(true)
+    expect(metaMocks.createAdCampaign).not.toHaveBeenCalled()
+    expect(metaMocks.createAdSet).not.toHaveBeenCalled()
+    const ptgt = await promoRepo.findPromotionTargetById(ptgtId)
+    expect(ptgt.status).toBe('failed')
+    expect(ptgt.error).toContain('explicit handling')
+    const promo = await promoRepo.findPromotionById(promotionId)
+    expect(promo.error).toContain('manual review')
+  })
+
+  it('backfill resolves valid legacy promotions, flags invalid ones, and is idempotent', async () => {
+    await setFlag('promotions_enabled', true)
+    const post = await postService.createPost(client.id, {
+      name: `Promo Backfill ${generateUuid().slice(0, 8)}`,
+      type: 'post', caption: 'backfill', mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [igAccountId],
+    })
+    const targets = await postRepo.findPostTargetsByPostId(post.id)
+    const goodId = generateUuid()
+    await promoRepo.createPromotion(goodId, post.id, client.id, {
+      status: 'waiting_for_post', budgetType: 'daily', budgetAmount: 500,
+      objective: 'OUTCOME_ENGAGEMENT', targeting: { geo_locations: { countries: ['IN'] } },
+    })
+    await promoRepo.createPromotionTarget(generateUuid(), goodId, targets[0].id, 'instagram', targets[0].platformAccountId)
+    const badPost = await postService.createPost(client.id, {
+      name: `Promo Backfill Bad ${generateUuid().slice(0, 8)}`,
+      type: 'post', caption: 'backfill bad', mediaUrl: 'https://example.com/img.jpg',
+      targetAccountIds: [igAccountId],
+    })
+    const badTargets = await postRepo.findPostTargetsByPostId(badPost.id)
+    const badId = generateUuid()
+    await promoRepo.createPromotion(badId, badPost.id, client.id, {
+      status: 'waiting_for_post', budgetType: 'daily', budgetAmount: 500,
+      objective: 'OUTCOME_AWARENESS', targeting: { geo_locations: { countries: ['IN'] } },
+    })
+    await promoRepo.createPromotionTarget(generateUuid(), badId, badTargets[0].id, 'instagram', badTargets[0].platformAccountId)
+
+    const goodOutcome = await promotionService.backfillPromotionSnapshot(goodId)
+    expect(goodOutcome.status).toBe('resolved')
+    const badOutcome = await promotionService.backfillPromotionSnapshot(badId)
+    expect(badOutcome.status).toBe('unresolved')
+
+    const good = await promoRepo.findPromotionById(goodId)
+    expect(good.resolvedAt).toBeTruthy()
+    expect(good.resolvedTargeting.targets[targets[0].id].geo_locations.countries).toEqual(['IN'])
+    expect(good.targeting).toEqual({ geo_locations: { countries: ['IN'] } })
+    const bad = await promoRepo.findPromotionById(badId)
+    expect(bad.resolvedAt).toBeNull()
+    expect(bad.resolvedTargeting).toBeNull()
+    expect(bad.error).toContain('Unresolved boost configuration')
+    expect(bad.targeting).toEqual({ geo_locations: { countries: ['IN'] } })
+    expect(await promoRepo.countUnresolvedPromotions()).toBeGreaterThanOrEqual(1)
+
+    const resolvedAtBefore = good.resolvedAt
+    const repeat = await promotionService.backfillPromotionSnapshot(goodId)
+    expect(repeat.status).toBe('skipped')
+    const goodAfter = await promoRepo.findPromotionById(goodId)
+    expect(new Date(goodAfter.resolvedAt).getTime()).toBe(new Date(resolvedAtBefore).getTime())
   })
 
   it('Flow B invalid: unpublished post → 422, no promotion, no charge', async () => {
@@ -463,12 +688,13 @@ describe('promotions architecture', () => {
     await markTargetPosted(post.id, targets[0].id, `ig_dup_${generateUuid().slice(0, 8)}`)
     await grantCoins(client.id, 10000)
 
-    const first = await promotionService.createPromotionForPublishedPost(client.id, post.id, { budgetType: 'daily', budgetAmount: 500 })
+    const dupArgs = { budgetType: 'daily', budgetAmount: 500, targeting: { geo_locations: { countries: ['IN'] } } }
+    const first = await promotionService.createPromotionForPublishedPost(client.id, post.id, dupArgs)
     const walletAfterFirst = (await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(client.id)])).coins
 
-    await expect(promotionService.createPromotionForPublishedPost(client.id, post.id, { budgetType: 'daily', budgetAmount: 500 }))
+    await expect(promotionService.createPromotionForPublishedPost(client.id, post.id, dupArgs))
       .rejects.toMatchObject({ statusCode: 409 })
-    await expect(promotionService.createPromotionForPublishedPost(client.id, post.id, { budgetType: 'daily', budgetAmount: 500 }))
+    await expect(promotionService.createPromotionForPublishedPost(client.id, post.id, dupArgs))
       .rejects.toMatchObject({ statusCode: 409 })
     const walletAfterAll = (await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(client.id)])).coins
     expect(Number(walletAfterAll)).toBe(Number(walletAfterFirst))
@@ -509,6 +735,10 @@ describe('promotions architecture', () => {
       targetAccountIds: [igAccountId],
     })
     const targets = await postRepo.findPostTargetsByPostId(post.id)
+    await grantCoins(client.id, 10000)
+    await postService.submitPost(client.id, post.id)
+    const adminCancelAct = await createTestUser({ email: `promo-admx-cancelact-${generateUuid()}@flowx-test.com`, password: 'Test@123', role: 'admin' })
+    await postService.approvePost(adminCancelAct.id, post.id, {})
     await markTargetPosted(post.id, targets[0].id, `ig_cancelact_${generateUuid().slice(0, 8)}`)
     const promotion = await promoRepo.findPromotionByPostId(post.id)
     const ptgts = await promoRepo.findPromotionTargetsByPromotionId(promotion.id)
@@ -649,6 +879,7 @@ describe('promotions architecture', () => {
       name: `Promo Idem ${generateUuid().slice(0, 8)}`,
       type: 'post', caption: 'idem', mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true, boostBudgetType: 'daily', boostBudgetAmount: 500,
+      boostTargeting: { geo_locations: { countries: ['IN'] } },
       targetAccountIds: [igAccountId],
     })
     const before = await totalAvailable(client.id)
@@ -685,6 +916,7 @@ describe('promotions architecture', () => {
       name: `Promo CancelCharged ${generateUuid().slice(0, 8)}`,
       type: 'post', caption: 'cancel charged', mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true, boostBudgetType: 'daily', boostBudgetAmount: 500,
+      boostTargeting: { geo_locations: { countries: ['IN'] } },
       targetAccountIds: [igAccountId, fbAccountId],
     })
     await postService.submitPost(client.id, post.id)
@@ -710,6 +942,7 @@ describe('promotions architecture', () => {
       name: `Promo Refund ${generateUuid().slice(0, 8)}`,
       type: 'post', caption: 'refund', mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true, boostBudgetType: 'daily', boostBudgetAmount: 500,
+      boostTargeting: { geo_locations: { countries: ['IN'] } },
       targetAccountIds: [igAccountId],
     })
     await postService.submitPost(client.id, post.id)
@@ -786,6 +1019,7 @@ describe('promotions architecture', () => {
       name: `Promo BareId ${generateUuid().slice(0, 8)}`,
       type: 'post', caption: 'bare', mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true, boostBudgetType: 'daily', boostBudgetAmount: 500,
+      boostTargeting: { geo_locations: { countries: ['IN'] } },
       targetAccountIds: [fbAccountId],
     })
     await postService.submitPost(client.id, post.id)
@@ -815,6 +1049,7 @@ describe('promotions architecture', () => {
       name: `Promo PhotoId ${generateUuid().slice(0, 8)}`,
       type: 'post', caption: 'photo id', mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true, boostBudgetType: 'daily', boostBudgetAmount: 500,
+      boostTargeting: { geo_locations: { countries: ['IN'] } },
       targetAccountIds: [fbAccountId],
     })
     await postService.submitPost(client.id, post.id)
@@ -854,6 +1089,7 @@ describe('promotions architecture', () => {
       name: `Promo PhotoNull ${generateUuid().slice(0, 8)}`,
       type: 'post', caption: 'photo null', mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true, boostBudgetType: 'daily', boostBudgetAmount: 500,
+      boostTargeting: { geo_locations: { countries: ['IN'] } },
       targetAccountIds: [fbAccountId],
     })
     await postService.submitPost(client.id, post.id)
@@ -888,6 +1124,7 @@ describe('promotions architecture', () => {
       name: `Promo Trans ${generateUuid().slice(0, 8)}`,
       type: 'post', caption: 'trans', mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true, boostBudgetType: 'daily', boostBudgetAmount: 500,
+      boostTargeting: { geo_locations: { countries: ['IN'] } },
       targetAccountIds: [igAccountId],
     })
     await postService.submitPost(client.id, post.id)

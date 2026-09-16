@@ -157,13 +157,9 @@ describe('instagram post boost via boost_eligibility_info', () => {
     await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(postId)])
   })
 
-  it('should hard-fail IG story posts (not boostable)', async () => {
-    const { postId, targetId } = await createIgPost({ type: 'story', mediaUrl: 'https://example.com/story.jpg' })
-    const result = await postService.postBoostJob(postId, targetId, {})
-    expect(result.done).toBe(true)
-    const post = await postRepo.findPostById(postId)
-    expect(post.boostError).toContain('Instagram stories cannot be boosted')
-    await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(postId)])
+  it('should hard-fail IG story posts at creation (not boostable, before any charge)', async () => {
+    await expect(createIgPost({ type: 'story', mediaUrl: 'https://example.com/story.jpg' }))
+      .rejects.toMatchObject({ statusCode: 422 })
   })
 
   it('should requeue when boost_eligibility_info not yet ready and park after eligibility is false', async () => {

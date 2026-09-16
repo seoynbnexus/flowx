@@ -521,3 +521,221 @@ describe('meta webhook event processing', () => {
     expect(row.last_error).toBeNull()
   })
 })
+
+describe('feed photo_id fallback', () => {
+  it('normal post_id match does NOT attempt photo_id fallback', async () => {
+    const user = await createTestUser({ email: `whk-phi1-${Date.now()}@test.com`, password: 'Test@123', coins: 1000 })
+    const pageId = `page_phi1_${generateUuid().substring(0, 8)}`
+    const postId = await insertFbPhotoPostTarget(user.id, pageId)
+
+    const result = await webhookService.processMetaWebhookEvents({
+      object: 'page',
+      entry: [{
+        id: pageId,
+        time: Math.floor(Date.now() / 1000),
+        changes: [{
+          field: 'feed',
+          value: {
+            from: { id: 'user_x', name: 'Test' },
+            post_id: postId.promotable,
+            item: 'photo',
+            verb: 'add',
+          },
+        }],
+      }],
+    })
+    expect(result.queued).toBe(1)
+    const inboxRow = await queryOne('SELECT id FROM meta_webhook_events WHERE object_type = ? AND external_object_id = ?', ['page', postId.promotable])
+    const outcome = await webhookService.processWebhookEventById(inboxRow.id)
+    expect(outcome.ignored).toBeUndefined()
+    expect(outcome.remoteHealthQueued).toBe(true)
+    const target = await queryOne('SELECT meta_object_id FROM post_targets WHERE id = ?', [uuidToBuffer(postId.targetId)])
+    expect(target.meta_object_id).toBe(postId.promotable)
+  })
+
+  it('photo_id fallback resolves target when post_id lookup fails', async () => {
+    const user = await createTestUser({ email: `whk-phi2-${Date.now()}@test.com`, password: 'Test@123', coins: 1000 })
+    const pageId = `page_phi2_${generateUuid().substring(0, 8)}`
+    const postId = await insertFbPhotoPostTarget(user.id, pageId)
+
+    const fakeFeedSuffix = `99${generateUuid().replace(/[^0-9]/g, '').slice(0, 15)}`
+    const fakeFeedPostId = `${pageId}_${fakeFeedSuffix}`
+
+    const result = await webhookService.processMetaWebhookEvents({
+      object: 'page',
+      entry: [{
+        id: pageId,
+        time: Math.floor(Date.now() / 1000),
+        changes: [{
+          field: 'feed',
+          value: {
+            from: { id: 'user_x', name: 'Test' },
+            post_id: fakeFeedPostId,
+            photo_id: postId.photoId,
+            item: 'photo',
+            verb: 'add',
+          },
+        }],
+      }],
+    })
+    expect(result.queued).toBe(1)
+    const inboxRow = await queryOne('SELECT id FROM meta_webhook_events WHERE object_type = ? AND external_object_id = ?', ['page', fakeFeedPostId])
+    const outcome = await webhookService.processWebhookEventById(inboxRow.id)
+    expect(outcome.ignored).toBeUndefined()
+    expect(outcome.remoteHealthQueued).toBe(true)
+    const target = await queryOne('SELECT meta_object_id FROM post_targets WHERE id = ?', [uuidToBuffer(postId.targetId)])
+    expect(target.meta_object_id).toBe(fakeFeedPostId)
+  })
+
+  it('both lookups fail returns unknown_target', async () => {
+    const user = await createTestUser({ email: `whk-phi3-${Date.now()}@test.com`, password: 'Test@123', coins: 1000 })
+    const pageId = `page_phi3_${generateUuid().substring(0, 8)}`
+    await insertFbPageAccount(user.id, pageId)
+
+    const unknownPostId = `${pageId}_88${generateUuid().replace(/[^0-9]/g, '').slice(0, 15)}`
+    const unknownPhotoId = `77${generateUuid().replace(/[^0-9]/g, '').slice(0, 15)}`
+
+    const result = await webhookService.processMetaWebhookEvents({
+      object: 'page',
+      entry: [{
+        id: pageId,
+        time: Math.floor(Date.now() / 1000),
+        changes: [{
+          field: 'feed',
+          value: {
+            from: { id: 'user_x', name: 'Test' },
+            post_id: unknownPostId,
+            photo_id: unknownPhotoId,
+            item: 'photo',
+            verb: 'add',
+          },
+        }],
+      }],
+    })
+    expect(result.queued).toBe(1)
+    const inboxRow = await queryOne('SELECT id FROM meta_webhook_events WHERE object_type = ? AND external_object_id = ?', ['page', unknownPostId])
+    const outcome = await webhookService.processWebhookEventById(inboxRow.id)
+    expect(outcome.ignored).toBe(true)
+    expect(outcome.reason).toBe('unknown_target')
+  })
+
+  it('no photo_id in payload returns unknown_target without fallback', async () => {
+    const user = await createTestUser({ email: `whk-phi4-${Date.now()}@test.com`, password: 'Test@123', coins: 1000 })
+    const pageId = `page_phi4_${generateUuid().substring(0, 8)}`
+    await insertFbPageAccount(user.id, pageId)
+
+    const unknownPostId = `${pageId}_77${generateUuid().replace(/[^0-9]/g, '').slice(0, 15)}`
+
+    const result = await webhookService.processMetaWebhookEvents({
+      object: 'page',
+      entry: [{
+        id: pageId,
+        time: Math.floor(Date.now() / 1000),
+        changes: [{
+          field: 'feed',
+          value: {
+            from: { id: 'user_x', name: 'Test' },
+            post_id: unknownPostId,
+            item: 'photo',
+            verb: 'add',
+          },
+        }],
+      }],
+    })
+    expect(result.queued).toBe(1)
+    const inboxRow = await queryOne('SELECT id FROM meta_webhook_events WHERE object_type = ? AND external_object_id = ?', ['page', unknownPostId])
+    const outcome = await webhookService.processWebhookEventById(inboxRow.id)
+    expect(outcome.ignored).toBe(true)
+    expect(outcome.reason).toBe('unknown_target')
+  })
+
+  it('subsequent engagement resolves target after photo_id fixup corrected meta_object_id', async () => {
+    const user = await createTestUser({ email: `whk-phi5-${Date.now()}@test.com`, password: 'Test@123', coins: 1000 })
+    const pageId = `page_phi5_${generateUuid().substring(0, 8)}`
+    const postId = await insertFbPhotoPostTarget(user.id, pageId)
+
+    const fakeFeedSuffix = `99${generateUuid().replace(/[^0-9]/g, '').slice(0, 15)}`
+    const fakeFeedPostId = `${pageId}_${fakeFeedSuffix}`
+
+    const addResult = await webhookService.processMetaWebhookEvents({
+      object: 'page',
+      entry: [{
+        id: pageId,
+        time: Math.floor(Date.now() / 1000),
+        changes: [{
+          field: 'feed',
+          value: {
+            from: { id: 'user_x', name: 'Test' },
+            post_id: fakeFeedPostId,
+            photo_id: postId.photoId,
+            item: 'photo',
+            verb: 'add',
+          },
+        }],
+      }],
+    })
+    expect(addResult.queued).toBe(1)
+    const addInbox = await queryOne('SELECT id FROM meta_webhook_events WHERE object_type = ? AND external_object_id = ?', ['page', fakeFeedPostId])
+    await webhookService.processWebhookEventById(addInbox.id)
+
+    const fixedTarget = await queryOne('SELECT meta_object_id FROM post_targets WHERE id = ?', [uuidToBuffer(postId.targetId)])
+    expect(fixedTarget.meta_object_id).toBe(fakeFeedPostId)
+
+    const reactionResult = await webhookService.processMetaWebhookEvents({
+      object: 'page',
+      entry: [{
+        id: pageId,
+        time: Math.floor(Date.now() / 1000),
+        changes: [{
+          field: 'feed',
+          value: {
+            from: { id: 'user_y', name: 'Reactor' },
+            post_id: fakeFeedPostId,
+            item: 'reaction',
+            reaction_type: 'like',
+            verb: 'add',
+          },
+        }],
+      }],
+    })
+    expect(reactionResult.queued).toBe(1)
+    const reactionInbox = await queryOne('SELECT id FROM meta_webhook_events WHERE object_type = ? AND external_object_id = ? AND processing_status = ?', ['page', fakeFeedPostId, 'received'])
+    const reactionOutcome = await webhookService.processWebhookEventById(reactionInbox.id)
+    expect(reactionOutcome.ignored).toBeUndefined()
+    expect(reactionOutcome.engagementRefreshQueued).toBe(true)
+  })
+
+  it('already-matching post_id is NOT overwritten by photo_id', async () => {
+    const user = await createTestUser({ email: `whk-phi6-${Date.now()}@test.com`, password: 'Test@123', coins: 1000 })
+    const pageId = `page_phi6_${generateUuid().substring(0, 8)}`
+    const postId = await insertFbPhotoPostTarget(user.id, pageId)
+
+    const realFeedPostId = postId.promotable
+    const otherPhotoId = `66${generateUuid().replace(/[^0-9]/g, '').slice(0, 15)}`
+
+    const result = await webhookService.processMetaWebhookEvents({
+      object: 'page',
+      entry: [{
+        id: pageId,
+        time: Math.floor(Date.now() / 1000),
+        changes: [{
+          field: 'feed',
+          value: {
+            from: { id: 'user_x', name: 'Test' },
+            post_id: realFeedPostId,
+            photo_id: otherPhotoId,
+            item: 'photo',
+            verb: 'add',
+          },
+        }],
+      }],
+    })
+    expect(result.queued).toBe(1)
+    const inboxRow = await queryOne('SELECT id FROM meta_webhook_events WHERE object_type = ? AND external_object_id = ?', ['page', realFeedPostId])
+    const outcome = await webhookService.processWebhookEventById(inboxRow.id)
+    expect(outcome.ignored).toBeUndefined()
+    expect(outcome.remoteHealthQueued).toBe(true)
+    const target = await queryOne('SELECT meta_object_id FROM post_targets WHERE id = ?', [uuidToBuffer(postId.targetId)])
+    expect(target.meta_object_id).toBe(realFeedPostId)
+  })
+})

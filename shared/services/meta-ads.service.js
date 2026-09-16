@@ -4,7 +4,26 @@ import { recordUsage, tokenKeyFor } from './meta-rate-limiter.js'
 import { metaRequest, GATE_PRIORITY, tokenFingerprint } from './meta-request-gate.js'
 import { fetchBoundedBytes } from './media-url.js'
 import { logMetaEvent } from './meta-logger.service.js'
+import { queryOne } from '../database/connection.js'
 import { ValidationError } from '../errors/AppError.js'
+
+export async function isBoostPlacementFixEnabled() {
+  try {
+    const row = await queryOne('SELECT config_value FROM app_config WHERE config_key = ?', ['boost_placement_fix_enabled'])
+    if (!row) return false
+    const v = typeof row.config_value === 'string' ? JSON.parse(row.config_value) : row.config_value
+    return v === true || v === 'true' || v === 1
+  } catch { return false }
+}
+
+function pickPlacementValue(placement, snakeKey, ...camelKeys) {
+  if (!placement || typeof placement !== 'object') return undefined
+  if (placement[snakeKey] !== undefined && placement[snakeKey] !== null) return placement[snakeKey]
+  for (const key of camelKeys) {
+    if (placement[key] !== undefined && placement[key] !== null) return placement[key]
+  }
+  return undefined
+}
 
 const RATE_LIMIT_CODES = new Set([80004, 613, 4, 17])
 const RATE_LIMIT_SUBCODE = 2446079
@@ -246,9 +265,26 @@ export async function createAdSet(adAccountId, campaignId, targeting, budget, sc
   if (schedule.endTime) params.end_time = schedule.endTime
 
   if (placement) {
-    params.targeting.publisher_platforms = placement.publisherPlatforms || ['facebook', 'instagram']
-    if (placement.feedPositions) params.feed_positions = placement.feedPositions
-    if (placement.instagramPositions) params.instagram_positions = placement.instagramPositions
+    if (await isBoostPlacementFixEnabled()) {
+      const platforms = pickPlacementValue(placement, 'publisher_platforms', 'publisherPlatforms')
+      if (Array.isArray(platforms) && platforms.length) {
+        params.targeting.publisher_platforms = platforms
+      } else if (!Array.isArray(params.targeting.publisher_platforms) || !params.targeting.publisher_platforms.length) {
+        params.targeting.publisher_platforms = ['facebook', 'instagram']
+      }
+      const fbPositions = pickPlacementValue(placement, 'facebook_positions', 'facebookPositions', 'feedPositions', 'feed_positions')
+      if (Array.isArray(fbPositions) && fbPositions.length) params.targeting.facebook_positions = fbPositions
+      const igPositions = pickPlacementValue(placement, 'instagram_positions', 'instagramPositions')
+      if (Array.isArray(igPositions) && igPositions.length) params.targeting.instagram_positions = igPositions
+      const msgrPositions = pickPlacementValue(placement, 'messenger_positions', 'messengerPositions')
+      if (Array.isArray(msgrPositions) && msgrPositions.length) params.targeting.messenger_positions = msgrPositions
+      const anPositions = pickPlacementValue(placement, 'audience_network_positions', 'audienceNetworkPositions')
+      if (Array.isArray(anPositions) && anPositions.length) params.targeting.audience_network_positions = anPositions
+    } else {
+      params.targeting.publisher_platforms = placement.publisherPlatforms || ['facebook', 'instagram']
+      if (placement.feedPositions) params.feed_positions = placement.feedPositions
+      if (placement.instagramPositions) params.instagram_positions = placement.instagramPositions
+    }
   }
 
   if (budget.promotedPageId) params.promoted_object = { page_id: budget.promotedPageId }
@@ -1037,7 +1073,7 @@ export function classifyRemoteStateError(error, context = {}) {
   if (http === 404) return { state: 'missing', detail: message.slice(0, 240) }
   if (isRateLimitError(error) || http === 429) return { state: 'unknown', detail: message.slice(0, 240) }
   if (Number.isFinite(code) && code === 190) return { state: 'unknown', detail: message.slice(0, 240) }
-  if (Number.isFinite(code) && code === 100 && (subcode === 33 || /does not exist|nonexisting|has been deleted/i.test(message))) {
+  if (Number.isFinite(code) && code === 100 && (subcode === 33 || /does not exist|has been deleted/i.test(message))) {
     return { state: 'missing', detail: message.slice(0, 240) }
   }
   if (Number.isFinite(code) && REMOTE_STATE_PERMISSION_CODES.has(code)) {
@@ -1055,14 +1091,7 @@ export function classifyRemoteStateError(error, context = {}) {
 
 export async function getObjectRemoteState(objectId, accessToken, platform, context = {}) {
   if (!objectId || !accessToken) return { state: 'unknown', detail: 'no_object_or_token' }
-  const code = String(platform || '').toLowerCase()
   try {
-    if (code === 'facebook') {
-      const data = await graphGet(`${objectId}`, { access_token: accessToken, fields: 'id,is_hidden' })
-      if (!data || !data.id) return { state: 'unknown', detail: 'empty_response' }
-      if (data.is_hidden === true) return { state: 'hidden', hidden: true }
-      return { state: 'visible' }
-    }
     const data = await graphGet(`${objectId}`, { access_token: accessToken, fields: 'id' })
     if (!data || !data.id) return { state: 'unknown', detail: 'empty_response' }
     return { state: 'visible' }

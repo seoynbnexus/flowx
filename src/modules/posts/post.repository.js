@@ -369,6 +369,19 @@ export async function findPostTargetsByPostId(postId) {
   return rows.map(mapPostTargetRow)
 }
 
+export async function findPlatformCodesForAccounts(accountIds) {
+  if (!Array.isArray(accountIds) || !accountIds.length) return []
+  const placeholders = accountIds.map(() => '?').join(',')
+  const rows = await query(
+    `SELECT upa.id as account_id, p.code as platform_code
+     FROM user_platform_accounts upa
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE upa.id IN (${placeholders})`,
+    accountIds.map((id) => uuidToBuffer(id))
+  )
+  return rows.map((row) => ({ id: bufferToUuid(row.account_id), platformCode: row.platform_code || null }))
+}
+
 export async function findPostTargetById(id) {
   const row = await queryOne(
     `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,

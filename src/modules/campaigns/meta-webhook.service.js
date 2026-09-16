@@ -327,7 +327,10 @@ async function handleFacebookPageFeed(event) {
   if (!targetExternalId) return { ignored: true, reason: 'no_external_id' }
 
   const { findPostTargetByExternalId } = await import('./campaign.repository.js')
-  const targetRow = await findPostTargetByExternalId(targetExternalId, 'facebook')
+  let targetRow = await findPostTargetByExternalId(targetExternalId, 'facebook')
+  if (!targetRow && value.photo_id) {
+    targetRow = await findPostTargetByExternalId(value.photo_id, 'facebook')
+  }
   if (!targetRow) {
     const pageId = event.sourceId || event.externalAccountId
     if (pageId) {

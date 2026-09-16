@@ -1,6 +1,15 @@
 import * as service from './post.service.js'
 import * as boostPerfService from './boost-performance.service.js'
+import { getBoostCapabilities as readBoostCapabilities } from '../../../shared/services/boost-capabilities.js'
 import { sendSuccess, sendCreated, sendPaginated, sendAccepted } from '../../../shared/utils/response.utils.js'
+
+export async function getBoostCapabilities(req, res, next) {
+  try {
+    return sendSuccess(res, readBoostCapabilities())
+  } catch (error) {
+    next(error)
+  }
+}
 
 export async function createPost(req, res, next) {
   try {

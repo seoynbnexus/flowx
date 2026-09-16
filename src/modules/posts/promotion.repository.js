@@ -1,5 +1,6 @@
 import { query, queryOne, transaction } from '../../../shared/database/connection.js'
 import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/uuid.utils.js'
+import { PROMOTION_STATUS, TERMINAL_PROMOTION_STATUSES } from './promotion.model.js'
 
 function mapPromotionRow(row) {
   if (!row) return null
@@ -16,6 +17,10 @@ function mapPromotionRow(row) {
     bidStrategy: row.bid_strategy || null,
     targeting: typeof row.targeting === 'string' ? JSON.parse(row.targeting) : row.targeting || null,
     placement: typeof row.placement === 'string' ? JSON.parse(row.placement) : row.placement || null,
+    resolvedTargeting: typeof row.resolved_targeting === 'string' ? JSON.parse(row.resolved_targeting) : row.resolved_targeting || null,
+    resolvedPlacement: typeof row.resolved_placement === 'string' ? JSON.parse(row.resolved_placement) : row.resolved_placement || null,
+    resolvedGraphVersion: row.resolved_graph_version || null,
+    resolvedAt: row.resolved_at || null,
     callToAction: row.call_to_action || null,
     link: row.link || null,
     headline: row.headline || null,
@@ -106,6 +111,33 @@ export async function createPromotionTarget(id, promotionId, postTargetId, platf
     [uuidToBuffer(id), uuidToBuffer(promotionId), uuidToBuffer(postTargetId), platform, platformAccountId ? uuidToBuffer(platformAccountId) : null]
   )
   return findPromotionTargetById(id)
+}
+
+const NON_TERMINAL_PROMOTION_STATUSES = Object.values(PROMOTION_STATUS).filter((s) => !TERMINAL_PROMOTION_STATUSES.includes(s))
+
+export async function findPromotionsNeedingResolution(limit = 25, afterId = null) {
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 25))
+  const placeholders = NON_TERMINAL_PROMOTION_STATUSES.map(() => '?').join(',')
+  const params = [...NON_TERMINAL_PROMOTION_STATUSES]
+  let cursor = ''
+  if (afterId) {
+    cursor = 'AND id > ?'
+    params.push(uuidToBuffer(afterId))
+  }
+  const rows = await query(
+    `SELECT * FROM promotions WHERE status IN (${placeholders}) AND resolved_at IS NULL ${cursor} ORDER BY id ASC LIMIT ${safeLimit}`,
+    params
+  )
+  return rows.map(mapPromotionRow)
+}
+
+export async function countUnresolvedPromotions() {
+  const placeholders = NON_TERMINAL_PROMOTION_STATUSES.map(() => '?').join(',')
+  const row = await queryOne(
+    `SELECT COUNT(*) as c FROM promotions WHERE status IN (${placeholders}) AND resolved_at IS NULL`,
+    NON_TERMINAL_PROMOTION_STATUSES
+  )
+  return Number(row?.c) || 0
 }
 
 export async function findPromotionById(id) {
@@ -243,6 +275,10 @@ export async function updatePromotion(id, data) {
   if (data.error !== undefined) { fields.push('error = ?'); params.push(data.error) }
   if (data.chargedPaise !== undefined) { fields.push('charged_paise = ?'); params.push(data.chargedPaise) }
   if (data.settledAt !== undefined) { fields.push('settled_at = ?'); params.push(data.settledAt) }
+  if (data.resolvedTargeting !== undefined) { fields.push('resolved_targeting = ?'); params.push(data.resolvedTargeting ? JSON.stringify(data.resolvedTargeting) : null) }
+  if (data.resolvedPlacement !== undefined) { fields.push('resolved_placement = ?'); params.push(data.resolvedPlacement ? JSON.stringify(data.resolvedPlacement) : null) }
+  if (data.resolvedGraphVersion !== undefined) { fields.push('resolved_graph_version = ?'); params.push(data.resolvedGraphVersion) }
+  if (data.resolvedAt !== undefined) { fields.push('resolved_at = ?'); params.push(data.resolvedAt) }
   if (fields.length === 0) return
   params.push(uuidToBuffer(id))
   await query(`UPDATE promotions SET ${fields.join(', ')} WHERE id = ?`, params)

@@ -602,6 +602,18 @@ paths:
         "200":
           description: Media config updated
 
+  /posts/boost-capabilities:
+    get:
+      tags: [Posts]
+      summary: Backend-owned boost capability registry (versioned; frontend renders only these options)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Objectives, per-platform contexts, positions, device platforms, graphVersion
+        "401":
+          description: Unauthorized
+
   /posts/{id}/boost-performance:
     get:
       tags: [Posts]

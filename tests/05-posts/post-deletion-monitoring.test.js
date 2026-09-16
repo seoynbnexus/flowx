@@ -225,9 +225,12 @@ describe('remote-state classifier (strict)', () => {
     expect(classifyRemoteStateError(err).state).toBe('missing')
   })
   it('missing on code 100 + documented message patterns', () => {
-    expect(classifyRemoteStateError(tagError('Graph API GET x failed: {"error":{"code":100,"message":"(#100) Tried accessing nonexisting field"}}', 400)).state).toBe('missing')
     expect(classifyRemoteStateError(tagError('Graph API GET x failed: {"error":{"code":100,"message":"post does not exist"}}', 400)).state).toBe('missing')
     expect(classifyRemoteStateError(tagError('Graph API GET x failed: {"error":{"code":100,"message":"this object has been deleted"}}', 400)).state).toBe('missing')
+  })
+  it('unknown on code 100 + "nonexisting field" (field-level error, not deletion)', () => {
+    expect(classifyRemoteStateError(tagError('Graph API GET x failed: {"error":{"code":100,"message":"(#100) Tried accessing nonexisting field (is_hidden)"}}', 400)).state).toBe('unknown')
+    expect(classifyRemoteStateError(tagError('Graph API GET x failed: {"error":{"code":100,"message":"(#100) Tried accessing nonexisting field"}}', 400)).state).toBe('unknown')
   })
   it('code-less deletion-worded messages are UNKNOWN (regex gated on code 100 — code 10 says "does not exist" too)', () => {
     expect(classifyRemoteStateError(tagError('post does not exist', 400)).state).toBe('unknown')

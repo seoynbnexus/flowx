@@ -13,6 +13,7 @@ import {
 const router = Router()
 
 router.get('/accounts/available', authenticate, requireRole('client', 'super_admin'), controller.getAvailableAccounts)
+router.get('/boost-capabilities', authenticate, requireRole('client', 'super_admin'), controller.getBoostCapabilities)
 router.post('/', authenticate, requireRole('client', 'super_admin'), validate(createPostSchema), controller.createPost)
 router.get('/', authenticate, requireRole('client', 'super_admin'), validate(postQuerySchema, 'query'), controller.listPosts)
 router.get('/:id', authenticate, requireRole('client', 'super_admin'), controller.getPost)

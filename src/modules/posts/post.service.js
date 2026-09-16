@@ -190,9 +190,9 @@ export async function buildPostBoostPayloads(post, target, coinRate) {
   delete targeting.gender
   delete targeting.country
   if (targeting.geo_locations) delete targeting.geo_locations.location_types
-  if (!targeting.geo_locations?.countries?.length && !targeting.geo_locations?.custom_locations?.length) {
-    targeting.geo_locations = { countries: ['IN'] }
-  }
+  const geo = targeting.geo_locations
+  const hasGeoSelection = !!(geo?.countries?.length || geo?.regions?.length || geo?.cities?.length || geo?.zips?.length || geo?.custom_locations?.length)
+  const geoError = hasGeoSelection ? null : 'Select at least one location for boost targeting'
 
   const objectiveConfig = {
     OUTCOME_AWARENESS: { goals: ['REACH','IMPRESSIONS'], defaultGoal: 'REACH' },
@@ -213,6 +213,7 @@ export async function buildPostBoostPayloads(post, target, coinRate) {
     isDaily,
     minBudgetError: budgetInINR < minBudgetInr ? `Minimum ${isDaily ? 'daily' : 'lifetime'} budget is ₹${minBudgetInr} (${Math.ceil(minBudgetInr / coinRate)} coins)` : null,
     scheduleError,
+    geoError,
     fbCampaignName,
     targeting,
     spendCapInPaise: post.boostSpendCap ? Math.round(post.boostSpendCap * coinRate * 100) : null,
@@ -342,6 +343,10 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
   if (boostPayload.scheduleError) {
     await logMetaEvent({ action: 'post_boost_create', postId: post.id, targetId: target.id, error: boostPayload.scheduleError })
     return { success: false, error: boostPayload.scheduleError }
+  }
+  if (boostPayload.geoError) {
+    await logMetaEvent({ action: 'post_boost_create', postId: post.id, targetId: target.id, error: boostPayload.geoError })
+    return { success: false, error: boostPayload.geoError }
   }
 
   const pageId = target.platformCode === 'instagram' ? (target.igBusinessAccountId || target.platformUserId) : target.platformUserId
@@ -933,6 +938,19 @@ export async function createPost(userId, data) {
   }
 
   if (boostCost > 0) {
+    if (data.boostEnabled) {
+      const { validateBoostForTargets } = await import('./promotion-validation.js')
+      const accountTargets = await repo.findPlatformCodesForAccounts(data.targetAccountIds || [])
+      await validateBoostForTargets({
+        postId: null,
+        postType: data.type,
+        targets: accountTargets,
+        targeting: data.boostTargeting || null,
+        placement: data.boostPlacement || null,
+        objective: data.boostObjective || 'OUTCOME_ENGAGEMENT',
+        optimizationGoal: data.boostOptimizationGoal || null,
+      })
+    }
     const coinRate = await getCoinConversionRate()
     const coinService = await import('../../../shared/services/coin.service.js')
     const available = await coinService.getAvailable(userId)

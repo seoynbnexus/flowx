@@ -2524,6 +2524,13 @@ export async function getMetaSyncHealth() {
     // backend-only telemetry — never fails the health endpoint
   }
 
+  try {
+    const { countUnresolvedPromotions } = await import('../posts/promotion.repository.js')
+    health.promotionsUnresolved = await countUnresolvedPromotions()
+  } catch {
+    // backend-only telemetry — never fails the health endpoint
+  }
+
   return health
 }
 

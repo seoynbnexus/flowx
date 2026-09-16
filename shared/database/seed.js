@@ -188,6 +188,7 @@ const APP_CONFIG_SEEDS = [
   { key: 'publisher_response_deadline_hours', value: 48, is_public: 1, description: 'General waiting time for publishers to accept post/campaign requests (hours, 1..720). Capped by scheduled time if scheduled.' },
   { key: 'promotions_enabled', value: false, is_public: 0, description: 'Master feature flag for the new Promotion/PromotionTarget boost architecture. When false, no new Promotions are created or executed; the legacy post_boost path continues unchanged.' },
   { key: 'promotion_publish_trigger_enabled', value: false, is_public: 0, description: 'Wake-hook trigger flag: enqueue promotion_execute when a PostTarget becomes POSTED. Requires promotions_enabled as well. Allows staged rollout of the trigger layer.' },
+  { key: 'boost_placement_fix_enabled', value: false, is_public: 0, description: 'Forward client-selected boost placement (publisher_platforms + all 4 position sets, snake-first/camel-fallback) into targeting in createAdSet. When false, legacy placement behavior (forced platform defaults) is preserved.' },
 ]
 
 const report = []

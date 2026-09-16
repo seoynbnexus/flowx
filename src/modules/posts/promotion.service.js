@@ -11,6 +11,47 @@ import { isRateLimited, tokenKeyFor } from '../../../shared/services/meta-rate-l
 import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
 import { POST_STATUS, POST_TARGET_STATUS, POST_TYPES } from './post.model.js'
 import { executeBoostCreation, buildPostBoostPayloads } from './post.service.js'
+import { validateBoostForTargets, validateBoostForPlatforms, snapshotColumns, readSnapshotSlice, buildResolvedSnapshot } from './promotion-validation.js'
+
+export async function backfillPromotionSnapshot(promotionId) {
+  const promotion = await promoRepo.findPromotionById(promotionId)
+  if (!promotion) return { id: promotionId, status: 'skipped', reason: 'promotion not found' }
+  if (promotion.resolvedAt) return { id: promotionId, status: 'skipped', reason: 'already resolved' }
+  const post = await postRepo.findPostById(promotion.postId)
+  if (!post) return { id: promotion.id, status: 'skipped', reason: 'post not found' }
+  const ptgts = await promoRepo.findPromotionTargetsByPromotionId(promotion.id)
+  const targets = []
+  for (const ptgt of ptgts) {
+    const target = await postRepo.findPostTargetById(ptgt.postTargetId)
+    if (target) targets.push(target)
+  }
+  const { snapshot, failures, objective, optimizationGoal } = await buildResolvedSnapshot({
+    postId: post.id,
+    postType: post.type,
+    targets,
+    targeting: promotion.targeting,
+    placement: promotion.placement,
+    objective: promotion.objective || 'OUTCOME_ENGAGEMENT',
+    optimizationGoal: promotion.optimizationGoal || null,
+  })
+  if (failures.length) {
+    if (!String(promotion.error || '').startsWith('Unresolved boost configuration')) {
+      await promoRepo.updatePromotion(promotion.id, {
+        error: `Unresolved boost configuration (${failures.length} target${failures.length === 1 ? '' : 's'}) — manual review required`,
+      })
+      await logMetaEvent({ action: 'promotion_backfill_unresolved', promotionId: promotion.id, postId: post.id, failures })
+    }
+    return { id: promotion.id, status: 'unresolved', failures: failures.length }
+  }
+  await promoRepo.updatePromotion(promotion.id, snapshotColumns({
+    byTarget: snapshot.targets,
+    byPlatform: snapshot.platforms,
+    objective,
+    optimizationGoal,
+  }))
+  await logMetaEvent({ action: 'promotion_backfill_resolved', promotionId: promotion.id, postId: post.id, targets: targets.length })
+  return { id: promotion.id, status: 'resolved', targets: targets.length }
+}
 
 async function readFlag(key) {
   try {
@@ -52,6 +93,35 @@ export async function chargePromotionForApproval(post) {
     const publisherCount = post.runOnPublishers ? (Number(post.publisherCount) || 0) : 0
     const expected = clientTargetCount + publisherCount
     if (expected <= 0) return { charged: false }
+
+    const clientTargets = targets.filter(t => t.targetType === 'client' && (t.platformCode === 'facebook' || t.platformCode === 'instagram'))
+    const validated = await validateBoostForTargets({
+      postId: post.id,
+      postType: post.type,
+      targets: clientTargets,
+      targeting: promotion.targeting,
+      placement: promotion.placement,
+      objective: promotion.objective || 'OUTCOME_ENGAGEMENT',
+      optimizationGoal: promotion.optimizationGoal || null,
+    })
+    let platformVariants = { ...validated.snapshot.platforms }
+    if (publisherCount > 0) {
+      const prospective = await validateBoostForPlatforms({
+        postType: post.type,
+        platformCodes: ['facebook', 'instagram'],
+        targeting: promotion.targeting,
+        placement: promotion.placement,
+        objective: promotion.objective || 'OUTCOME_ENGAGEMENT',
+        optimizationGoal: promotion.optimizationGoal || null,
+      })
+      platformVariants = { ...prospective, ...platformVariants }
+    }
+    await promoRepo.updatePromotion(promotion.id, snapshotColumns({
+      byTarget: validated.snapshot.targets,
+      byPlatform: platformVariants,
+      objective: validated.objective,
+      optimizationGoal: validated.optimizationGoal,
+    }))
 
     const coinRate = await getCoinConversionRate()
     const costCoins = (Number(promotion.budgetAmount) || 0) * expected
@@ -247,6 +317,16 @@ export async function createPromotionForPublishedPost(userId, postId, data) {
     }
   }
 
+  const validated = await validateBoostForTargets({
+    postId: post.id,
+    postType: post.type,
+    targets,
+    targeting: data.targeting || null,
+    placement: data.placement || null,
+    objective: data.objective || 'OUTCOME_ENGAGEMENT',
+    optimizationGoal: data.optimizationGoal || null,
+  })
+
   const coinRate = await getCoinConversionRate()
   const { accountDbId } = await resolveAccountContext()
   const perCopy = Number(data.budgetAmount) || 1000
@@ -278,6 +358,12 @@ export async function createPromotionForPublishedPost(userId, postId, data) {
     endAt: data.endTime || null,
     chargedPaise,
   })
+  await promoRepo.updatePromotion(promotionId, snapshotColumns({
+    byTarget: validated.snapshot.targets,
+    byPlatform: validated.snapshot.platforms,
+    objective: validated.objective,
+    optimizationGoal: validated.optimizationGoal,
+  }))
   await postRepo.insertPostBillingEntry(postId, {
     kind: 'charge',
     paise: chargedPaise,
@@ -478,6 +564,16 @@ export async function runPromotionTargetJob(promotionTargetId, jobPayload = {}) 
   await promoRepo.updatePromotion(promotion.id, { status: PROMOTION_STATUS.CREATING })
   await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.CREATING })
 
+  const snapshot = readSnapshotSlice(promotion, target.id, target.platformCode)
+  if (!snapshot) {
+    const error = 'Promotion configuration could not be resolved — explicit handling required'
+    await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.FAILED, error, attempts: ptgt.attempts + 1 })
+    await promoRepo.updatePromotion(promotion.id, { error: `Unresolved boost configuration (target ${ptgt.id}) — manual review required` })
+    await refundPromotionTargetShare(ptgt, promotion, post, 'unresolved boost configuration')
+    await refreshPromotionStatus(promotion.id)
+    await logMetaEvent({ action: 'promotion_target_unresolved', promotionId: promotion.id, promotionTargetId: ptgt.id, postId: post.id, postTargetId: target.id, platform: ptgt.platform })
+    return { done: true }
+  }
   const promoPost = {
     ...post,
     name: `${post.name} ${ptgt.platform} ${ptgt.id.slice(0, 4)}`,
@@ -485,11 +581,11 @@ export async function runPromotionTargetJob(promotionTargetId, jobPayload = {}) 
     boostBudgetAmount: promotion.budgetAmount,
     boostSpendCap: promotion.spendCap,
     boostEndTime: promotion.endAt,
-    boostTargeting: promotion.targeting,
-    boostPlacement: promotion.placement,
+    boostTargeting: snapshot.targeting,
+    boostPlacement: snapshot.placement,
     boostBidStrategy: promotion.bidStrategy,
-    boostOptimizationGoal: promotion.optimizationGoal,
-    boostObjective: promotion.objective,
+    boostOptimizationGoal: snapshot.optimizationGoal,
+    boostObjective: snapshot.objective,
     boostCallToAction: promotion.callToAction,
     boostLink: promotion.link,
     boostHeadline: promotion.headline,
@@ -498,8 +594,8 @@ export async function runPromotionTargetJob(promotionTargetId, jobPayload = {}) 
   }
   const coinRate = await getCoinConversionRate()
   const boostPayload = await buildPostBoostPayloads(promoPost, target, coinRate)
-  if (boostPayload.minBudgetError || boostPayload.scheduleError) {
-    const error = boostPayload.minBudgetError || boostPayload.scheduleError
+  if (boostPayload.minBudgetError || boostPayload.scheduleError || boostPayload.geoError) {
+    const error = boostPayload.minBudgetError || boostPayload.scheduleError || boostPayload.geoError
     await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.FAILED, error, attempts: ptgt.attempts + 1 })
     await refundPromotionTargetShare(ptgt, promotion, post, 'invalid boost configuration')
     await refreshPromotionStatus(promotion.id)
