@@ -9,8 +9,9 @@ import {
   generateOtp,
 } from '../../../shared/utils/crypto.utils.js';
 import { query, transaction } from '../../../shared/database/connection.js';
-import { AuthError, ConflictError, ValidationError, ForbiddenError, MethodMismatchError } from '../../../shared/errors/AppError.js';
+import { AppError, AuthError, ConflictError, ValidationError, MethodMismatchError } from '../../../shared/errors/AppError.js';
 import { ERROR_CODES } from '../../../shared/errors/errorCodes.js';
+import { HTTP_STATUS } from '../../../shared/constants/httpStatus.js';
 import { TOKEN_EXPIRY } from './auth.model.js';
 import { USER_STATUS, LOGIN_METHOD, OTP_PURPOSE, ROLE_CODES } from '../../../shared/constants/index.js';
 import { sendOtpEmail, sendPasswordResetEmail } from '../../../shared/mailer/mailer.js';
@@ -183,11 +184,11 @@ export async function login(email, password, deviceName, ipAddress, userAgent) {
   }
 
   if (user.status === USER_STATUS.BLOCKED) {
-    throw new ForbiddenError('Account is blocked');
+    throw new AppError('Account is blocked', HTTP_STATUS.FORBIDDEN, ERROR_CODES.ACCOUNT_BLOCKED);
   }
 
   if (user.status === USER_STATUS.INACTIVE) {
-    throw new ForbiddenError('Account is inactive');
+    throw new AppError('Account is inactive', HTTP_STATUS.FORBIDDEN, ERROR_CODES.ACCOUNT_INACTIVE);
   }
 
   const passwordRecord = await repo.getUserPassword(user.id);
@@ -202,7 +203,7 @@ export async function login(email, password, deviceName, ipAddress, userAgent) {
   }
 
   if (passwordRecord.locked_until && new Date(passwordRecord.locked_until) > new Date()) {
-    throw new ForbiddenError('Account is temporarily locked. Try again later.');
+    throw new AppError('Account is temporarily locked. Try again later.', HTTP_STATUS.FORBIDDEN, ERROR_CODES.ACCOUNT_LOCKED);
   }
 
   const valid = await comparePassword(password, passwordRecord.password_hash);

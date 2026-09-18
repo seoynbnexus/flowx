@@ -130,6 +130,14 @@ export async function handleRemoteContentSignal({ postTargetId, remoteState, sou
       if (!flagged) return { ignored: true, reason: 'race' }
       const pause = await pauseBoostForDeletionCandidate(target)
       await logMetaEvent({ action: 'deletion_candidate_flagged', postId: target.postId, postTargetId, source, reason: msg, boostPaused: pause.paused })
+      try {
+        const { createNotification } = await import('../notifications/notifications.repository.js')
+        const superAdminIds = await dmRepo.findSuperAdminIds()
+        const post = await postRepo.findPostById(target.postId)
+        for (const adminId of superAdminIds) {
+          await createNotification(adminId, 'post_flagged', 'Post Content Removed', `Post "${post?.name || target.postId}" has been removed from ${target.platformCode || 'platform'}. Reason: ${reasonText || 'unknown'}`, { postId: target.postId, postTargetId, platformCode: target.platformCode })
+        }
+      } catch {}
       return { flagged: true, boostPaused: pause.paused }
     }
     // flagged: confirm only after the grace period
@@ -140,6 +148,33 @@ export async function handleRemoteContentSignal({ postTargetId, remoteState, sou
     const confirmed = await dmRepo.confirmFlaggedDeletion(postTargetId, reasonText)
     if (!confirmed) return { ignored: true, reason: 'race' }
     await applyDeletionEnforcement({ ...target, deletionReviewState: DELETION_REVIEW_STATE.CONFIRMED })
+    try {
+      const { createNotification } = await import('../notifications/notifications.repository.js')
+      const superAdminIds = await dmRepo.findSuperAdminIds()
+      const post = await postRepo.findPostById(target.postId)
+      for (const adminId of superAdminIds) {
+        await createNotification(adminId, 'post_confirmed_deleted', 'Post Deletion Confirmed', `Post "${post?.name || target.postId}" deletion confirmed on ${target.platformCode || 'platform'}. Enforcement applied.`, { postId: target.postId, postTargetId, platformCode: target.platformCode })
+      }
+      if (isPublisherTarget(target) && target.platformAccountId) {
+        const { queryOne } = await import('../../../shared/database/connection.js')
+        const { uuidToBuffer: ub } = await import('../../../shared/utils/uuid.utils.js')
+        const pubUser = await queryOne('SELECT user_id FROM user_platform_accounts WHERE id = ?', [ub(target.platformAccountId)])
+        if (pubUser?.user_id) {
+          const publisherId = (await import('../../../shared/utils/uuid.utils.js')).bufferToUuid(pubUser.user_id)
+          await createNotification(publisherId, 'post_deleted', 'Published Post Removed', `A post you published on ${target.platformCode || 'platform'} has been permanently removed due to a platform violation.`, { postId: target.postId, postTargetId })
+          if (process.env.SMTP_HOST) {
+            try {
+              const { queryOne: qo } = await import('../../../shared/database/connection.js')
+              const userInfo = await qo('SELECT u.email, up.first_name FROM users u LEFT JOIN user_profiles up ON up.user_id = u.id WHERE u.id = ?', [ub(publisherId)])
+              if (userInfo?.email) {
+                const { sendPublisherViolationWarningEmail } = await import('../../../shared/mailer/mailer.js')
+                await sendPublisherViolationWarningEmail(userInfo.email, userInfo.first_name || 'there', `A post you published has been permanently removed due to a platform violation. Continued violations may result in suspension.`)
+              }
+            } catch {}
+          }
+        }
+      }
+    } catch {}
     return { confirmed: true }
   }
 

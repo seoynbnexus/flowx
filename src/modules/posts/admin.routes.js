@@ -7,6 +7,7 @@ import { approvePostSchema, rejectPostSchema, adminPostQuerySchema, violationRev
 const router = Router()
 
 router.get('/', authenticate, requirePermission('posts.review'), validate(adminPostQuerySchema, 'query'), adminController.listAllPosts)
+router.get('/flagged', authenticate, requirePermission('posts.review'), adminController.getFlaggedPosts)
 router.get('/:id', authenticate, requirePermission('posts.review'), adminController.getPostDetail)
 router.get('/:id/engagement', authenticate, requirePermission('posts.review'), adminController.getPostEngagement)
 router.get('/:id/boost-performance', authenticate, requirePermission('posts.review'), adminController.getBoostPerformance)
@@ -20,5 +21,10 @@ router.post('/:id/force-go-live', authenticate, requirePermission('posts.manage'
 router.post('/:id/expire-publisher-requests', authenticate, requirePermission('posts.manage'), adminController.expirePublisherRequests)
 router.get('/:id/violations', authenticate, requirePermission('posts.review'), adminController.getPostViolations)
 router.post('/:id/violations/:targetId/review', authenticate, requirePermission('posts.review'), validate(violationReviewSchema), adminController.reviewPostViolation)
+
+router.get('/publishers/:publisherId/violations', authenticate, requirePermission('posts.review'), adminController.getPublisherViolations)
+router.post('/publishers/:publisherId/suspend', authenticate, requirePermission('posts.review'), adminController.suspendPublisher)
+router.post('/publishers/:publisherId/unsuspend', authenticate, requirePermission('posts.review'), adminController.unsuspendPublisher)
+router.post('/publishers/:publisherId/warn', authenticate, requirePermission('posts.review'), adminController.warnPublisher)
 
 export default router

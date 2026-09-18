@@ -1037,6 +1037,11 @@ export async function listAllPosts(query) {
   return repo.findAllPosts(query)
 }
 
+export async function listFlaggedPosts(query) {
+  const { findFlaggedPosts } = await import('./deletion-monitoring.repository.js')
+  return findFlaggedPosts(query)
+}
+
 export async function getPostDetail(postId) {
   return getPost(null, postId, true)
 }

@@ -1091,7 +1091,7 @@ export async function findEligiblePublishersForPost({ categoryId, platformCodes,
      LEFT JOIN user_profiles up ON up.user_id = u.id
      JOIN user_roles ur ON ur.user_id = u.id
      JOIN roles r ON r.id = ur.role_id AND r.code = 'publisher'
-     WHERE u.deleted_at IS NULL AND u.status = 'active'
+     WHERE u.deleted_at IS NULL AND u.status = 'active' AND u.publisher_suspended = 0
        ${categoryClause}
        AND EXISTS (
          SELECT 1 FROM user_platform_accounts upa

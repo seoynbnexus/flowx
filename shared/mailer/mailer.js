@@ -138,3 +138,24 @@ function publisherRepublishHtml(publisherName, campaignName, link) {
 </body>
 </html>`
 }
+
+export async function sendPublisherViolationWarningEmail(to, publisherName, message) {
+  await transporter.sendMail({
+    from,
+    to,
+    subject: 'Policy Violation Warning — FlowX',
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:sans-serif;padding:24px;background:#f5f5f5">
+  <div style="max-width:480px;margin:auto;background:white;border-radius:8px;padding:32px">
+    <h2 style="margin-top:0;color:#dc2626">Policy Violation Warning</h2>
+    <p>Hi ${publisherName},</p>
+    <p>${message}</p>
+    <p style="color:#999;font-size:12px;margin-top:16px">If you believe this is an error, please contact support.</p>
+  </div>
+</body>
+</html>`,
+  })
+}

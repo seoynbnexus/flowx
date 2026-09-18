@@ -352,3 +352,118 @@ export async function findRequestViolationInfo(requestId) {
     coinsOffered: Number(row.coins_offered) || 0,
   }
 }
+
+export async function findFlaggedPosts({ page = 1, limit = 20 } = {}) {
+  const offset = (page - 1) * limit
+  const countRow = await queryOne(
+    `SELECT COUNT(DISTINCT p.id) as total
+     FROM posts p
+     JOIN post_targets pt ON pt.post_id = p.id
+     WHERE p.deleted_at IS NULL
+       AND pt.deletion_review_state IN ('flagged', 'confirmed')`,
+    []
+  )
+  const rows = await query(
+    `SELECT p.id, p.name, p.type, p.status, p.created_at,
+            u.email as client_email, up.first_name as client_first_name, up.last_name as client_last_name,
+            SUM(CASE WHEN pt.deletion_review_state = 'flagged' THEN 1 ELSE 0 END) as flagged_count,
+            SUM(CASE WHEN pt.deletion_review_state = 'confirmed' THEN 1 ELSE 0 END) as confirmed_count,
+            MAX(CASE WHEN pt.deletion_review_state = 'flagged' THEN pt.deletion_flagged_at ELSE NULL END) as latest_flagged_at,
+            (SELECT pt2.deletion_reason FROM post_targets pt2
+             WHERE pt2.post_id = p.id AND pt2.deletion_review_state IN ('flagged', 'confirmed')
+             ORDER BY pt2.deletion_flagged_at DESC LIMIT 1) as latest_reason
+     FROM posts p
+     JOIN post_targets pt ON pt.post_id = p.id
+     JOIN users u ON u.id = p.client_id
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     WHERE p.deleted_at IS NULL
+       AND pt.deletion_review_state IN ('flagged', 'confirmed')
+     GROUP BY p.id, p.name, p.type, p.status, p.created_at, u.email, up.first_name, up.last_name
+     ORDER BY latest_flagged_at DESC
+     LIMIT ? OFFSET ?`,
+    [String(limit), String(offset)]
+  )
+  return {
+    items: rows.map(r => ({
+      postId: bufferToUuid(r.id),
+      name: r.name,
+      type: r.type,
+      status: r.status,
+      createdAt: r.created_at,
+      clientEmail: r.client_email,
+      clientFirstName: r.client_first_name,
+      clientLastName: r.client_last_name,
+      flaggedCount: Number(r.flagged_count) || 0,
+      confirmedCount: Number(r.confirmed_count) || 0,
+      latestFlaggedAt: r.latest_flagged_at || null,
+      latestReason: r.latest_reason || null,
+    })),
+    total: countRow?.total || 0,
+    page,
+    limit,
+  }
+}
+
+export async function findPublisherViolationSummary(publisherId) {
+  const targets = await query(
+    `SELECT pt.id, pt.post_id, pt.deletion_review_state, pt.deletion_flagged_at,
+            pt.deletion_confirmed_at, pt.deletion_reason, pt.remote_content_state,
+            pt.platform_account_id, p.code as platform_code,
+            upa.platform_display_name, upa.platform_username,
+            prr.id as request_id, prr.coins_offered, prr.violation_count, prr.clawback_paise, prr.payout_status
+     FROM post_targets pt
+     JOIN platforms p ON p.id = (SELECT upa2.platform_id FROM user_platform_accounts upa2 WHERE upa2.id = pt.platform_account_id)
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     LEFT JOIN post_publisher_requests prr ON prr.id = pt.publisher_request_id
+     WHERE upa.user_id = ?
+       AND pt.deletion_review_state IN ('flagged', 'confirmed', 'dismissed')
+     ORDER BY pt.deletion_flagged_at DESC`,
+    [uuidToBuffer(publisherId)]
+  )
+  const totals = await queryOne(
+    `SELECT COUNT(*) as total_violations,
+            SUM(CASE WHEN pt.deletion_review_state = 'confirmed' THEN 1 ELSE 0 END) as confirmed_count,
+            COALESCE(SUM(prr.clawback_paise), 0) as total_clawback_paise
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     LEFT JOIN post_publisher_requests prr ON prr.id = pt.publisher_request_id
+     WHERE upa.user_id = ?
+       AND pt.deletion_review_state IN ('flagged', 'confirmed', 'dismissed')`,
+    [uuidToBuffer(publisherId)]
+  )
+  return {
+    targets: targets.map(r => ({
+      id: bufferToUuid(r.id),
+      postId: bufferToUuid(r.post_id),
+      deletionReviewState: r.deletion_review_state,
+      deletionFlaggedAt: r.deletion_flagged_at || null,
+      deletionConfirmedAt: r.deletion_confirmed_at || null,
+      deletionReason: r.deletion_reason || null,
+      remoteContentState: r.remote_content_state || 'visible',
+      platformCode: r.platform_code || null,
+      platformDisplayName: r.platform_display_name || null,
+      platformUsername: r.platform_username || null,
+      requestId: r.request_id ? bufferToUuid(r.request_id) : null,
+      coinsOffered: Number(r.coins_offered) || 0,
+      violationCount: Number(r.violation_count) || 0,
+      clawbackPaise: Number(r.clawback_paise) || 0,
+      payoutStatus: r.payout_status || 'pending',
+    })),
+    totals: {
+      totalViolations: Number(totals?.total_violations) || 0,
+      confirmedCount: Number(totals?.confirmed_count) || 0,
+      totalClawbackPaise: Number(totals?.total_clawback_paise) || 0,
+    },
+  }
+}
+
+export async function findSuperAdminIds() {
+  const rows = await query(
+    `SELECT u.id FROM users u
+     JOIN user_roles ur ON ur.user_id = u.id
+     JOIN roles r ON r.id = ur.role_id AND r.is_super_admin = 1
+     WHERE u.deleted_at IS NULL AND u.status = 'active'`,
+    []
+  )
+  return rows.map(r => bufferToUuid(r.id))
+}
