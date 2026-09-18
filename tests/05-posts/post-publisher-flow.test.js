@@ -58,7 +58,7 @@ async function assignCategory(userId, categoryId) {
 }
 
 describe('post publisher flow', () => {
-  let client, admin, publisher, publisher2, categoryId
+  let client, admin, publisher, publisher2
   let clientAccountId, publisherAccountId, publisher2AccountId
 
   beforeAll(async () => {
@@ -67,11 +67,6 @@ describe('post publisher flow', () => {
     publisher2 = await createTestUser({ email: `post-pub-publisher2-${dateTag}@flowx-test.com`, password: 'Test@123', role: 'publisher' })
     const adminRow = await queryOne("SELECT id FROM users WHERE email = 'admin@flowx.com'")
     admin = { id: adminRow ? bufferToUuid(adminRow.id) : null }
-
-    const catRow = await queryOne('SELECT id FROM ad_categories LIMIT 1')
-    categoryId = bufferToUuid(catRow.id)
-    await assignCategory(publisher.id, categoryId)
-    await assignCategory(publisher2.id, categoryId)
 
     clientAccountId = await addPlatformAccount(client.id, { code: 'facebook', platformUserId: 'ppc_fb_client' })
     publisherAccountId = await addPlatformAccount(publisher.id, { code: 'facebook', platformUserId: 'ppc_fb_pub1' })
@@ -94,7 +89,6 @@ describe('post publisher flow', () => {
       type: 'post',
       caption: 'Publisher post',
       mediaUrl: 'https://example.com/img.jpg',
-      categoryId,
       runOnPublishers: true,
       publisherCount: count,
       coinsPerPublisher: coins,
@@ -104,14 +98,17 @@ describe('post publisher flow', () => {
     return post.id
   }
 
-  it('rejects publisher config without a category', async () => {
-    await expect(postService.createPost(client.id, {
-      name: 'bad',
+  it('allows publisher posts without a category', async () => {
+    const post = await postService.createPost(client.id, {
+      name: `NoCat ${generateUuid()}`,
       type: 'post',
+      caption: 'No category',
+      mediaUrl: 'https://example.com/img.jpg',
       runOnPublishers: true,
       publisherCount: 2,
       coinsPerPublisher: 10,
-    })).rejects.toThrow('Publisher posts require a category')
+    })
+    expect(post.id).toBeDefined()
   })
 
   it('rejects publisher count/coins without runOnPublishers', async () => {

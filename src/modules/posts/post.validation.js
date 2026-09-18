@@ -116,6 +116,13 @@ const postTypeRefine = (schema) =>
         message: 'Reels require a video media URL (.mp4 or .mov)',
       })
     }
+    if (type === 'post' && !data.caption && !data.mediaUrl && !data.textBody) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['caption'],
+        message: 'Post must have a caption, media, or text body',
+      })
+    }
   })
 
 export const createPostSchema = boostRefine(postTypeRefine(z.object({
@@ -158,6 +165,7 @@ export const adminPostQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(100).default(20),
   status: z.string().optional(),
   clientId: z.string().uuid().optional(),
+  search: z.string().max(200).optional(),
 })
 
 export const approvePostSchema = z.object({

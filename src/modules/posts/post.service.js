@@ -996,7 +996,6 @@ export async function createPost(userId, data) {
 
 function validatePublisherConfig(data) {
   if (data.runOnPublishers) {
-    if (!data.categoryId) throw new ValidationError('Publisher posts require a category')
     if (!data.publisherCount || data.publisherCount < 1) {
       throw new ValidationError('Publisher posts require a publisher count of at least 1')
     }
@@ -1222,8 +1221,8 @@ export async function approvePost(adminId, postId, data) {
   }
 
   if (post.runOnPublishers) {
-    if (!post.categoryId || !post.publisherCount || !post.coinsPerPublisher) {
-      throw new ValidationError('Publisher posts require a category, publisher count and coins per publisher')
+    if (!post.publisherCount || !post.coinsPerPublisher) {
+      throw new ValidationError('Publisher posts require publisher count and coins per publisher')
     }
     const { total } = calculatePublisherEscrow(post)
     const coinService = await import('../../../shared/services/coin.service.js')
@@ -1362,14 +1361,16 @@ function snapshotHash(snapshot) {
 export async function createPostPublisherRequests(postId) {
   const post = await repo.findPostById(postId)
   if (!post) throw new NotFoundError('Post not found')
-  if (!post.runOnPublishers || !post.categoryId) return { created: [] }
+  if (!post.runOnPublishers) return { created: [] }
 
   const targetCount = post.publisherCount || 0
   if (targetCount <= 0) return { created: [] }
   const multiplier = Number(process.env.POST_PUBLISHER_REQUEST_MULTIPLIER) || 2
   const limit = Math.max(targetCount, targetCount * multiplier)
 
-  const publishers = await repo.findEligiblePublishersForPost({ categoryId: post.categoryId, limit })
+  const isCaptionOnly = !post.mediaUrl && !post.textBody
+  const platformCodes = isCaptionOnly ? ['facebook'] : ['facebook', 'instagram']
+  const publishers = await repo.findEligiblePublishersForPost({ platformCodes, limit })
   const eligible = publishers.filter(p => p.publisherId !== post.clientId)
   const selected = eligible.slice(0, limit)
   if (selected.length === 0) return { created: [] }
@@ -1532,6 +1533,90 @@ export async function acceptPostPublisherRequest(publisherId, requestId, { platf
 
     return repo.findPostPublisherRequestById(requestId)
   })
+}
+
+export async function adminAcceptPostPublisherRequest(adminId, postId, requestId, { platformAccountIds } = {}) {
+  const request = await repo.findPostPublisherRequestById(requestId)
+  if (!request) throw new NotFoundError('Request not found')
+  if (request.postId !== postId) throw new ValidationError('Request does not belong to this post')
+  if (request.status !== PUBLISHER_REQUEST_STATUS.PENDING) {
+    throw new ValidationError('Request is no longer pending')
+  }
+
+  let ids = platformAccountIds
+  if (!ids || !ids.length) {
+    const accounts = await repo.findVerifiedPublisherAccounts(request.publisherId)
+    ids = accounts.map(a => a.id)
+  }
+  if (!ids || !ids.length) {
+    throw new ValidationError('Publisher has no verified accounts')
+  }
+  ids = [...new Set(ids.map(String))]
+  const cap = await getPublisherMaxAccounts()
+  if (ids.length > cap) ids = ids.slice(0, cap)
+
+  const accounts = await repo.findVerifiedPublisherAccounts(request.publisherId)
+  const allowed = new Set(accounts.map(a => a.id))
+  for (const id of ids) {
+    if (!allowed.has(id)) throw new ValidationError('Selected account does not belong to this publisher')
+  }
+
+  const post = await repo.findPostById(postId)
+  if (!post) throw new NotFoundError('Post not found')
+
+  const result = await transaction(async () => {
+    await repo.lockPostById(post.id)
+    const acceptedCount = await repo.countPostPublisherRequestsByStatus(post.id, PUBLISHER_REQUEST_STATUS.ACCEPTED)
+    if (acceptedCount >= (post.publisherCount || Infinity)) {
+      throw new ValidationError('Publisher capacity reached for this post')
+    }
+
+    await repo.updatePostPublisherRequest(requestId, { platformAccountIds: ids })
+    await repo.updatePostPublisherRequestStatusWithGuard(
+      requestId,
+      PUBLISHER_REQUEST_STATUS.ACCEPTED,
+      new Date().toISOString().slice(0, 19).replace('T', ' '),
+      PUBLISHER_REQUEST_STATUS.PENDING
+    )
+
+    const newAccepted = await repo.countPostPublisherRequestsByStatus(post.id, PUBLISHER_REQUEST_STATUS.ACCEPTED)
+    if (newAccepted >= (post.publisherCount || Infinity)) {
+      const pending = await repo.findPostPublisherRequestsByStatus(post.id, PUBLISHER_REQUEST_STATUS.PENDING)
+      for (const p of pending) {
+        await repo.updatePostPublisherRequestStatusWithGuard(
+          p.id,
+          PUBLISHER_REQUEST_STATUS.CANCELLED,
+          new Date().toISOString().slice(0, 19).replace('T', ' '),
+          PUBLISHER_REQUEST_STATUS.PENDING
+        )
+      }
+      await enqueueCampaignJob(generateUuid(), postId, POST_JOB_TYPES.PUBLISHER_GO_LIVE, null, {}, {
+        runKey: `post:go-live:${postId}`,
+        entityType: 'post',
+      })
+    }
+
+    return repo.findPostPublisherRequestById(requestId)
+  })
+
+  try {
+    const { createAndSend } = await import('../notifications/notifications.service.js')
+    const pub = accounts.find(a => ids.includes(a.id))
+    await createAndSend(
+      request.publisherId,
+      'post_request_accepted_by_admin',
+      'Post Request Accepted',
+      `Your post request "${post.name}" was accepted by admin`,
+      { postId, postName: post.name, coinsOffered: request.coinsOffered, requestId },
+      null,
+      null,
+    )
+  } catch {}
+
+  await repo.createReviewLog(postId, adminId, REVIEW_ACTIONS.SUBMITTED, post.status,
+    `Admin accepted publisher request`)
+
+  return result
 }
 
 export async function rejectPostPublisherRequest(publisherId, requestId) {

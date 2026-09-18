@@ -209,7 +209,7 @@ export async function findPostsByClientId(clientId, { page = 1, limit = 20, stat
   }
 }
 
-export async function findAllPosts({ page = 1, limit = 20, status, clientId }) {
+export async function findAllPosts({ page = 1, limit = 20, status, clientId, search }) {
   const offset = (page - 1) * limit
   const where = ['p.deleted_at IS NULL']
   const params = []
@@ -222,6 +222,11 @@ export async function findAllPosts({ page = 1, limit = 20, status, clientId }) {
   if (clientId) {
     where.push('p.client_id = ?')
     params.push(uuidToBuffer(clientId))
+  }
+
+  if (search) {
+    where.push('(p.name LIKE ? OR p.caption LIKE ?)')
+    params.push(`%${search}%`, `%${search}%`)
   }
 
   const whereClause = `WHERE ${where.join(' AND ')}`
@@ -918,13 +923,17 @@ export async function findPostPublisherRequestById(id) {
   return mapPostPublisherRequestRow(row)
 }
 
-export async function findPostPublisherRequestsByPublisherId(publisherId, { page = 1, limit = 20, status } = {}) {
+export async function findPostPublisherRequestsByPublisherId(publisherId, { page = 1, limit = 20, status, search } = {}) {
   const offset = (page - 1) * limit
   const where = ['r.publisher_id = ?']
   const params = [uuidToBuffer(publisherId)]
   if (status) {
     where.push('r.status = ?')
     params.push(status)
+  }
+  if (search) {
+    where.push('(po.name LIKE ? OR po.caption LIKE ?)')
+    params.push(`%${search}%`, `%${search}%`)
   }
   const whereClause = `WHERE ${where.join(' AND ')}`
   const countRow = await queryOne(
@@ -1061,7 +1070,7 @@ export async function createPublisherTarget(postId, requestId, platformAccountId
   return id
 }
 
-export async function findEligiblePublishersForPost({ categoryId, limit = 20 } = {}) {
+export async function findEligiblePublishersForPost({ categoryId, platformCodes, limit = 20 } = {}) {
   const params = []
   let categoryClause = ''
   if (categoryId) {
@@ -1073,6 +1082,9 @@ export async function findEligiblePublishersForPost({ categoryId, limit = 20 } =
       )`
     params.push(uuidToBuffer(categoryId), uuidToBuffer(categoryId))
   }
+  const codes = platformCodes && platformCodes.length > 0 ? platformCodes : ['facebook', 'instagram']
+  const platformClause = `AND p.code IN (${codes.map(() => '?').join(',')})`
+  params.push(...codes)
   const rows = await query(
     `SELECT DISTINCT u.id as publisher_id, u.email, up.first_name, up.last_name
      FROM users u
@@ -1087,7 +1099,7 @@ export async function findEligiblePublishersForPost({ categoryId, limit = 20 } =
          WHERE upa.user_id = u.id
            AND upa.token_type = 'page'
            AND upa.verification_status = 'verified'
-           AND p.code IN ('facebook', 'instagram')
+           ${platformClause}
        )
      ORDER BY u.id
      LIMIT ?`,

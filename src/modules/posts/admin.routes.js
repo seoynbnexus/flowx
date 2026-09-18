@@ -14,6 +14,8 @@ router.post('/:id/approve', authenticate, requirePermission('posts.review'), val
 router.post('/:id/reject', authenticate, requirePermission('posts.review'), validate(rejectPostSchema), adminController.rejectPost)
 router.post('/:id/retry', authenticate, requirePermission('posts.review'), adminController.retryPost)
 router.get('/:id/publisher-requests', authenticate, requirePermission('posts.review'), adminController.getPostPublisherRequests)
+router.get('/:id/publisher-requests/:requestId/publisher-accounts', authenticate, requirePermission('posts.review'), adminController.getPublisherRequestAccounts)
+router.post('/:id/publisher-requests/:requestId/accept', authenticate, requirePermission('posts.review'), adminController.adminAcceptPublisherRequest)
 router.post('/:id/force-go-live', authenticate, requirePermission('posts.manage'), adminController.forceGoLivePost)
 router.post('/:id/expire-publisher-requests', authenticate, requirePermission('posts.manage'), adminController.expirePublisherRequests)
 router.get('/:id/violations', authenticate, requirePermission('posts.review'), adminController.getPostViolations)

@@ -98,6 +98,35 @@ export async function expirePublisherRequests(req, res, next) {
   }
 }
 
+export async function adminAcceptPublisherRequest(req, res, next) {
+  try {
+    const result = await service.adminAcceptPostPublisherRequest(
+      req.user.id, req.params.id, req.params.requestId, req.body
+    )
+    return sendSuccess(res, result, 'Publisher request accepted on behalf')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function getPublisherRequestAccounts(req, res, next) {
+  try {
+    const requests = await service.adminListPostPublisherRequests(req.params.id)
+    const target = requests.requests.find(r => r.id === req.params.requestId)
+    if (!target) return res.status(404).json({ success: false, message: 'Request not found' })
+    const { findVerifiedPublisherAccounts } = await import('./post.repository.js')
+    const accounts = await findVerifiedPublisherAccounts(target.publisherId)
+    return sendSuccess(res, accounts.map(a => ({
+      id: a.id,
+      platformCode: a.platformCode,
+      platformDisplayName: a.platformDisplayName,
+      platformUsername: a.platformUsername,
+    })))
+  } catch (error) {
+    next(error)
+  }
+}
+
 export async function getPostViolations(req, res, next) {
   try {
     const targets = await findViolationTargetsByPostId(req.params.id)
