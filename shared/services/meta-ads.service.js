@@ -211,7 +211,7 @@ export async function createAdCampaign(adAccountId, name, objective, status = 'P
     name: safeName,
     objective: safeObjective,
     status,
-    special_ad_categories: [],
+    special_ad_categories: Array.isArray(extra.specialAdCategories) ? extra.specialAdCategories : [],
     is_adset_budget_sharing_enabled: false,
   }
   if (extra.spendCap) params.spend_cap = extra.spendCap
@@ -247,6 +247,7 @@ export async function createAdSet(adAccountId, campaignId, targeting, budget, sc
     name: `Ad Set ${campaignId.substring(0, 8)}`,
     campaign_id: campaignId,
     bid_strategy: budget.bidStrategy || 'LOWEST_COST_WITHOUT_CAP',
+    ...(budget.bidAmount ? { bid_amount: budget.bidAmount } : {}),
     optimization_goal: optimizationGoal,
     billing_event: GOAL_BILLING_MAP[optimizationGoal] || budget.billingEvent || 'IMPRESSIONS',
     targeting: { ...targeting, targeting_automation: { advantage_audience: 0 } },
@@ -303,7 +304,7 @@ export async function createAdCreative(adAccountId, pageId, message, mediaUrl, c
     page_id: pageId,
   }
 
-  if (mediaUrl) {
+  if (mediaUrl && !extra.video?.videoId) {
     const linkData = {
       link: mediaUrl,
       message: message || '',
@@ -315,9 +316,17 @@ export async function createAdCreative(adAccountId, pageId, message, mediaUrl, c
     objectStorySpec.link_data = linkData
   }
 
+  if (extra.video?.videoId) {
+    const videoData = { video_id: extra.video.videoId }
+    if (callToAction) videoData.call_to_action = { type: callToAction }
+    if (extra.description) videoData.link_description = extra.description
+    if (extra.headline) videoData.title = extra.headline
+    objectStorySpec.video_data = videoData
+  }
+
   const params = {
     access_token: accessToken,
-    name: `Creative ${Date.now()}`,
+    name: extra.name || `Creative ${Date.now()}`,
     object_story_spec: objectStorySpec,
   }
 
@@ -342,15 +351,76 @@ export async function createUnpublishedPagePost(pageId, message, mediaUrl, acces
   return data
 }
 
-export async function createAdCreativeFromPost(adAccountId, objectStoryId, name, accessToken, validateOnly = false) {
+export async function createAdCreativeFromPost(adAccountId, objectStoryId, name, accessToken, validateOnly = false, callToActionType = null) {
   const params = {
     access_token: accessToken,
     name: name || `Creative ${Date.now()}`,
     object_story_id: objectStoryId,
   }
+  // object_story_id reuses the existing organic post as-is — Meta's
+  // link_data/video_data CTA fields only apply to a freshly-authored
+  // object_story_spec, which is mutually exclusive with object_story_id.
+  // call_to_action_type is the one top-level field documented to add a CTA
+  // button on top of an existing post (the same mechanism Ads Manager's own
+  // "Boost Post" flow uses) — link/headline/description have no equivalent
+  // override here and are intentionally not accepted for this call.
+  if (callToActionType) params.call_to_action_type = callToActionType
   if (validateOnly) params.execution_options = ['validate_only']
   const data = await graphPost(`act_${adAccountId}/adcreatives`, params)
   return data
+}
+
+export const adVideoPoll = { intervalMs: 5000, timeoutMs: 180000 }
+
+export async function uploadRepairVideoFromUrl(adAccountId, { fileUrl, name }, accessToken) {
+  const data = await graphPost(`act_${adAccountId}/advideos`, {
+    access_token: accessToken,
+    name: name || `Repair video ${Date.now()}`,
+    file_url: fileUrl,
+  })
+  if (data instanceof Error) throw data
+  const videoId = data?.video_id || data?.id || null
+  if (!videoId) {
+    const err = new Error('Graph API video upload returned no video id')
+    err.metaAmbiguous = false
+    err.metaHttpStatus = 500
+    throw err
+  }
+  return { videoId }
+}
+
+export async function getAdVideoStatus(videoId, accessToken) {
+  const data = await graphGet(videoId, {
+    access_token: accessToken,
+    fields: 'status',
+  })
+  if (data instanceof Error) throw data
+  return data?.status ?? data
+}
+
+export async function waitForAdVideoReady(videoId, accessToken) {
+  const startedAt = Date.now()
+  for (;;) {
+    let status = null
+    try {
+      status = await getAdVideoStatus(videoId, accessToken)
+    } catch (err) {
+      if (isMissingObjectError(err)) throw err
+      throw new Error(`Ad video status read failed: ${err.message}`)
+    }
+    const state = String(status?.video_status || status?.status || '').toUpperCase()
+    if (state === 'READY' || state === 'PUBLISHED' || state === 'ACTIVE') return status
+    if (state && /FAIL|ERROR|REJECT/.test(state)) {
+      const err = new Error(`Ad video processing failed with status ${state}`)
+      err.metaAmbiguous = false
+      err.metaHttpStatus = 400
+      throw err
+    }
+    if (Date.now() - startedAt > adVideoPoll.timeoutMs) {
+      throw new Error(`Timed out waiting for ad video ${videoId} to finish processing`)
+    }
+    await sleep(adVideoPoll.intervalMs)
+  }
 }
 
 export async function createAd(adAccountId, adSetId, creativeId, name, accessToken, status = 'PAUSED', extra = {}, validateOnly = false) {
@@ -800,7 +870,7 @@ export async function getInstagramBoostEligibility(igMediaId, igToken) {
   }
 }
 
-export async function createAdCreativeFromInstagramPost(adAccountId, igMediaId, igActorId, pageId, name, accessToken, validateOnly = false) {
+export async function createAdCreativeFromInstagramPost(adAccountId, igMediaId, igActorId, pageId, name, accessToken, validateOnly = false, callToActionType = null) {
   const minimal = {
     access_token: accessToken,
     name: name || `Creative ${Date.now()}`,
@@ -808,6 +878,9 @@ export async function createAdCreativeFromInstagramPost(adAccountId, igMediaId, 
   }
   if (igActorId) minimal.instagram_user_id = String(igActorId)
   if (pageId) minimal.object_id = String(pageId)
+  // Same top-level call_to_action_type mechanism as the FB existing-post
+  // path — no link/headline/description override exists for reused IG media.
+  if (callToActionType) minimal.call_to_action_type = callToActionType
   if (validateOnly) minimal.execution_options = ['validate_only']
   try {
     const data = await graphPost(`act_${adAccountId}/adcreatives`, minimal)
@@ -830,6 +903,7 @@ export async function createAdCreativeFromInstagramPost(adAccountId, igMediaId, 
     },
     source_instagram_media_id: igMediaId,
   }
+  if (callToActionType) fallback.call_to_action_type = callToActionType
   if (validateOnly) fallback.execution_options = ['validate_only']
   const data = await graphPost(`act_${adAccountId}/adcreatives`, fallback)
   logMetaEvent({ action: 'create_adcreative_from_ig_post', params: { adAccountId, igMediaId, igActorId, pageId, name, access_token: '[REDACTED]', mode: validateOnly ? 'validate-fallback' : 'create-fallback', resObj: JSON.stringify(fallback), res: JSON.stringify(data) } })
@@ -856,8 +930,8 @@ export async function getConnectedFacebookPage(igActorId, accessToken) {
   }
 }
 
-export async function getMediaEngagement(mediaId, accessToken, { mediaKind = 'post', platform = 'instagram' } = {}) {
-  if (platform === 'facebook') return getFacebookMediaEngagement(mediaId, accessToken, mediaKind)
+export async function getMediaEngagement(mediaId, accessToken, { mediaKind = 'post', platform = 'instagram', knownKind = null } = {}) {
+  if (platform === 'facebook') return getFacebookMediaEngagement(mediaId, accessToken, mediaKind, knownKind)
 
   const basic = await graphGet(`${mediaId}`, {
     access_token: accessToken,
@@ -914,7 +988,7 @@ export async function getMediaEngagement(mediaId, accessToken, { mediaKind = 'po
   return result
 }
 
-async function getFacebookMediaEngagement(mediaId, accessToken, mediaKind = 'post') {
+async function getFacebookMediaEngagement(mediaId, accessToken, mediaKind = 'post', knownKind = null) {
   const result = {
     mediaId,
     mediaType: null,
@@ -927,14 +1001,22 @@ async function getFacebookMediaEngagement(mediaId, accessToken, mediaKind = 'pos
     comments: [],
   }
 
+  // A confirmed classification from a prior successful sync is tried FIRST,
+  // alone — if it still matches (the common case, an object's type never
+  // changes after publish), classification costs exactly one Graph call
+  // instead of looping through 1-2 guaranteed-failing field sets every
+  // single sync cycle forever (Meta rejects inapplicable fields with a 400).
+  // A wrong/stale hint self-heals: it just falls through to the full
+  // ordered loop below, same as having no hint at all.
+  const candidates = [['video', FB_VIDEO_FIELDS], ['photo', FB_PHOTO_FIELDS], ['post', FB_POST_FIELDS]]
+  const ordered = knownKind
+    ? [...candidates.filter(([k]) => k === knownKind), ...candidates.filter(([k]) => k !== knownKind)]
+    : candidates
+
   let kind = null
   let basic = null
   let lastError = null
-  for (const [candidateKind, fields] of [
-    ['video', FB_VIDEO_FIELDS],
-    ['photo', FB_PHOTO_FIELDS],
-    ['post', FB_POST_FIELDS],
-  ]) {
+  for (const [candidateKind, fields] of ordered) {
     try {
       basic = await graphGet(`${mediaId}`, { access_token: accessToken, fields })
       kind = candidateKind
@@ -953,6 +1035,7 @@ async function getFacebookMediaEngagement(mediaId, accessToken, mediaKind = 'pos
     throw new Error(`Graph API GET ${mediaId} failed: unsupported Facebook object${detail ? ` (last: ${detail})` : ''}`)
   }
 
+  result.classifyKind = kind
   result.mediaType = kind === 'post' ? (basic.link ? 'link' : 'post') : kind
   result.permalink = basic.permalink_url || basic.link || null
   result.timestamp = basic.created_time || null
@@ -1204,6 +1287,10 @@ export async function deleteAd(adId, accessToken) {
   return graphDelete(adId, accessToken)
 }
 
+export async function deleteAdVideo(videoId, accessToken) {
+  return graphDelete(videoId, accessToken)
+}
+
 export async function updateAdStatus(adId, status, accessToken) {
   const data = await graphPost(adId, {
     access_token: accessToken,
@@ -1215,9 +1302,63 @@ export async function updateAdStatus(adId, status, accessToken) {
 export async function getObjectStatus(objectId, accessToken) {
   const data = await graphGet(objectId, {
     access_token: accessToken,
-    fields: 'status,effective_status',
+    fields: 'status,effective_status,issues_info',
   })
   return data
+}
+
+export async function getMetaObject(objectId, accessToken, fields = 'id') {
+  const data = await graphGet(objectId, {
+    access_token: accessToken,
+    fields,
+  })
+  return data
+}
+
+export async function graphList(path, accessToken, fields, limit = 100, maxPages = 10) {
+  const rows = []
+  let after = null
+  let truncated = false
+  let endedFull = false
+  for (let page = 0; page < maxPages; page += 1) {
+    const params = { access_token: accessToken, fields, limit }
+    if (after) params.after = after
+    const data = await graphGet(path, params)
+    const pageRows = data.data || []
+    rows.push(...pageRows)
+    if (pageRows.length) endedFull = pageRows.length === limit
+    after = data.paging?.cursors?.after || null
+    if (!after) {
+      if (endedFull) truncated = true
+      break
+    }
+    if (page === maxPages - 1) truncated = true
+  }
+  return { rows, truncated }
+}
+
+export async function listAccountCampaigns(adAccountId, accessToken, limit = 100) {
+  return graphList(`act_${adAccountId}/campaigns`, accessToken, 'id,name,effective_status,status', limit)
+}
+
+export async function listCampaignAdSets(fbCampaignId, accessToken) {
+  return graphList(`${fbCampaignId}/adsets`, accessToken, 'id,name,effective_status,status')
+}
+
+export async function listAdSetAds(fbAdSetId, accessToken) {
+  return graphList(`${fbAdSetId}/ads`, accessToken, 'id,name,effective_status,status,creative{id}')
+}
+
+export function isMissingObjectError(error) {
+  const message = error?.message || ''
+  const parsed = extractMetaError(error)
+  if (parsed?.code === 100 && /does not exist|not found|unsupported get request|object.*missing|nonexisting/i.test(parsed.raw || message)) {
+    return true
+  }
+  if (!parsed && /does not exist|not found|unsupported get request/i.test(message)) {
+    return true
+  }
+  return false
 }
 
 export async function listAccountAds(adAccountId, accessToken, limit = 100) {
@@ -1228,7 +1369,7 @@ export async function listAccountAds(adAccountId, accessToken, limit = 100) {
   for (let page = 0; page < 10; page += 1) {
     const params = {
       access_token: accessToken,
-      fields: 'id,status,effective_status',
+      fields: 'id,status,effective_status,issues_info',
       limit,
     }
     if (after) params.after = after
@@ -1246,6 +1387,10 @@ export async function listAccountAds(adAccountId, accessToken, limit = 100) {
   return { rows, truncated }
 }
 
+export async function listAccountCreatives(adAccountId, accessToken, limit = 100) {
+  return graphList(`act_${adAccountId}/adcreatives`, accessToken, 'id,name,object_story_spec', limit)
+}
+
 export async function getCampaignStatusesBatch(adAccountId, accessToken, fbCampaignIds) {
   if (!fbCampaignIds.length) return {}
   const ids = fbCampaignIds.join(',')
@@ -1260,6 +1405,29 @@ export async function getCampaignStatusesBatch(adAccountId, accessToken, fbCampa
       result[id] = campaign.effective_status
     } else if (campaign?.status) {
       result[id] = campaign.status
+    }
+  }
+  return result
+}
+
+// Ad-level status+issues batch fetch for boost repair's issue-detection
+// job. Additive sibling of getCampaignStatusesBatch (untouched) — that one
+// only fetches effective_status/status for campaigns' batch sync, this one
+// also fetches issues_info so a disapproval's exact Meta error code can be
+// captured and classified.
+export async function getAdStatusesWithIssuesBatch(adAccountId, accessToken, adIds) {
+  if (!adIds.length) return {}
+  const ids = adIds.join(',')
+  const data = await graphGet('', {
+    access_token: accessToken,
+    ids,
+    fields: 'effective_status,status,issues_info',
+  })
+  const result = {}
+  for (const [id, ad] of Object.entries(data || {})) {
+    result[id] = {
+      status: ad?.effective_status || ad?.status || null,
+      issuesInfo: Array.isArray(ad?.issues_info) ? ad.issues_info : [],
     }
   }
   return result

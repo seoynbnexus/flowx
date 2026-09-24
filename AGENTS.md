@@ -313,6 +313,12 @@ All routes are mounted under `/api/v1` in `src/routes/index.js`:
   /users
   /roles
   /permissions
+  /campaigns
+  /admin/campaigns
+  /posts
+  /admin/posts
+  /media
+  /admin/media
   /publisher/accounts
   /publisher/accounts/oauth
   /admin/platform-accounts
@@ -380,6 +386,66 @@ Middleware order: `authenticate` → `requirePermission(...)` → `validate(sche
 - Controllers parse request params, delegate to service, and use `sendSuccess`/`sendCreated`/`sendError` helpers
 - Cross-module calls are rare — when needed, import the other module's service directly (e.g., `user.routes.js` imports `ad-category.controller.js` for `/me/categories` endpoints)
 - The `config` module is a special case — it reads from `app_config` table and serves different responses based on auth state
+
+## Campaign executions & repair
+
+Traditional campaigns run a per-owner Meta chain (campaign → ad set → ad → creative) tracked by `campaign_executions` rows (one per owner × kind, `UNIQUE(campaign_id, owner_user_id, kind)`), each with versioned `campaign_execution_generations` (gen 0 = adopted legacy chain, gen 1+ = repair replacements). When Meta reports an `effective_status` issue on a live ad, an execution repair rebuilds the creative (and ad) while preserving budget, targeting, and frozen config.
+
+### Module files (`src/modules/campaigns/`)
+
+| File | Role |
+|------|------|
+| `campaign-execution.model.js` | Execution/generation statuses, guarded transitions |
+| `campaign-execution.repository.js` | Execution/generation CRUD, status-guarded updates, audit appends |
+| `campaign-execution.service.js` | Planning (`planExecutionsForCampaign`), adoption, snapshot freeze/verify, backfill orchestration |
+| `repair.service.js` | Repair lifecycle: `requestRepair`, `previewRepair`, `runRepairJob`, `runRepairCreation`, `runRepairActivation`, `getExecutionRepairStatus`, `getRepairReadiness` |
+| `repair.repository.js` | Repair rows keyed by `(execution_id, object_id, error_code)` triple, guarded status transitions |
+| `repair.model.js` | `REPAIR_STATUS` vocabulary, `ACTIVE_REPAIR_STATUSES`, `TERMINAL_REPAIR_STATUSES`, `SUPPORTED_REPAIR_CATEGORIES` (`MEDIA_DIMENSION`, `VIDEO_DIMENSION`) |
+| `repair.metrics.js` | `recordRepairMetric`/`getRepairMetrics` (meta_sync_state rows), `getRepairFleetSummary`, `checkRepairAlerts` (leader-tick sweep) |
+| `repair.snapshot.js` | Frozen-vs-live diff scoped to the media amendment |
+| `campaign-execution-stats.test.js` et al | See test inventory below |
+
+Shared services: `meta-chain-runner.js` (validate-then-create + reverse-order cleanup + error classification), `meta-issue-catalog.js` (code-keyed classification; **never invent codes** — unknown codes stay `UNKNOWN`/informational), `snapshot.js` (freeze/hash/version primitives), `financial-claims.js` (spend/refund math), `repair-media-criteria.js` (ad-creative image/video gates: formats, ≤30MB images, ≥500px width both kinds, video mp4/mov + ≥1s; unprobeable rules pass through to Meta).
+
+### Async execution
+
+- Repairs run as `campaign_jobs` rows with `job_type = 'execution_repair'`, `campaign_id = NULL`, `run_key = repair:<repairId>` — the single worker entry is `HANDLERS[EXECUTION_REPAIR] → repairService.runRepairJob`.
+- State machine per repair: `pending → ready_for_creation → creative_created → ad_created → new_verified → new_activating → new_active_verified → old_pausing → old_paused_verified → active_pointer_moved → old_cleanup → completed`, with `failed`/`unknown`/`superseded` exits. Every hop is a guarded single-row `UPDATE` (`WHERE status = …`).
+- No fixed delays anywhere — parking uses `requeueAfterSeconds`/job backoff only. The worker lease (`campaign_job_worker`) fences execution; `drainCampaignJobs` stays unfenced for tests/scripts.
+
+### Rollout & safety gates (all `app_config`, all fail-closed, seeded by migration `093_repair_rollout_flags.js`)
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `campaign_repair_rollout` | `'off'` | `requestRepair` throws unless `admin_only`/`enabled` |
+| `campaign_repair_execution_enabled` | `false` | worker parks at `ready_for_creation` when off |
+| `campaign_repair_killed` | `false` | kill switch: all repair mutations throw, no state change |
+| `campaign_repair_category_media_dimension` | `true` | per-category gate for `MEDIA_DIMENSION` |
+| `campaign_repair_category_video_dimension` | absent (`false`) | per-category gate for `VIDEO_DIMENSION`; `VIDEO_DIMENSION_ISSUE_CODES` allowlist starts empty until live-pinned |
+
+- `getRepairRolloutMode()` returns a mode only for the exact strings `admin_only`/`enabled`, else `'off'`. `previewRepair` is read-only (plus a metrics row) and never gated by rollout.
+- Replacement media: asset-id **or** direct URL (exactly-one-of, enforced by `repairRequestSchema`). URLs are SSRF-checked, probed, and stored verbatim (query strings intact for signed CDN URLs); Meta fetches the submitted URL as-is via `link_data.link` (image) or `advideos { file_url }` → `video_data` (video). No asset row is created for URL repairs.
+
+### Invariants (do not break)
+
+- Financial fence: repair code paths must never touch coins, billing entries, or `chargedAdBudgetPaise` — grep for `coinService|insertBillingEntry|chargedAdBudgetPaise|claimCampaignSettlement` in `repair.*` must stay empty.
+- Kill-switch coverage: `runRepairJob`, `runRepairCreation`, `runRepairActivation` assert at entry; every Meta mutation site asserts inline. The worker dispatch is the only entry — no alternate mutation path may bypass `assertRepairMutationsAllowed()`.
+- `SUPPORTED_REPAIR_CATEGORIES` membership alone never enables a repair — the category flag + a classified active issue are both required.
+- Migrations touching repair tables stay additive; `app_config` seeds use `INSERT IGNORE` (never overwrite operator values); `seed.js` mirrors migration defaults for fresh environments.
+
+### Test inventory (`tests/04-campaigns/` + `tests/06-media/`)
+
+- `repair-media-criteria.test.js` — image/video criteria unit matrix
+- `repair-media-url.test.js` — direct-URL request/preview/worker re-probe (changed/vanished), schema xor
+- `repair-video.test.js` — video e2e to `NEW_VERIFIED`, adoption-by-`video_id`, upload/readiness failures, 389 classification
+- `campaign-repair-rollout.test.js` — rollout/kill/category/metrics/readiness/financial-fence
+- `campaign-repair-status.test.js` — status shape, eligibility reasons, preview authorization
+- `campaign-execution-repair.test.js` — creation state machine, invalid media, transitions
+- `campaign-execution-{creation,resume,retry,runtime,snapshot,activation,hardening,financial,generations,publisher,stats,backfill}.test.js` — phase coverage per filename
+- `campaign-executions.test.js` — planning matrix, shadow invisibility
+- `campaign-finance-characterization.test.js` — locks spend-last/escrow behavior
+- `financial-claims.test.js`, `meta-chain-runner.test.js`, `snapshot-primitive.test.js` — shared primitives
+- `tests/06-media/media-dimensions.test.js` — creation pre-validate media gate (image + video)
 
 ## File Organization Rules
 

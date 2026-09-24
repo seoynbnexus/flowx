@@ -2,7 +2,8 @@ import crypto from 'node:crypto'
 import { z } from 'zod'
 import { query, queryOne } from '../../../shared/database/connection.js'
 import * as repo from './campaign.repository.js'
-import { CAMPAIGN_STATUS, META_STATUS, REVIEW_ACTIONS, CAMPAIGN_JOB_TYPES } from './campaign.model.js'
+import * as execRepo from './campaign-execution.repository.js'
+import { CAMPAIGN_STATUS, META_STATUS, REVIEW_ACTIONS, CAMPAIGN_JOB_TYPES, META_ISSUE_MESSAGES } from './campaign.model.js'
 import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
 import { sendAdminAlert } from '../../../shared/mailer/alert.mailer.js'
 import {
@@ -190,6 +191,12 @@ async function handleSpendEvent(event) {
   const statDate = event.value.date || new Date().toISOString().slice(0, 10)
   await repo.upsertSpendOnly(campaign.id, statDate, spendPaise)
 
+  const fbCampaignId = String(event.value.campaign_id)
+  const executionId = await repo.findExecutionByPlatformCampaignId(fbCampaignId)
+  if (executionId) {
+    await repo.upsertExecutionSpendOnly(executionId, statDate, spendPaise)
+  }
+
   const totalPaise = await repo.sumDailyStatsSpend(campaign.id)
   if (totalPaise > (campaign.metaSpentPaise || 0)) {
     await repo.saveMetaSpend(campaign.id, totalPaise)
@@ -219,6 +226,16 @@ async function handleDeliverySignals(event) {
   const outcomes = []
   if (value.ad_id && value.status) {
     await repo.saveMetaObjectStatus(value.ad_id, String(value.status).toUpperCase())
+    const generation = await execRepo.findGenerationByMetaId(String(value.ad_id))
+    if (generation) {
+      const holder = await execRepo.findExecutionById(generation.executionId)
+      const activeNo = holder?.activeGenerationNo
+      if (activeNo !== null && activeNo !== undefined && Number(activeNo) !== Number(generation.generationNo)) {
+        await logMetaEvent({ action: 'webhook_delivery_signal_historical', campaignId: campaign.id, params: { adId: value.ad_id, generationNo: generation.generationNo } })
+        outcomes.push({ adId: value.ad_id, status: String(value.status).toUpperCase(), applied: false, ignored: 'historical-generation' })
+        return { applied: true, outcomes }
+      }
+    }
     const transition = await applyMetaStatusTransitionLocal(campaign, String(value.status).toUpperCase())
     outcomes.push({ adId: value.ad_id, status: String(value.status).toUpperCase(), ...transition })
   } else {
@@ -243,6 +260,7 @@ async function applyMetaStatusTransitionLocal(campaign, metaAdStatus) {
     }, campaign.status)
     await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
       'Ad disapproved by Meta')
+    await repo.requeueAutoJob(campaign.id, CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN)
     newStatus = CAMPAIGN_STATUS.FAILED
     newMetaStatus = META_STATUS.FAILED
     statusChanged = true
@@ -258,7 +276,9 @@ async function applyMetaStatusTransitionLocal(campaign, metaAdStatus) {
     metaStatusChanged = true
   } else if (status === 'PAUSED' && campaign.status === CAMPAIGN_STATUS.RUNNING) {
     await repo.updateCampaignStatus(campaign.id, CAMPAIGN_STATUS.PAUSED)
-    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PAUSED })
+    const pauseUpdate = { metaStatus: META_STATUS.PAUSED }
+    if (campaign.metaError && campaign.metaStatus !== META_STATUS.PAUSED) pauseUpdate.metaError = null
+    await repo.updateCampaign(campaign.id, pauseUpdate)
     await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, CAMPAIGN_STATUS.RUNNING, 'Campaign paused from Meta webhook')
     newStatus = CAMPAIGN_STATUS.PAUSED
     newMetaStatus = META_STATUS.PAUSED
@@ -266,34 +286,60 @@ async function applyMetaStatusTransitionLocal(campaign, metaAdStatus) {
     metaStatusChanged = true
   } else if (status === 'ACTIVE' && campaign.status === CAMPAIGN_STATUS.PAUSED) {
     await repo.updateCampaignStatus(campaign.id, CAMPAIGN_STATUS.RUNNING)
-    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.ACTIVE })
+    const resumeUpdate = { metaStatus: META_STATUS.ACTIVE }
+    if (campaign.metaError && campaign.metaStatus !== META_STATUS.ACTIVE) resumeUpdate.metaError = null
+    await repo.updateCampaign(campaign.id, resumeUpdate)
     await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, CAMPAIGN_STATUS.PAUSED, 'Campaign resumed from Meta webhook')
     newStatus = CAMPAIGN_STATUS.RUNNING
     newMetaStatus = META_STATUS.ACTIVE
     statusChanged = true
     metaStatusChanged = true
   } else if (status === 'ACTIVE') {
-    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.ACTIVE })
+    const update = { metaStatus: META_STATUS.ACTIVE }
+    if (campaign.metaError && campaign.metaStatus !== META_STATUS.ACTIVE) update.metaError = null
+    await repo.updateCampaign(campaign.id, update)
     newMetaStatus = META_STATUS.ACTIVE
     metaStatusChanged = true
   } else if (status === 'PAUSED') {
-    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PAUSED })
+    const update = { metaStatus: META_STATUS.PAUSED }
+    if (campaign.metaError && campaign.metaStatus !== META_STATUS.PAUSED) update.metaError = null
+    await repo.updateCampaign(campaign.id, update)
     newMetaStatus = META_STATUS.PAUSED
     metaStatusChanged = true
   } else if (status === 'PENDING_REVIEW') {
-    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PENDING_REVIEW })
+    const newlyObserved = campaign.metaStatus !== META_STATUS.PENDING_REVIEW
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PENDING_REVIEW, metaError: META_ISSUE_MESSAGES[META_STATUS.PENDING_REVIEW] })
+    if (newlyObserved) {
+      await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+        'Meta is reviewing this campaign — delivery may be limited until review completes.')
+    }
     newMetaStatus = META_STATUS.PENDING_REVIEW
     metaStatusChanged = true
   } else if (status === 'PENDING_BILLING_INFO') {
-    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PENDING_BILLING_INFO })
-    await sendAdminAlert('Meta campaign billing info required',
-      `Campaign ${campaign.name} (${campaign.id}) requires billing info on Meta.`)
+    const newlyObserved = campaign.metaStatus !== META_STATUS.PENDING_BILLING_INFO
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.PENDING_BILLING_INFO, metaError: META_ISSUE_MESSAGES[META_STATUS.PENDING_BILLING_INFO] })
+    if (newlyObserved) {
+      await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+        'Meta reported that billing information requires attention — delivery may be limited.')
+      await sendAdminAlert('Meta campaign billing info required',
+        `Campaign ${campaign.name} (${campaign.id}) requires billing info on Meta.`)
+    }
     newMetaStatus = META_STATUS.PENDING_BILLING_INFO
     metaStatusChanged = true
   } else if (status === 'WITH_ISSUES') {
-    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.WITH_ISSUES })
-    await sendAdminAlert('Meta campaign has issues',
-      `Campaign ${campaign.name} (${campaign.id}) has policy issues on Meta.`)
+    // Webhook payloads never carry the ad's issues_info (only a bare
+    // status), so there's no way to tell here whether the issue is
+    // repairable — that decision needs the full ad fetch the periodic
+    // sync does. Stay alert-only; syncCampaignStatusJob/syncAccountStatusJob
+    // are the only paths allowed to fail the campaign for WITH_ISSUES.
+    const newlyObserved = campaign.metaStatus !== META_STATUS.WITH_ISSUES
+    await repo.updateCampaign(campaign.id, { metaStatus: META_STATUS.WITH_ISSUES, metaError: META_ISSUE_MESSAGES[META_STATUS.WITH_ISSUES] })
+    if (newlyObserved) {
+      await repo.createReviewLog(campaign.id, null, REVIEW_ACTIONS.SUBMITTED, campaign.status,
+        'Meta reported an issue with this campaign — ads may not be delivering. Check Meta Ads Manager for details.')
+      await sendAdminAlert('Meta campaign has issues',
+        `Campaign ${campaign.name} (${campaign.id}) has policy issues on Meta.`)
+    }
     newMetaStatus = META_STATUS.WITH_ISSUES
     metaStatusChanged = true
   } else if (status === 'PREAPPROVED') {

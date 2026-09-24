@@ -42,6 +42,8 @@ export async function listAllAccounts(req, res, next) {
   try {
     const result = await service.listAllAccounts({
       status: req.query.status,
+      platformCode: req.query.platformCode,
+      search: req.query.search,
       page: parseInt(req.query.page, 10) || 1,
       limit: Math.min(parseInt(req.query.limit, 10) || 20, 100),
     });

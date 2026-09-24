@@ -202,6 +202,11 @@ export async function pauseBoostForDeletionCandidate(target) {
     const { updateAdStatus } = await import('../../../shared/services/meta-ads.service.js')
     const ptgt = await promoRepo.findPromotionTargetByPostTargetId(target.id)
     if (ptgt && ptgt.status === PROMOTION_TARGET_STATUS.ACTIVE) {
+      // Guarded active -> paused: a concurrent cancel or confirmed-deletion
+      // settle could have already terminated this target between the read
+      // above and this write — the CAS refuses to resurrect it as paused.
+      const claimed = await promoRepo.claimPromotionTargetPause(ptgt.id)
+      if (!claimed) return { paused: false }
       if (ptgt.platformCampaignId && sysToken) {
         try {
           await updateAdStatus(ptgt.platformCampaignId, 'PAUSED', sysToken)
@@ -209,7 +214,6 @@ export async function pauseBoostForDeletionCandidate(target) {
           await logMetaEvent({ action: 'deletion_pause_meta_error', promotionTargetId: ptgt.id, postTargetId: target.id, error: err?.message || String(err) })
         }
       }
-      await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.PAUSED })
       const { refreshPromotionStatus } = await import('./promotion.service.js')
       await refreshPromotionStatus(ptgt.promotionId)
       await dmRepo.setBoostPausedByDeletion(target.id, true)
@@ -261,7 +265,14 @@ export async function resumeBoostAfterRecovery(target) {
           return { resumed: false, reason: 'meta_resume_failed' }
         }
       }
-      await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.ACTIVE })
+      // Guarded paused -> active: a concurrent cancel or confirmed-deletion
+      // settle could have already terminated this target while the Meta
+      // call above was in flight — the CAS refuses to resurrect it.
+      const claimed = await promoRepo.claimPromotionTargetResume(ptgt.id)
+      if (!claimed) {
+        await dmRepo.setBoostPausedByDeletion(target.id, false)
+        return { resumed: false, reason: 'not_paused' }
+      }
       const { refreshPromotionStatus } = await import('./promotion.service.js')
       await refreshPromotionStatus(ptgt.promotionId)
       await dmRepo.setBoostPausedByDeletion(target.id, false)

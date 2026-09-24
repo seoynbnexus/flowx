@@ -239,6 +239,68 @@ export async function settlePromotionLeftover(promotionId) {
   }
 }
 
+/**
+ * Refunds boost slots that were charged upfront (chargePromotionForApproval
+ * charges for every EXPECTED slot — client target(s) + full publisherCount —
+ * before publishers have had a chance to accept) but never got a
+ * promotion_targets row at all, because the publisher response deadline
+ * passed without enough acceptances. This is the one gap the per-target
+ * consume/refund machinery can't reach: refundPromotionTargetShare and
+ * settlePromotionLeftover both operate over EXISTING promotion_targets rows,
+ * and a slot nobody accepted never has one.
+ *
+ * Called exactly once, at the moment a set of publisher slots is finalized
+ * as permanently unfilled (deadline passed with partial acceptance) —
+ * mirrors refundPostEscrow's unfilled-slot refund for the publisher payout
+ * escrow, which fires at the same call site. After this commits,
+ * charged_paise correctly reflects only the slots that materialized (or are
+ * about to), so cancelPromotionById / settlePromotionLeftover need no
+ * awareness of unfilled slots — their existing math is already correct
+ * against the corrected total.
+ */
+export async function refundUnfilledPromotionSlots(postId, unfilledCount, reason) {
+  try {
+    if (!unfilledCount || unfilledCount <= 0) return null
+    const promotion = await promoRepo.findPromotionByPostId(postId)
+    if (!promotion || promotion.chargedPaise <= 0) return null
+    if (TERMINAL_PROMOTION_STATUSES.includes(promotion.status)) return null
+
+    const perTargetPaise = await promotionPerTargetPaise(promotion)
+    const refundPaise = perTargetPaise * unfilledCount
+    if (refundPaise <= 0) return null
+
+    const { transaction } = await import('../../../shared/database/connection.js')
+    return await transaction(async () => {
+      const settledAt = new Date().toISOString().slice(0, 19).replace('T', ' ')
+      const claimed = await promoRepo.claimPromotionUnfilledSlots(promotion.id, refundPaise, settledAt)
+      if (!claimed) return promoRepo.findPromotionById(promotion.id)
+
+      const post = await postRepo.findPostById(postId)
+      const coinRate = await getCoinConversionRate()
+      const refundCoins = Math.round(refundPaise / (coinRate * 100))
+      if (post && refundCoins > 0) {
+        const coinService = await import('../../../shared/services/coin.service.js')
+        await coinService.refundWithDetail(post.clientId, refundCoins, 'post_boost', post.id,
+          `Refund: ${reason} — ${unfilledCount} unfilled boost slot(s) for "${post.name}"`, { fromMonthly: 0, fromWallet: refundCoins })
+        await postRepo.insertPostBillingEntry(post.id, {
+          kind: 'refund',
+          paise: refundPaise,
+          coins: refundCoins,
+          rate: coinRate,
+          paidFromMonthly: 0,
+          paidFromWallet: refundCoins,
+          reason: `Boost refund — ${unfilledCount} unfilled slot(s): ${reason}`,
+        })
+        await logMetaEvent({ action: 'promotion_unfilled_slots_refunded', promotionId: promotion.id, postId, unfilledCount, coins: refundCoins, paise: refundPaise, reason })
+      }
+      return promoRepo.findPromotionById(promotion.id)
+    })
+  } catch (err) {
+    await logMetaEvent({ action: 'promotion_unfilled_slots_refund_error', postId, error: err?.message || String(err) })
+    return null
+  }
+}
+
 async function loadPostForClient(userId, postId) {
   const post = await postRepo.findPostById(postId)
   if (!post) throw new NotFoundError('Post not found')
@@ -267,12 +329,11 @@ function buildPromotionConfigFromPost(post) {
     objective: post.boostObjective || 'OUTCOME_ENGAGEMENT',
     optimizationGoal: post.boostOptimizationGoal || null,
     bidStrategy: post.boostBidStrategy || null,
+    bidAmount: post.boostBidAmount || null,
+    specialAdCategories: post.boostSpecialAdCategories || [],
     targeting: post.boostTargeting || null,
     placement: post.boostPlacement || null,
     callToAction: post.boostCallToAction || null,
-    link: post.boostLink || null,
-    headline: post.boostHeadline || null,
-    description: post.boostDescription || null,
     startAt: post.scheduledAt || null,
     endAt: post.boostEndTime || null,
     chargedPaise: post.chargedBoostPaise || 0,
@@ -348,12 +409,11 @@ export async function createPromotionForPublishedPost(userId, postId, data) {
     objective: data.objective || 'OUTCOME_ENGAGEMENT',
     optimizationGoal: data.optimizationGoal || null,
     bidStrategy: data.bidStrategy || null,
+    bidAmount: data.bidAmount || null,
+    specialAdCategories: data.specialAdCategories || [],
     targeting: data.targeting || null,
     placement: data.placement || null,
     callToAction: data.callToAction || null,
-    link: data.link || null,
-    headline: data.headline || null,
-    description: data.description || null,
     startAt: data.startAt || null,
     endAt: data.endTime || null,
     chargedPaise,
@@ -481,6 +541,20 @@ export async function runPromotionTargetJob(promotionTargetId, jobPayload = {}) 
 
   const target = await postRepo.findPostTargetById(ptgt.postTargetId)
   if (!target) return { done: true }
+  if (target.status === POST_TARGET_STATUS.FAILED) {
+    // The underlying organic publish permanently failed for this specific
+    // target (a partial-failure case — other targets on the same post may
+    // still be live) — this share was charged upfront and will otherwise
+    // never be visited again (findStuckPendingPromotionTargets used to only
+    // look for pt.status='posted', so a target stuck here sat unrefunded
+    // forever). Cancel + refund just this target, mirroring the
+    // deleted-post handling below.
+    await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.CANCELLED })
+    await refundPromotionTargetShare(ptgt, promotion, post, 'post publish permanently failed')
+    await refreshPromotionStatus(promotion.id)
+    await logMetaEvent({ action: 'promotion_target_skipped_publish_failed', promotionId: promotion.id, promotionTargetId: ptgt.id, postId: post.id, postTargetId: target.id })
+    return { done: true }
+  }
   if (target.status !== POST_TARGET_STATUS.POSTED) return { done: true }
   if (!target.metaObjectId) return { done: true }
   if (target.deletionReviewState === 'confirmed' || target.remoteContentState === 'missing') {
@@ -561,8 +635,17 @@ export async function runPromotionTargetJob(promotionTargetId, jobPayload = {}) 
   await promoRepo.updatePromotionTarget(ptgt.id, { eligibilityStatus: PROMOTION_TARGET_ELIGIBILITY.ELIGIBLE, eligibilityReason: null })
   if (eligibility.promotableId) target.promotableId = eligibility.promotableId
 
+  // Atomic claim before any Meta object creation — closes the window where
+  // campaign_jobs' 10min stale-reclaim double-dispatches this same target
+  // while the original invocation is still alive but slow. Only one
+  // concurrent caller can win pending/validating -> creating; the loser
+  // stands down instead of risking duplicate Meta objects.
+  const claimed = await promoRepo.claimPromotionTargetForCreation(ptgt.id)
+  if (!claimed) {
+    await logMetaEvent({ action: 'promotion_target_claim_lost', promotionId: promotion.id, promotionTargetId: ptgt.id })
+    return { done: true }
+  }
   await promoRepo.updatePromotion(promotion.id, { status: PROMOTION_STATUS.CREATING })
-  await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.CREATING })
 
   const snapshot = readSnapshotSlice(promotion, target.id, target.platformCode)
   if (!snapshot) {
@@ -584,18 +667,17 @@ export async function runPromotionTargetJob(promotionTargetId, jobPayload = {}) 
     boostTargeting: snapshot.targeting,
     boostPlacement: snapshot.placement,
     boostBidStrategy: promotion.bidStrategy,
+    boostBidAmount: promotion.bidAmount,
+    boostSpecialAdCategories: promotion.specialAdCategories,
     boostOptimizationGoal: snapshot.optimizationGoal,
     boostObjective: snapshot.objective,
     boostCallToAction: promotion.callToAction,
-    boostLink: promotion.link,
-    boostHeadline: promotion.headline,
-    boostDescription: promotion.description,
     scheduledAt: promotion.startAt,
   }
   const coinRate = await getCoinConversionRate()
   const boostPayload = await buildPostBoostPayloads(promoPost, target, coinRate)
-  if (boostPayload.minBudgetError || boostPayload.scheduleError || boostPayload.geoError) {
-    const error = boostPayload.minBudgetError || boostPayload.scheduleError || boostPayload.geoError
+  if (boostPayload.minBudgetError || boostPayload.scheduleError || boostPayload.geoError || boostPayload.bidAmountError) {
+    const error = boostPayload.minBudgetError || boostPayload.scheduleError || boostPayload.geoError || boostPayload.bidAmountError
     await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.FAILED, error, attempts: ptgt.attempts + 1 })
     await refundPromotionTargetShare(ptgt, promotion, post, 'invalid boost configuration')
     await refreshPromotionStatus(promotion.id)
@@ -723,6 +805,14 @@ export async function recoverStuckPromotionTargets() {
   let recovered = 0
   for (const ptgt of stuck) {
     try {
+      if (ptgt.status !== PROMOTION_TARGET_STATUS.PENDING) {
+        // Stale validating/creating (worker died mid-flight) — reset to
+        // pending first so claimPromotionTargetForCreation can re-claim it;
+        // a target whose underlying post_target already failed is left as
+        // whatever status it's in — runPromotionTargetJob's own FAILED
+        // branch handles it once the job runs, no reset needed.
+        await promoRepo.resetStalePromotionTargetToPending(ptgt.id)
+      }
       await enqueuePromotionTargetJob(ptgt.id)
       recovered += 1
     } catch (err) {
@@ -776,21 +866,28 @@ export async function cancelPromotionById(promotionId) {
   const perTargetPaise = await promotionPerTargetPaise(promotion)
 
   for (const ptgt of targets) {
-    if (ptgt.status === PROMOTION_TARGET_STATUS.CANCELLED) continue
-    const wasActive = ptgt.status === PROMOTION_TARGET_STATUS.ACTIVE || ptgt.status === PROMOTION_TARGET_STATUS.PAUSED
-    if (ptgt.status === PROMOTION_TARGET_STATUS.ACTIVE || ptgt.status === PROMOTION_TARGET_STATUS.CREATING || ptgt.status === PROMOTION_TARGET_STATUS.VALIDATING || ptgt.status === PROMOTION_TARGET_STATUS.PAUSED) {
-      if (systemToken) {
-        await cleanupPromotionTargetMetaObjects(ptgt, systemToken)
+    try {
+      if (ptgt.status === PROMOTION_TARGET_STATUS.CANCELLED) continue
+      const wasActive = ptgt.status === PROMOTION_TARGET_STATUS.ACTIVE || ptgt.status === PROMOTION_TARGET_STATUS.PAUSED
+      if (ptgt.status === PROMOTION_TARGET_STATUS.ACTIVE || ptgt.status === PROMOTION_TARGET_STATUS.CREATING || ptgt.status === PROMOTION_TARGET_STATUS.VALIDATING || ptgt.status === PROMOTION_TARGET_STATUS.PAUSED) {
+        if (systemToken) {
+          await cleanupPromotionTargetMetaObjects(ptgt, systemToken)
+        }
+        if (wasActive && perTargetPaise > 0 && !ptgt.consumedPaise) {
+          await promoRepo.updatePromotionTarget(ptgt.id, { consumedPaise: perTargetPaise })
+        }
+        await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.CANCELLED, platformCampaignId: null, platformAdsetId: null, platformCreativeId: null, platformAdId: null })
+      } else {
+        await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.CANCELLED })
+        if (!wasActive) {
+          await refundPromotionTargetShare(ptgt, promotion, post, 'promotion cancelled')
+        }
       }
-      if (wasActive && perTargetPaise > 0 && !ptgt.consumedPaise) {
-        await promoRepo.updatePromotionTarget(ptgt.id, { consumedPaise: perTargetPaise })
-      }
-      await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.CANCELLED, platformCampaignId: null, platformAdsetId: null, platformCreativeId: null, platformAdId: null })
-    } else {
-      await promoRepo.updatePromotionTarget(ptgt.id, { status: PROMOTION_TARGET_STATUS.CANCELLED })
-      if (!wasActive) {
-        await refundPromotionTargetShare(ptgt, promotion, post, 'promotion cancelled')
-      }
+    } catch (err) {
+      // One target's transient failure (e.g. a DB hiccup) must never stop
+      // the rest of the promotion from being cancelled/refunded, and must
+      // never skip the final status flip + settle below.
+      await logMetaEvent({ action: 'promotion_cancel_target_error', promotionId, promotionTargetId: ptgt.id, error: err?.message || String(err) })
     }
   }
 
@@ -875,6 +972,18 @@ export async function listPromotionsForPost(userId, postId) {
 export async function adminGetPromotion(promotionId) {
   const promotion = await promoRepo.findPromotionById(promotionId)
   if (!promotion) throw new NotFoundError('Promotion not found')
-  const targets = await promoRepo.findPromotionTargetsByPromotionId(promotionId)
+  const rawTargets = await promoRepo.findPromotionTargetsByPromotionId(promotionId)
+  const { getPromotionTargetRepairStatus } = await import('./promotion-repair.service.js')
+  const targets = []
+  for (const target of rawTargets) {
+    let issues = []
+    let activeRepair = null
+    try {
+      const status = await getPromotionTargetRepairStatus(target.id)
+      issues = status.issues
+      activeRepair = status.activeRepair
+    } catch {}
+    targets.push({ ...target, issues, activeRepair })
+  }
   return { ...promotion, targets }
 }

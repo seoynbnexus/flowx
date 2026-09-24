@@ -27,6 +27,7 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
 })
 
 const dateTag = Date.now()
+const futureBoostEndTime = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
 
 async function addPlatformAccount(userId, { code, platformUserId }) {
   const platform = await queryOne("SELECT id FROM platforms WHERE code = ?", [code])
@@ -82,7 +83,7 @@ describe('post boost video/reel id resolution', () => {
       mediaUrl: 'https://example.com/video.mp4',
       boostEnabled: true,
       boostBudgetType: 'daily',
-      boostBudgetAmount: 500,
+      boostBudgetAmount: 500, boostEndTime: futureBoostEndTime,
       boostObjective: 'OUTCOME_ENGAGEMENT',
       boostOptimizationGoal: 'POST_ENGAGEMENT',
       boostTargeting: { geo_locations: { countries: ['IN'] } },

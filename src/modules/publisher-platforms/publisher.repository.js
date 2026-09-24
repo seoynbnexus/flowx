@@ -119,9 +119,9 @@ export async function listAccountsByUser(userId) {
   }));
 }
 
-export async function listAllAccounts({ status, page, limit }) {
+export async function listAllAccounts({ status, page, limit, platformCode, search }) {
   const offset = (page - 1) * limit;
-  const where = ['a.token_type != ?'];
+  const where = ['a.token_type != ?', 'u.deleted_at IS NULL'];
   const params = ['user'];
 
   if (status) {
@@ -129,20 +129,30 @@ export async function listAllAccounts({ status, page, limit }) {
     params.push(status);
   }
 
-  const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  if (platformCode) {
+    where.push('p.code = ?');
+    params.push(platformCode);
+  }
 
-  const countRow = await queryOne(
-    `SELECT COUNT(*) as total FROM user_platform_accounts a ${whereClause}`,
-    params
-  );
+  if (search) {
+    where.push('(u.email LIKE ? OR a.platform_username LIKE ? OR a.platform_display_name LIKE ?)');
+    const pattern = `%${search}%`;
+    params.push(pattern, pattern, pattern);
+  }
+
+  const whereClause = `WHERE ${where.join(' AND ')}`;
+  const joinClause = `
+     FROM user_platform_accounts a
+     JOIN platforms p ON p.id = a.platform_id
+     JOIN users u ON u.id = a.user_id
+     ${whereClause}`;
+
+  const countRow = await queryOne(`SELECT COUNT(*) as total ${joinClause}`, params);
 
   const rows = await query(
     `SELECT a.*, p.code as platform_code, p.name as platform_name,
             u.email as user_email
-     FROM user_platform_accounts a
-     JOIN platforms p ON p.id = a.platform_id
-     JOIN users u ON u.id = a.user_id
-     ${whereClause}${where.length > 0 ? ' AND' : ' WHERE'} u.deleted_at IS NULL
+     ${joinClause}
      ORDER BY a.created_at DESC
      LIMIT ? OFFSET ?`,
     [...params, String(limit), String(offset)]

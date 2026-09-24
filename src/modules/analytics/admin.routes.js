@@ -11,5 +11,7 @@ router.get('/users', adminController.getUsers);
 router.get('/logins', adminController.getLogins);
 router.get('/ai-usage', adminController.getAiUsage);
 router.get('/economy', adminController.getEconomy);
+router.get('/publishers', adminController.getPublishers);
+router.get('/clients', adminController.getClients);
 
 export default router;

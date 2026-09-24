@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { POST_TYPES } from './post.model.js'
+import { META_SPECIAL_AD_CATEGORIES } from '../campaigns/campaign.model.js'
 
 const contentFields = {
   caption: z.string().max(2200).optional().nullable(),
@@ -54,12 +55,11 @@ const boostFields = {
   boostTargeting: boostTargetingSchema.optional().nullable(),
   boostPlacement: boostPlacementSchema.optional().nullable(),
   boostBidStrategy: z.string().max(100).optional().nullable(),
+  boostBidAmount: z.coerce.number().positive().optional().nullable(),
+  boostSpecialAdCategories: z.array(z.enum(META_SPECIAL_AD_CATEGORIES)).optional().default([]),
   boostOptimizationGoal: z.enum(BOOST_GOALS).optional().nullable(),
   boostObjective: z.enum(BOOST_OBJECTIVES).optional().nullable(),
   boostCallToAction: z.string().max(100).optional().nullable(),
-  boostLink: z.string().url().max(2000).optional().nullable().or(z.literal('').transform(() => null)),
-  boostHeadline: z.string().max(255).optional().nullable(),
-  boostDescription: z.string().max(500).optional().nullable(),
 }
 
 const boostRefine = (schema) =>

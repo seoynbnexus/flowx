@@ -70,18 +70,26 @@ export async function updateProfile(userId, data) {
   });
 }
 
-export async function listUsers({ page, limit, status, search }) {
+export async function listUsers({ page, limit, status, search, role }) {
   const offset = (page - 1) * limit;
-  const where = ['deleted_at IS NULL'];
+  // Qualified with u. throughout — both queries below alias the table as
+  // `u`, and the row query also joins user_profiles (which has its own
+  // `id` column), so an unqualified `id` is ambiguous there.
+  const where = ['u.deleted_at IS NULL'];
   const params = [];
 
   if (status) {
-    where.push('status = ?');
+    where.push('u.status = ?');
     params.push(status);
   }
 
+  if (role) {
+    where.push('u.id IN (SELECT user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.code = ?)');
+    params.push(role);
+  }
+
   if (search) {
-    where.push('(email LIKE ? OR id IN (SELECT user_id FROM user_profiles WHERE first_name LIKE ? OR last_name LIKE ?))');
+    where.push('(u.email LIKE ? OR u.id IN (SELECT user_id FROM user_profiles WHERE first_name LIKE ? OR last_name LIKE ?))');
     const pattern = `%${search}%`;
     params.push(pattern, pattern, pattern);
   }
@@ -89,7 +97,7 @@ export async function listUsers({ page, limit, status, search }) {
   const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
 
   const countRow = await queryOne(
-    `SELECT COUNT(*) as total FROM users ${whereClause}`,
+    `SELECT COUNT(*) as total FROM users u ${whereClause}`,
     params
   );
 

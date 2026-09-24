@@ -23,7 +23,7 @@ export async function getClientDashboard(clientId) {
   const cached = getCached(cacheKey)
   if (cached) return cached
 
-  const [campaigns, posts, wallet, engagementDaily, spendDaily, postsEngagement, lifetime] = await Promise.all([
+  const [campaigns, posts, wallet, engagementDaily, spendDaily, postsEngagement, lifetime, connectedAccounts] = await Promise.all([
     repo.getClientCampaignStats(clientId),
     repo.getClientPostStats(clientId),
     repo.getClientWallet(clientId),
@@ -31,6 +31,7 @@ export async function getClientDashboard(clientId) {
     repo.getClientSpendDaily(clientId),
     repo.getClientPostsEngagement(clientId, 10),
     repo.getClientLifetimeEngagement(clientId),
+    repo.getClientConnectedAccounts(clientId),
   ])
 
   const totalViews = engagementDaily.reduce((s, d) => s + d.views, 0)
@@ -41,6 +42,7 @@ export async function getClientDashboard(clientId) {
     campaigns,
     posts,
     wallet,
+    accounts: { connected: connectedAccounts },
     engagement: { daily: engagementDaily, postsEngagement, lifetime, totalViews, totalReach, totalSpendPaise, spendDaily },
   }
   setCached(cacheKey, data)

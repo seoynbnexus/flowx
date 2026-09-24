@@ -2,12 +2,19 @@ import { logger, sanitizeUrl } from './logger.js'
 
 const IS_DEV = process.env.NODE_ENV === 'development'
 const successLevel = IS_DEV ? 'info' : 'debug'
+// A hung outbound Meta call never resolves on its own — without a timeout it
+// can pin a job "running" indefinitely, which is exactly what makes the
+// campaign_jobs stale-reclaim (10 min) treat a still-alive worker as dead and
+// double-dispatch the same job. A bounded timeout guarantees every call
+// eventually fails and lets normal job backoff take over.
+export const apiFetchTimeoutMs = Number(process.env.META_HTTP_TIMEOUT_MS) || 30000
 
 export async function apiFetch(url, options = {}, { service, operation } = {}) {
   const start = Date.now()
+  const fetchOptions = options.signal ? options : { ...options, signal: AbortSignal.timeout(apiFetchTimeoutMs) }
 
   try {
-    const res = await fetch(url, options)
+    const res = await fetch(url, fetchOptions)
     const ms = Date.now() - start
     const base = { service, operation, statusCode: res.status, ms, url: sanitizeUrl(url) }
     if (res.ok) {

@@ -48,6 +48,8 @@ function mapPostRow(row) {
     boostTargeting: typeof row.boost_targeting === 'string' ? JSON.parse(row.boost_targeting) : row.boost_targeting || null,
     boostPlacement: typeof row.boost_placement === 'string' ? JSON.parse(row.boost_placement) : row.boost_placement || null,
     boostBidStrategy: row.boost_bid_strategy || null,
+    boostBidAmount: row.boost_bid_amount != null ? Number(row.boost_bid_amount) : null,
+    boostSpecialAdCategories: typeof row.boost_special_ad_categories === 'string' ? JSON.parse(row.boost_special_ad_categories) : row.boost_special_ad_categories || [],
     boostOptimizationGoal: row.boost_optimization_goal || null,
     boostObjective: row.boost_objective || null,
     boostCallToAction: row.boost_call_to_action || null,
@@ -98,6 +100,7 @@ function mapPostTargetRow(row) {
     lastMetaEventAt: row.last_meta_event_at || null,
     lastEngagementEventAt: row.last_engagement_event_at || null,
     remoteContentState: row.remote_content_state || 'visible',
+    remoteMediaKind: row.remote_media_kind || null,
     remoteStateCheckedAt: row.remote_state_checked_at || null,
     remoteStateSource: row.remote_state_source || null,
     remoteTokenKey: row.remote_token_key || null,
@@ -136,9 +139,10 @@ export async function createPost(id, clientId, data) {
     `INSERT INTO posts (id, client_id, category_id, name, type, scheduled_at, run_on_publishers,
        publisher_count, coins_per_publisher, caption, media_url, hashtags, text_body,
        boost_enabled, boost_budget_type, boost_budget_amount, boost_spend_cap, boost_end_time,
-       boost_targeting, boost_placement, boost_bid_strategy, boost_optimization_goal, boost_objective,
+       boost_targeting, boost_placement, boost_bid_strategy, boost_bid_amount, boost_special_ad_categories,
+       boost_optimization_goal, boost_objective,
        boost_call_to_action, boost_link, boost_headline, boost_description, ad_account_id, charged_boost_paise)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(clientId),
@@ -161,6 +165,8 @@ export async function createPost(id, clientId, data) {
       data.boostTargeting ? JSON.stringify(data.boostTargeting) : null,
       data.boostPlacement ? JSON.stringify(data.boostPlacement) : null,
       data.boostBidStrategy || null,
+      data.boostBidAmount || null,
+      JSON.stringify(data.boostSpecialAdCategories || []),
       data.boostOptimizationGoal || null,
       data.boostObjective || null,
       data.boostCallToAction || null,
@@ -504,6 +510,19 @@ export async function findPostTargetsByStatus(postId, status) {
   return rows.map(mapPostTargetRow)
 }
 
+export async function findPostTargetsByPublisherRequestId(publisherRequestId) {
+  const rows = await query(
+    `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,
+       upa.avatar_url, upa.instagram_business_account_id, upa.access_token
+     FROM post_targets pt
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE pt.publisher_request_id = ?`,
+    [uuidToBuffer(publisherRequestId)]
+  )
+  return rows.map(mapPostTargetRow)
+}
+
 export async function findPostTargetsByPostIdAndTargetType(postId, targetType) {
   const rows = await query(
     `SELECT pt.*, p.code as platform_code, upa.platform_user_id, upa.platform_display_name, upa.platform_username,
@@ -577,6 +596,7 @@ export async function updatePostTargetStatus(id, data) {
   if (data.eligibilityCheckedAt !== undefined) { fields.push('eligibility_checked_at = ?'); params.push(data.eligibilityCheckedAt) }
   if (data.eligibilityReason !== undefined) { fields.push('eligibility_reason = ?'); params.push(data.eligibilityReason) }
   if (data.remoteContentState !== undefined) { fields.push('remote_content_state = ?'); params.push(data.remoteContentState) }
+  if (data.remoteMediaKind !== undefined) { fields.push('remote_media_kind = ?'); params.push(data.remoteMediaKind) }
   if (data.remoteStateCheckedAt !== undefined) { fields.push('remote_state_checked_at = ?'); params.push(data.remoteStateCheckedAt) }
   if (data.remoteStateSource !== undefined) { fields.push('remote_state_source = ?'); params.push(data.remoteStateSource) }
   if (data.remoteTokenKey !== undefined) { fields.push('remote_token_key = ?'); params.push(data.remoteTokenKey) }

@@ -1,6 +1,8 @@
 import * as service from './post.service.js'
 import * as boostPerfService from './boost-performance.service.js'
 import * as deletionService from './deletion-monitoring.service.js'
+import * as promotionService from './promotion.service.js'
+import * as promotionRepairService from './promotion-repair.service.js'
 import { findViolationTargetsByPostId, findRequestViolationInfo, findPublisherViolationSummary, findSuperAdminIds } from './deletion-monitoring.repository.js'
 import { sendSuccess, sendPaginated, sendAccepted } from '../../../shared/utils/response.utils.js'
 
@@ -223,6 +225,38 @@ export async function warnPublisher(req, res, next) {
       } catch {}
     }
     return sendSuccess(res, { warned: true }, 'Warning sent to publisher')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function adminGetPromotionDetail(req, res, next) {
+  try {
+    const result = await promotionService.adminGetPromotion(req.params.id)
+    return sendSuccess(res, result)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function getPromotionTargetRepairStatus(req, res, next) {
+  try {
+    const result = await promotionRepairService.getPromotionTargetRepairStatus(req.params.targetId)
+    return sendSuccess(res, result)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function requestPromotionTargetRepair(req, res, next) {
+  try {
+    const result = await promotionRepairService.requestRepair({
+      promotionTargetId: req.params.targetId,
+      actorId: req.user.id,
+      callToAction: req.body?.callToAction || null,
+      issueCode: req.body?.issueCode || null,
+    })
+    return sendAccepted(res, result)
   } catch (error) {
     next(error)
   }

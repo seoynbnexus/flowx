@@ -2,11 +2,15 @@ import * as repo from './campaign.repository.js'
 import * as service from './campaign.service.js'
 import * as postService from '../posts/post.service.js'
 import * as promotionService from '../posts/promotion.service.js'
+import * as promotionRepairService from '../posts/promotion-repair.service.js'
+import * as promotionStatusSyncService from '../posts/promotion-status-sync.service.js'
 import * as boostPerfService from '../posts/boost-performance.service.js'
 import * as deletionService from '../posts/deletion-monitoring.service.js'
+import * as repairService from './repair.service.js'
 import { AppError } from '../../../shared/errors/AppError.js'
 import { CAMPAIGN_JOB_TYPES } from './campaign.model.js'
 import { POST_JOB_TYPES } from '../posts/post.model.js'
+import { PROMOTION_JOB_TYPES } from '../posts/promotion.model.js'
 import { isRateLimited } from '../../../shared/services/meta-rate-limiter.js'
 import { runWithMetaRequestContext, GATE_PRIORITY } from '../../../shared/services/meta-request-gate.js'
 import { logger } from '../../../shared/utils/logger.js'
@@ -26,12 +30,14 @@ const HANDLERS = {
   [CAMPAIGN_JOB_TYPES.PUBLISHER_GO_LIVE]: (campaignId) => service.goLiveForFilledCampaign(campaignId),
   [CAMPAIGN_JOB_TYPES.APPROVE_GO_LIVE]: (campaignId, actorId, payload) => service.approveAndGoLive(campaignId, actorId, payload),
   [CAMPAIGN_JOB_TYPES.CONFIRM_GO_LIVE]: (campaignId, actorId) => service.confirmAndGoLive(campaignId, actorId),
+  [CAMPAIGN_JOB_TYPES.APPROVE_PUBLISHER]: (campaignId, actorId, payload) => service.approvePublisherFlow(campaignId, actorId, payload || {}),
   [CAMPAIGN_JOB_TYPES.RETRY_META]: (campaignId) => service.retryCampaignMeta(campaignId),
   [CAMPAIGN_JOB_TYPES.SYNC_STATUS]: (campaignId) => service.syncCampaignStatusJob(campaignId),
   [CAMPAIGN_JOB_TYPES.SYNC_INSIGHTS]: (campaignId) => service.syncCampaignInsightsJob(campaignId),
   [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_STATUS]: (campaignId, actorId, payload) => service.syncAccountStatusJob(payload?.adAccountId ?? undefined),
   [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_INSIGHTS]: (campaignId, actorId, payload) => service.syncAccountInsightsJob(payload?.adAccountId ?? undefined),
   [CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN]: (campaignId) => service.settleCampaignJob(campaignId),
+  [CAMPAIGN_JOB_TYPES.EXECUTION_REPAIR]: (campaignId, actorId, payload) => repairService.runRepairJob(payload?.repairId),
   [CAMPAIGN_JOB_TYPES.META_WEBHOOK]: async (campaignId, actorId, payload) => {
     const { processWebhookEventById } = await import('./meta-webhook.service.js')
     const eventId = payload?.eventId || campaignId
@@ -44,12 +50,14 @@ const HANDLERS = {
   [POST_JOB_TYPES.FB_REEL]: (campaignId, actorId, payload) => postService.fbReelJob(payload?.postId, payload?.targetId, payload),
   [POST_JOB_TYPES.IG_REEL]: (campaignId, actorId, payload) => postService.igReelJob(payload?.postId, payload?.targetId, payload),
   [POST_JOB_TYPES.IG_STORY]: (campaignId, actorId, payload) => postService.igVideoStoryJob(payload?.postId, payload?.targetId, payload),
+  [POST_JOB_TYPES.IG_IMAGE]: (campaignId, actorId, payload) => postService.igImageJob(payload?.postId, payload?.targetId, payload),
   [POST_JOB_TYPES.PUBLISHER_GO_LIVE]: (postId) => postService.goLiveForFilledPost(postId),
   [POST_JOB_TYPES.EXPIRE_PUBLISHER_REQUESTS]: (postId) => postService.expirePublisherPosts([postId]),
   [POST_JOB_TYPES.BOOST]: (campaignId, actorId, payload) => postService.postBoostJob(payload?.postId, payload?.postTargetId, payload),
   [POST_JOB_TYPES.SYNC_BOOST_PERFORMANCE]: (campaignId, actorId, payload) => boostPerfService.syncBoostPerformanceJob(payload || {}),
   [POST_JOB_TYPES.REMOTE_HEALTH]: (campaignId, actorId, payload) => deletionService.runRemoteHealthJob(payload || {}),
   'promotion_execute': (campaignId, actorId, payload) => promotionService.runPromotionTargetJob(payload?.promotionTargetId, payload),
+  [PROMOTION_JOB_TYPES.REPAIR]: (campaignId, actorId, payload) => promotionRepairService.runRepairJob(payload?.repairId),
 }
 
 function isPermanentError(error) {
@@ -67,12 +75,14 @@ const JOB_GATE_PRIORITY = {
   [CAMPAIGN_JOB_TYPES.PUBLISHER_GO_LIVE]: GATE_PRIORITY.HIGH,
   [CAMPAIGN_JOB_TYPES.APPROVE_GO_LIVE]: GATE_PRIORITY.HIGH,
   [CAMPAIGN_JOB_TYPES.CONFIRM_GO_LIVE]: GATE_PRIORITY.HIGH,
+  [CAMPAIGN_JOB_TYPES.APPROVE_PUBLISHER]: GATE_PRIORITY.HIGH,
   [CAMPAIGN_JOB_TYPES.RETRY_META]: GATE_PRIORITY.HIGH,
   [CAMPAIGN_JOB_TYPES.SYNC_STATUS]: GATE_PRIORITY.LOW,
   [CAMPAIGN_JOB_TYPES.SYNC_INSIGHTS]: GATE_PRIORITY.LOW,
   [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_STATUS]: GATE_PRIORITY.LOW,
   [CAMPAIGN_JOB_TYPES.SYNC_ACCOUNT_INSIGHTS]: GATE_PRIORITY.LOW,
   [CAMPAIGN_JOB_TYPES.SETTLE_CAMPAIGN]: GATE_PRIORITY.LOW,
+  [CAMPAIGN_JOB_TYPES.EXECUTION_REPAIR]: GATE_PRIORITY.LOW,
   [CAMPAIGN_JOB_TYPES.META_WEBHOOK]: GATE_PRIORITY.HIGH,
   [POST_JOB_TYPES.PUBLISH]: GATE_PRIORITY.HIGH,
   [POST_JOB_TYPES.VERIFY]: GATE_PRIORITY.HIGH,
@@ -81,12 +91,14 @@ const JOB_GATE_PRIORITY = {
   [POST_JOB_TYPES.FB_REEL]: GATE_PRIORITY.HIGH,
   [POST_JOB_TYPES.IG_REEL]: GATE_PRIORITY.HIGH,
   [POST_JOB_TYPES.IG_STORY]: GATE_PRIORITY.HIGH,
+  [POST_JOB_TYPES.IG_IMAGE]: GATE_PRIORITY.HIGH,
   [POST_JOB_TYPES.PUBLISHER_GO_LIVE]: GATE_PRIORITY.HIGH,
   [POST_JOB_TYPES.EXPIRE_PUBLISHER_REQUESTS]: GATE_PRIORITY.HIGH,
   [POST_JOB_TYPES.BOOST]: GATE_PRIORITY.HIGH,
   [POST_JOB_TYPES.SYNC_BOOST_PERFORMANCE]: GATE_PRIORITY.LOW,
   [POST_JOB_TYPES.REMOTE_HEALTH]: GATE_PRIORITY.LOW,
   promotion_execute: GATE_PRIORITY.HIGH,
+  [PROMOTION_JOB_TYPES.REPAIR]: GATE_PRIORITY.LOW,
 }
 
 export async function processDueJobs() {
@@ -338,7 +350,23 @@ async function tickSyncScheduler() {
       }
     }
     await checkMetaRateAlert()
+    try {
+      const { checkRepairAlerts } = await import('./repair.metrics.js')
+      await checkRepairAlerts()
+    } catch (err) {
+      logger.warn({ err: err?.message }, 'Repair alert sweep failed')
+    }
     await service.scheduleCampaignSyncs()
+    try {
+      await service.activateDueScheduledCampaigns()
+    } catch (err) {
+      logger.warn({ err: err?.message }, 'Scheduled-campaign activation sweep failed')
+    }
+    try {
+      await service.endExpiredCampaigns()
+    } catch (err) {
+      logger.warn({ err: err?.message }, 'Expired-campaign end sweep failed')
+    }
     await postService.schedulePostEngagementSyncs()
     try {
       await boostPerfService.schedulePostBoostPerformanceSyncs()
@@ -350,6 +378,11 @@ async function tickSyncScheduler() {
       await promotionService.recoverStuckPromotionTargets()
     } catch (err) {
       logger.warn({ err: err?.message }, 'Promotion recovery sweep failed')
+    }
+    try {
+      await promotionStatusSyncService.schedulePromotionTargetStatusSyncs()
+    } catch (err) {
+      logger.warn({ err: err?.message }, 'Promotion target status/issues sync sweep failed')
     }
     try {
       await deletionService.scheduleDeletionMonitoring()

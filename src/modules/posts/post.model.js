@@ -66,6 +66,7 @@ export const POST_JOB_TYPES = {
   FB_REEL: 'post_fb_reel',
   IG_REEL: 'post_ig_reel',
   IG_STORY: 'post_ig_story',
+  IG_IMAGE: 'post_ig_image',
   PUBLISHER_GO_LIVE: 'post_publisher_go_live',
   EXPIRE_PUBLISHER_REQUESTS: 'post_expire_publisher_requests',
   BOOST: 'post_boost',

@@ -15,6 +15,8 @@ function mapPromotionRow(row) {
     objective: row.objective || null,
     optimizationGoal: row.optimization_goal || null,
     bidStrategy: row.bid_strategy || null,
+    bidAmount: row.bid_amount != null ? Number(row.bid_amount) : null,
+    specialAdCategories: typeof row.special_ad_categories === 'string' ? JSON.parse(row.special_ad_categories) : row.special_ad_categories || [],
     targeting: typeof row.targeting === 'string' ? JSON.parse(row.targeting) : row.targeting || null,
     placement: typeof row.placement === 'string' ? JSON.parse(row.placement) : row.placement || null,
     resolvedTargeting: typeof row.resolved_targeting === 'string' ? JSON.parse(row.resolved_targeting) : row.resolved_targeting || null,
@@ -30,6 +32,7 @@ function mapPromotionRow(row) {
     chargedPaise: row.charged_paise != null ? Number(row.charged_paise) : 0,
     error: row.error || null,
     settledAt: row.settled_at || null,
+    unfilledSlotsSettledAt: row.unfilled_slots_settled_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -76,9 +79,9 @@ function toDbTimestamp(value) {
 export async function createPromotion(id, postId, clientId, data) {
   await query(
     `INSERT INTO promotions (id, post_id, client_id, status, budget_type, budget_amount, spend_cap,
-       objective, optimization_goal, bid_strategy, targeting, placement, call_to_action, link,
+       objective, optimization_goal, bid_strategy, bid_amount, special_ad_categories, targeting, placement, call_to_action, link,
        headline, description, start_at, end_at, charged_paise)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(postId),
@@ -90,6 +93,8 @@ export async function createPromotion(id, postId, clientId, data) {
       data.objective || null,
       data.optimizationGoal || null,
       data.bidStrategy || null,
+      data.bidAmount || null,
+      JSON.stringify(data.specialAdCategories || []),
       data.targeting ? JSON.stringify(data.targeting) : null,
       data.placement ? JSON.stringify(data.placement) : null,
       data.callToAction || null,
@@ -190,16 +195,29 @@ export async function findPendingPromotionTargetsForPostTargetIds(postTargetIds)
   return rows.map(mapPromotionTargetRow)
 }
 
+/**
+ * Three independent reasons a promotion_target needs a nudge, unioned in one
+ * query (all still gated on no active queued/running job for it):
+ *   1. pending, underlying post live — the original "never got its first job" case
+ *   2. validating/creating for >15min, underlying post still live — a worker
+ *      died mid-flight (crash recovery; 15min > the 10min job-stale window so
+ *      a merely-slow-but-alive worker is never falsely reclaimed here)
+ *   3. underlying post_target permanently failed — this share will never
+ *      self-heal (the post can't retroactively become "posted"), so it must
+ *      be swept regardless of promotion_target status or staleness
+ */
 export async function findStuckPendingPromotionTargets() {
   const rows = await query(
     `SELECT ptgt.* FROM promotion_targets ptgt
      JOIN post_targets pt ON pt.id = ptgt.post_target_id
      JOIN promotions pr ON pr.id = ptgt.promotion_id
-     WHERE ptgt.status = 'pending'
-       AND pt.status = 'posted'
-       AND pt.meta_object_id IS NOT NULL
+     WHERE pr.status IN ('waiting_for_post', 'validating', 'creating')
        AND pt.deletion_review_state = 'none'
-       AND pr.status IN ('waiting_for_post', 'validating', 'creating')
+       AND (
+         (ptgt.status = 'pending' AND pt.status = 'posted' AND pt.meta_object_id IS NOT NULL)
+         OR (ptgt.status IN ('validating', 'creating') AND pt.status = 'posted' AND pt.meta_object_id IS NOT NULL AND ptgt.updated_at < NOW() - INTERVAL 15 MINUTE)
+         OR (ptgt.status IN ('pending', 'validating', 'creating') AND pt.status = 'failed')
+       )
        AND NOT EXISTS (
          SELECT 1 FROM campaign_jobs j
          WHERE j.job_type = 'promotion_execute'
@@ -208,6 +226,115 @@ export async function findStuckPendingPromotionTargets() {
        )`
   )
   return rows.map(mapPromotionTargetRow)
+}
+
+/**
+ * Resets a target stuck at validating/creating (worker died mid-flight, per
+ * findStuckPendingPromotionTargets' staleness branch) back to pending so it
+ * becomes claimable again via claimPromotionTargetForCreation.
+ */
+export async function resetStalePromotionTargetToPending(id) {
+  const result = await query(
+    "UPDATE promotion_targets SET status = 'pending' WHERE id = ? AND status IN ('validating', 'creating')",
+    [uuidToBuffer(id)]
+  )
+  return result.affectedRows > 0
+}
+
+/**
+ * DB-level exactly-once claim for entering Meta object creation. Guards
+ * against the campaign_jobs stale-reclaim (10min) double-dispatching the
+ * same promotion_target while the original worker is still alive but slow —
+ * only one concurrent caller can win the pending/validating -> creating
+ * transition; the loser must stand down rather than risk creating duplicate
+ * Meta objects. Deliberately excludes 'creating' as a source (that would
+ * make the guard a no-op) — recovery for a genuinely stuck 'creating' target
+ * goes through resetStalePromotionTargetToPending first.
+ */
+export async function claimPromotionTargetForCreation(id) {
+  const result = await query(
+    "UPDATE promotion_targets SET status = 'creating' WHERE id = ? AND status IN ('pending', 'validating')",
+    [uuidToBuffer(id)]
+  )
+  return result.affectedRows > 0
+}
+
+/**
+ * Guarded active -> paused / paused -> active transitions for the deletion
+ * pause/resume paths. Without the WHERE-status guard, a concurrent cancel or
+ * confirmed-deletion settle (both plain writes on the same row) racing
+ * against pauseBoostForDeletionCandidate/resumeBoostAfterRecovery could
+ * resurrect an already-terminated target back to paused/active.
+ */
+export async function claimPromotionTargetPause(id) {
+  const result = await query(
+    "UPDATE promotion_targets SET status = 'paused' WHERE id = ? AND status = 'active'",
+    [uuidToBuffer(id)]
+  )
+  return result.affectedRows > 0
+}
+
+export async function claimPromotionTargetResume(id) {
+  const result = await query(
+    "UPDATE promotion_targets SET status = 'active' WHERE id = ? AND status = 'paused'",
+    [uuidToBuffer(id)]
+  )
+  return result.affectedRows > 0
+}
+
+/**
+ * Guarded active/paused -> needs_repair claim before a repair takes over the
+ * target's Meta objects. Exclusivity fence for the repair flow — a target
+ * already needs_repair (a repair already claimed it) or already
+ * failed/cancelled cannot be claimed again.
+ */
+export async function claimPromotionTargetForRepairSwap(id) {
+  const result = await query(
+    "UPDATE promotion_targets SET status = 'needs_repair' WHERE id = ? AND status IN ('active', 'paused')",
+    [uuidToBuffer(id)]
+  )
+  return result.affectedRows > 0
+}
+
+/**
+ * Guarded exit from needs_repair once a repair completes (toStatus='active')
+ * or is exhausted (toStatus='failed'). Only ever fires from needs_repair —
+ * a target that left the repair flow through some other path (e.g. a
+ * concurrent cancel) is never resurrected by a late-finishing repair job.
+ */
+export async function restorePromotionTargetAfterRepair(id, toStatus) {
+  const result = await query(
+    'UPDATE promotion_targets SET status = ? WHERE id = ? AND status = ?',
+    [toStatus, uuidToBuffer(id), 'needs_repair']
+  )
+  return result.affectedRows > 0
+}
+
+/**
+ * Targets due for the ad-level status+issues poll: live (active/paused)
+ * with a Meta ad object to check, oldest-synced first. Independent of the
+ * Insights-piggyback cadence (1-6h) — issue detection needs to be far
+ * faster than spend reporting for a disapproval to become actionable.
+ */
+export async function findDuePromotionTargetsForStatusSync(limit) {
+  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100))
+  const rows = await query(
+    `SELECT ptgt.*, pt.post_id, pt.status as pt_status, pt.meta_object_id as pt_meta_object_id,
+            p.code as pt_platform_code, upa.platform_user_id as pt_platform_user_id,
+            upa.instagram_business_account_id as pt_ig_business_account_id, upa.access_token as pt_access_token
+     FROM promotion_targets ptgt
+     JOIN post_targets pt ON pt.id = ptgt.post_target_id
+     JOIN user_platform_accounts upa ON upa.id = pt.platform_account_id
+     JOIN platforms p ON p.id = upa.platform_id
+     WHERE ptgt.status IN ('active', 'paused') AND ptgt.platform_ad_id IS NOT NULL
+     ORDER BY ptgt.status_synced_at IS NOT NULL, ptgt.status_synced_at ASC
+     LIMIT ${safeLimit}`
+  )
+  return rows.map(mapPromotionTargetRow)
+}
+
+export async function stampPromotionTargetStatusSync(id) {
+  await query('UPDATE promotion_targets SET status_synced_at = NOW() WHERE id = ?', [uuidToBuffer(id)])
 }
 
 export async function updatePromotionTarget(id, data) {
@@ -264,6 +391,24 @@ export async function claimPromotionSettled(id, settledAt) {
   const result = await query(
     'UPDATE promotions SET settled_at = ? WHERE id = ? AND settled_at IS NULL',
     [settledAt, uuidToBuffer(id)]
+  )
+  return result.affectedRows > 0
+}
+
+/**
+ * DB-level exactly-once claim for refunding boost slots that were charged
+ * upfront but never got a promotion_target row at all (a publisher slot
+ * nobody accepted by the response deadline). Shrinks charged_paise directly
+ * in the same guarded UPDATE — after this commits, the promotion's
+ * charged_paise correctly reflects only the slots that actually
+ * materialized (or are about to), so the existing per-target
+ * consume/refund and settlePromotionLeftover math need no further changes.
+ */
+export async function claimPromotionUnfilledSlots(id, refundPaise, settledAt) {
+  const result = await query(
+    `UPDATE promotions SET charged_paise = charged_paise - ?, unfilled_slots_settled_at = ?
+     WHERE id = ? AND unfilled_slots_settled_at IS NULL AND charged_paise >= ?`,
+    [refundPaise, settledAt, uuidToBuffer(id), refundPaise]
   )
   return result.affectedRows > 0
 }

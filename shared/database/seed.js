@@ -189,6 +189,12 @@ const APP_CONFIG_SEEDS = [
   { key: 'promotions_enabled', value: false, is_public: 0, description: 'Master feature flag for the new Promotion/PromotionTarget boost architecture. When false, no new Promotions are created or executed; the legacy post_boost path continues unchanged.' },
   { key: 'promotion_publish_trigger_enabled', value: false, is_public: 0, description: 'Wake-hook trigger flag: enqueue promotion_execute when a PostTarget becomes POSTED. Requires promotions_enabled as well. Allows staged rollout of the trigger layer.' },
   { key: 'boost_placement_fix_enabled', value: false, is_public: 0, description: 'Forward client-selected boost placement (publisher_platforms + all 4 position sets, snake-first/camel-fallback) into targeting in createAdSet. When false, legacy placement behavior (forced platform defaults) is preserved.' },
+  { key: 'campaign_execution_runtime_enabled', value: false, is_public: 0, description: 'Execution-runtime flag for Traditional Campaigns: when true, eligible CampaignExecution rows own Meta chain creation via the execution path; when false, the legacy per-user path remains authoritative. OFF by default; no production rollout.' },
+  { key: 'campaign_repair_rollout', value: 'off', is_public: 0, description: 'Repair rollout gate: off blocks all new repairs, admin_only allows admin-created repairs, enabled opens repair creation. Fail-closed default off.' },
+  { key: 'campaign_repair_execution_enabled', value: false, is_public: 0, description: 'Repair worker execution flag: when true, the repair worker may create replacement Meta objects; when false, repairs park at READY_FOR_CREATION. OFF by default.' },
+  { key: 'campaign_repair_killed', value: false, is_public: 0, description: 'Repair kill switch: when true, all repair mutations (request + worker) are refused without state changes. Emergency stop.' },
+  { key: 'campaign_repair_category_media_dimension', value: true, is_public: 0, description: 'Per-category repair gate for MEDIA_DIMENSION issues: when true, media-dimension repairs may be created. Default on.' },
+  { key: 'campaign_repair_category_client_edit', value: false, is_public: 0, description: 'Per-category repair gate for CLIENT_EDIT amendments (client-initiated creative fix on a FAILED, already-live campaign): when true, these amendments may be created. Fail-closed default off.' },
 ]
 
 const report = []

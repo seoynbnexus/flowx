@@ -293,7 +293,7 @@ describe('post engagement sync', () => {
     const result = await postService.syncPostEngagementJob(postId)
     expect(result.synced).toBe(1)
     expect(metaMocks.getMediaEngagement).toHaveBeenCalledTimes(1)
-    expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(expect.any(String), 'test_system_token', { mediaKind: 'post', platform: 'instagram' })
+    expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(expect.any(String), 'test_system_token', { mediaKind: 'post', platform: 'instagram', knownKind: null })
     const rows = await postRepo.findPostEngagement(postId)
     expect(rows).toHaveLength(1)
     expect(rows[0].likes).toBe(12)
@@ -308,7 +308,7 @@ describe('post engagement sync', () => {
     const result = await postService.syncPostEngagementJob(postId)
     expect(result.synced).toBe(1)
     expect(metaMocks.getMediaEngagement).toHaveBeenCalledTimes(2)
-    expect(metaMocks.getMediaEngagement).toHaveBeenLastCalledWith(expect.any(String), 'mock_page_token', { mediaKind: 'post', platform: 'instagram' })
+    expect(metaMocks.getMediaEngagement).toHaveBeenLastCalledWith(expect.any(String), 'mock_page_token', { mediaKind: 'post', platform: 'instagram', knownKind: null })
     const rows = await postRepo.findPostEngagement(postId)
     expect(rows).toHaveLength(1)
     expect(rows[0].likes).toBe(12)
@@ -346,7 +346,7 @@ describe('post engagement sync', () => {
     expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(String),
-      { mediaKind: 'story', platform: 'instagram' }
+      { mediaKind: 'story', platform: 'instagram', knownKind: null }
     )
     const rows = await postRepo.findPostEngagement(postId)
     expect(rows).toHaveLength(1)
@@ -378,7 +378,7 @@ describe('post engagement sync', () => {
     expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(String),
-      { mediaKind: 'story', platform: 'facebook' }
+      { mediaKind: 'story', platform: 'facebook', knownKind: null }
     )
     const rows = await postRepo.findPostEngagement(postId)
     expect(rows[0].mediaType).toBe('video')
@@ -443,7 +443,7 @@ describe('post engagement sync', () => {
     expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(String),
-      { mediaKind: 'post', platform: 'facebook' }
+      { mediaKind: 'post', platform: 'facebook', knownKind: null }
     )
 
     const rows = await postRepo.findPostEngagement(postId)
@@ -454,6 +454,40 @@ describe('post engagement sync', () => {
     expect(rows[0].views).toBe(0)
     expect(rows[0].permalink).toBe('https://www.facebook.com/photo.php?fbid=122121852308927287')
     expect(rows[0].error).toBeNull()
+  })
+
+  it('caches the confirmed FB classification and reuses it as a hint on the next sync', async () => {
+    const postId = await createPublishedPost([fbAccountId])
+    metaMocks.getMediaEngagement.mockResolvedValue({
+      mediaId: 'fb_photo_2',
+      mediaType: 'photo',
+      classifyKind: 'photo',
+      mediaProductType: null,
+      permalink: 'https://www.facebook.com/photo.php?fbid=1',
+      timestamp: '2026-08-12T09:00:00+0000',
+      likeCount: 1,
+      commentsCount: 0,
+      insights: {},
+      comments: [],
+    })
+
+    await postService.syncPostEngagementJob(postId)
+    expect(metaMocks.getMediaEngagement).toHaveBeenLastCalledWith(
+      expect.any(String), expect.any(String),
+      { mediaKind: 'post', platform: 'facebook', knownKind: null }
+    )
+
+    const targetsAfterFirst = await postRepo.findPostTargetsByPostId(postId)
+    const fbTarget = targetsAfterFirst.find(t => t.platformCode === 'facebook')
+    expect(fbTarget.remoteMediaKind).toBe('photo')
+
+    // force past the freshness floor so a second real sync runs
+    await query('UPDATE post_targets SET last_engagement_sync_at = NOW() - INTERVAL 2 HOUR WHERE id = ?', [uuidToBuffer(fbTarget.id)])
+    await postService.syncPostEngagementJob(postId)
+    expect(metaMocks.getMediaEngagement).toHaveBeenLastCalledWith(
+      expect.any(String), expect.any(String),
+      { mediaKind: 'post', platform: 'facebook', knownKind: 'photo' }
+    )
   })
 
   it('should record FB video views from video_insights', async () => {
@@ -500,6 +534,7 @@ describe('post engagement sync', () => {
     expect(metaMocks.getMediaEngagement).toHaveBeenCalledWith(expect.any(String), 'mock_page_token', {
       mediaKind: 'post',
       platform: 'facebook',
+      knownKind: null,
     })
     delete process.env.META_SYSTEM_USER_TOKEN
   })

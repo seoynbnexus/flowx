@@ -55,6 +55,7 @@
     "campaigns:activate": "node src/jobs/activate-scheduled-campaigns.js",
     "campaigns:end": "node src/jobs/end-campaigns.js",
     "campaigns:reconcile": "node src/jobs/campaigns-reconcile.js",
+    "campaigns:backfill-executions": "node src/jobs/campaigns-backfill-executions.js",
     "campaigns:handle-awaiting": "node src/jobs/handle-awaiting-publishers.js",
     "posts:cleanup": "node src/jobs/posts-cleanup.js",
     "promotions:backfill-resolved": "node src/jobs/promotions-backfill-resolved.js",

@@ -3,8 +3,13 @@ import * as adminController from './admin.controller.js'
 import { authenticate, requirePermission } from '../../../shared/middleware/auth.middleware.js'
 import { validate } from '../../../shared/middleware/validate.middleware.js'
 import { approvePostSchema, rejectPostSchema, adminPostQuerySchema, violationReviewSchema } from './post.validation.js'
+import { promotionRepairRequestSchema } from './promotion-repair.validation.js'
 
 const router = Router()
+
+router.get('/promotions/:id', authenticate, requirePermission('posts.review'), adminController.adminGetPromotionDetail)
+router.get('/promotions/:id/targets/:targetId/repair-status', authenticate, requirePermission('posts.review'), adminController.getPromotionTargetRepairStatus)
+router.post('/promotions/:id/targets/:targetId/repair', authenticate, requirePermission('posts.manage'), validate(promotionRepairRequestSchema), adminController.requestPromotionTargetRepair)
 
 router.get('/', authenticate, requirePermission('posts.review'), validate(adminPostQuerySchema, 'query'), adminController.listAllPosts)
 router.get('/flagged', authenticate, requirePermission('posts.review'), adminController.getFlaggedPosts)

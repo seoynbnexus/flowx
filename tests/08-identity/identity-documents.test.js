@@ -72,6 +72,23 @@ describe('identity documents', () => {
     expect(result.documents.length).toBeGreaterThanOrEqual(1)
   })
 
+  it('should filter documents by documentType', async () => {
+    const result = await identityService.listAll({ page: 1, limit: 100, documentType: 'aadhaar' })
+    expect(result.documents.length).toBeGreaterThanOrEqual(1)
+    expect(result.documents.every(d => d.documentType === 'aadhaar')).toBe(true)
+  })
+
+  it('should filter documents by search (matches user email)', async () => {
+    const result = await identityService.listAll({ page: 1, limit: 100, search: testUser.email })
+    expect(result.documents.length).toBeGreaterThanOrEqual(1)
+    expect(result.documents.every(d => d.userEmail === testUser.email)).toBe(true)
+  })
+
+  it('should return empty results for a search that matches nothing', async () => {
+    const result = await identityService.listAll({ page: 1, limit: 100, search: `nonexistent-${dateTag}-xyz` })
+    expect(result.documents).toEqual([])
+  })
+
   it('should replace unverified document on re-upload', async () => {
     const mockFile2 = { filename: `test-${dateTag}-v2.jpg`, path: `/uploads/identity/test-${dateTag}-v2.jpg`, mimetype: 'image/jpeg' }
     const newDoc = await identityService.upload(testUser.id, 'drivers_license', mockFile2)

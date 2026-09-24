@@ -5,6 +5,7 @@ import {
   createAdSet,
   createAdCreative,
   createAdCreativeFromInstagramPost,
+  createAdCreativeFromPost,
   getConnectedFacebookPage,
   createAd,
   listAccountAds,
@@ -64,6 +65,40 @@ describe('meta ads validate_only support', () => {
     const [, options] = apiFetch.mock.calls[0]
     expect(options.body).toContain('execution_options')
     expect(options.body).toContain('validate_only')
+  })
+
+  it('should send link_data (not video_data) for a plain image/link creative', async () => {
+    await createAdCreative('act_1', 'page_1', 'msg', 'https://example.com/img.jpg', 'OPEN_LINK', 'tok', {})
+    const [, options] = apiFetch.mock.calls[0]
+    const params = Object.fromEntries(new URLSearchParams(options.body))
+    const spec = JSON.parse(params.object_story_spec)
+    expect(spec.link_data).toBeTruthy()
+    expect(spec.link_data.link).toBe('https://example.com/img.jpg')
+    expect(spec.video_data).toBeUndefined()
+  })
+
+  it('should send video_data (not link_data) when extra.video.videoId is provided, even if mediaUrl is also set', async () => {
+    // Regression: object_story_spec must never carry both link_data and
+    // video_data — Meta treats a raw video URL passed as link_data.link as a
+    // webpage to scrape for a link-preview thumbnail (producing a tiny/broken
+    // fallback image), which is the root cause of a live "media not wide
+    // enough" delivery rejection for otherwise-valid, correctly-sized videos.
+    await createAdCreative('act_1', 'page_1', 'msg', 'https://example.com/video.mp4', 'OPEN_LINK', 'tok', { video: { videoId: 'vid_123' } })
+    const [, options] = apiFetch.mock.calls[0]
+    const params = Object.fromEntries(new URLSearchParams(options.body))
+    const spec = JSON.parse(params.object_story_spec)
+    expect(spec.video_data).toBeTruthy()
+    expect(spec.video_data.video_id).toBe('vid_123')
+    expect(spec.link_data).toBeUndefined()
+  })
+
+  it('should send video_data with no mediaUrl at all (the campaign video-upload path)', async () => {
+    await createAdCreative('act_1', 'page_1', 'msg', null, 'OPEN_LINK', 'tok', { video: { videoId: 'vid_456' } })
+    const [, options] = apiFetch.mock.calls[0]
+    const params = Object.fromEntries(new URLSearchParams(options.body))
+    const spec = JSON.parse(params.object_story_spec)
+    expect(spec.video_data.video_id).toBe('vid_456')
+    expect(spec.link_data).toBeUndefined()
   })
 
   it('should append execution_options validate_only when createAd runs in validate mode', async () => {
@@ -294,6 +329,47 @@ describe('getFacebookMediaEngagement hybrid token handling', () => {
     expect(insightsUrls[0]).toContain('access_token=owner_token')
     delete process.env.META_SYSTEM_USER_TOKEN
   })
+
+  it('returns classifyKind alongside mediaType so the caller can cache the confirmed classification', async () => {
+    apiFetch.mockReset()
+    apiFetch.mockResolvedValueOnce(errJson(100, 'video fields fail')) // video fails
+      .mockResolvedValueOnce(okJson({ id: 'photo1', permalink_url: 'https://facebook.com/photo.php?fbid=1' })) // photo succeeds
+      .mockResolvedValueOnce(okJson({ data: [] })) // comments
+    const result = await getMediaEngagement('photo1', 'owner_token', { platform: 'facebook' })
+    expect(result.mediaType).toBe('photo')
+    expect(result.classifyKind).toBe('photo')
+  })
+
+  it('a cached knownKind is tried first — a photo target costs exactly one classify call instead of two', async () => {
+    apiFetch.mockReset()
+    apiFetch.mockResolvedValueOnce(okJson({ id: 'photo1', permalink_url: 'https://facebook.com/photo.php?fbid=1' })) // photo succeeds on the FIRST attempt
+      .mockResolvedValueOnce(okJson({ data: [] })) // comments
+    const result = await getMediaEngagement('photo1', 'owner_token', { platform: 'facebook', knownKind: 'photo' })
+    expect(result.mediaType).toBe('photo')
+    // exactly 2 calls total (classify + comments) — no wasted video-fields
+    // attempt, unlike the no-hint path which costs a guaranteed-failing
+    // video attempt before photo succeeds
+    expect(apiFetch).toHaveBeenCalledTimes(2)
+    // FB_VIDEO_FIELDS uniquely includes 'length' — its absence here proves
+    // the video-fields attempt was skipped, not just that it happened to fail
+    const classifyCall = apiFetch.mock.calls[0]
+    expect(String(classifyCall[0])).not.toContain('length')
+  })
+
+  it('a stale/wrong knownKind self-heals by falling through to the full classify loop', async () => {
+    apiFetch.mockReset()
+    // knownKind says 'video' but the object is actually a post — the video
+    // attempt (tried first per the hint) fails, then photo fails, then post
+    // succeeds, exactly like having no hint at all.
+    apiFetch.mockResolvedValueOnce(errJson(100, 'not a video')) // hinted video attempt fails
+      .mockResolvedValueOnce(errJson(100, 'not a photo')) // photo fails
+      .mockResolvedValueOnce(okJson(postObject)) // post succeeds
+      .mockResolvedValueOnce(errJson(100, 'insights unsupported'))
+      .mockResolvedValueOnce(okJson({ data: [] }))
+    const result = await getMediaEngagement('page_123', 'owner_token', { platform: 'facebook', knownKind: 'video' })
+    expect(result.mediaType).toBe('post')
+    expect(result.classifyKind).toBe('post')
+  })
 })
 
 describe('createAdCreativeFromInstagramPost minimal-first behavior', () => {
@@ -345,6 +421,40 @@ describe('createAdCreativeFromInstagramPost minimal-first behavior', () => {
     apiFetch.mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Unsupported post type', code: 100, error_subcode: 1487472 } }), { status: 400, headers: { 'content-type': 'application/json' } }))
     await expect(createAdCreativeFromInstagramPost('act_1', 'ig_media_1', 'ig_actor_1', 'page_1', 'Boost', 'tok', false)).rejects.toThrow()
     expect(apiFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('should include call_to_action_type at the top level when provided (minimal path)', async () => {
+    apiFetch.mockResolvedValueOnce(okJson({ id: 'creative_1' }))
+    await createAdCreativeFromInstagramPost('act_1', 'ig_media_1', 'ig_actor_1', 'page_1', 'Boost', 'tok', false, 'SHOP_NOW')
+    expect(apiFetch.mock.calls[0][1].body).toContain('call_to_action_type')
+    expect(apiFetch.mock.calls[0][1].body).toContain('SHOP_NOW')
+  })
+
+  it('should omit call_to_action_type when not provided', async () => {
+    apiFetch.mockResolvedValueOnce(okJson({ id: 'creative_1' }))
+    await createAdCreativeFromInstagramPost('act_1', 'ig_media_1', 'ig_actor_1', 'page_1', 'Boost', 'tok', false)
+    expect(apiFetch.mock.calls[0][1].body).not.toContain('call_to_action_type')
+  })
+})
+
+describe('createAdCreativeFromPost call_to_action_type forwarding (existing-post boost, no link/headline/description override)', () => {
+  beforeEach(() => {
+    apiFetch.mockReset()
+  })
+
+  it('should include call_to_action_type alongside object_story_id when provided', async () => {
+    apiFetch.mockResolvedValueOnce(okJson({ id: 'creative_1' }))
+    await createAdCreativeFromPost('act_1', 'page_1_post_1', 'Boost', 'tok', false, 'LEARN_MORE')
+    const [, options] = apiFetch.mock.calls[0]
+    expect(options.body).toContain('object_story_id')
+    expect(options.body).toContain('call_to_action_type')
+    expect(options.body).toContain('LEARN_MORE')
+  })
+
+  it('should omit call_to_action_type when not provided', async () => {
+    apiFetch.mockResolvedValueOnce(okJson({ id: 'creative_1' }))
+    await createAdCreativeFromPost('act_1', 'page_1_post_1', 'Boost', 'tok', false)
+    expect(apiFetch.mock.calls[0][1].body).not.toContain('call_to_action_type')
   })
 })
 

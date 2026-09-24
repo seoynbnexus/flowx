@@ -169,6 +169,121 @@ export async function getAiUsage(req, res, next) {
   }
 }
 
+export async function getPublishers(req, res, next) {
+  try {
+    const [roleBreakdown, totals, topEarners, campaignStatusRows, postStatusRows, totalPayout, connectedAccounts] = await Promise.all([
+      query(`
+        SELECT r.code as role, COUNT(DISTINCT ur.user_id) as count
+        FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        GROUP BY r.code
+      `),
+      queryOne(`
+        SELECT
+          COUNT(*) as totalPublishers,
+          SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM campaign_publisher_requests cpr WHERE cpr.publisher_id = u.id AND cpr.status = 'accepted'
+          ) OR EXISTS (
+            SELECT 1 FROM post_publisher_requests ppr WHERE ppr.publisher_id = u.id AND ppr.status = 'accepted'
+          ) THEN 1 ELSE 0 END) as activePublishers
+        FROM users u
+        WHERE u.id IN (SELECT user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.code = 'publisher')
+      `),
+      query(`
+        SELECT u.id, u.email, up.first_name, up.last_name,
+               COALESCE(SUM(t.amount), 0) as totalEarned
+        FROM users u
+        LEFT JOIN user_profiles up ON up.user_id = u.id
+        JOIN transactions t ON t.user_id = u.id AND t.type = 'credit' AND t.reference_type IN ('campaign', 'post')
+        WHERE u.id IN (SELECT user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.code = 'publisher')
+        GROUP BY u.id, u.email, up.first_name, up.last_name
+        ORDER BY totalEarned DESC
+        LIMIT 10
+      `),
+      query(`SELECT status, COUNT(*) as cnt FROM campaign_publisher_requests GROUP BY status`),
+      query(`SELECT status, COUNT(*) as cnt FROM post_publisher_requests GROUP BY status`),
+      queryOne(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'credit' AND reference_type IN ('campaign', 'post')`),
+      queryOne(`
+        SELECT COUNT(*) as total FROM user_platform_accounts upa
+        WHERE upa.verification_status = 'verified'
+          AND upa.user_id IN (SELECT user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.code = 'publisher')
+      `),
+    ]);
+
+    return sendSuccess(res, {
+      roleBreakdown: roleBreakdown.map(r => ({ role: r.role, count: Number(r.count) })),
+      totalPublishers: Number(totals?.totalPublishers || 0),
+      activePublishers: Number(totals?.activePublishers || 0),
+      totalPayoutCoins: Number(totalPayout?.total || 0),
+      totalConnectedAccounts: Number(connectedAccounts?.total || 0),
+      topEarners: topEarners.map(r => ({
+        id: bufferToUuid(r.id),
+        email: r.email,
+        name: [r.first_name, r.last_name].filter(Boolean).join(' ') || null,
+        totalEarned: Number(r.totalEarned) || 0,
+      })),
+      campaignRequestsByStatus: Object.fromEntries(campaignStatusRows.map(r => [r.status, Number(r.cnt)])),
+      postRequestsByStatus: Object.fromEntries(postStatusRows.map(r => [r.status, Number(r.cnt)])),
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function getClients(req, res, next) {
+  try {
+    const [totals, topSpenders, campaignStatusRows, postStatusRows, connectedAccounts] = await Promise.all([
+      queryOne(`
+        SELECT
+          COUNT(*) as totalClients,
+          SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM campaigns c WHERE c.client_id = u.id AND c.deleted_at IS NULL
+          ) OR EXISTS (
+            SELECT 1 FROM posts p WHERE p.client_id = u.id AND p.deleted_at IS NULL
+          ) THEN 1 ELSE 0 END) as activeClients
+        FROM users u
+        WHERE u.id IN (SELECT user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.code = 'client')
+      `),
+      query(`
+        SELECT u.id, u.email, up.first_name, up.last_name,
+               COALESCE(SUM(c.charged_ad_budget_paise), 0) as totalSpentPaise,
+               COUNT(DISTINCT c.id) as campaignCount
+        FROM users u
+        LEFT JOIN user_profiles up ON up.user_id = u.id
+        JOIN campaigns c ON c.client_id = u.id AND c.deleted_at IS NULL
+        WHERE u.id IN (SELECT user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.code = 'client')
+        GROUP BY u.id, u.email, up.first_name, up.last_name
+        ORDER BY totalSpentPaise DESC
+        LIMIT 10
+      `),
+      query(`SELECT status, COUNT(*) as cnt FROM campaigns WHERE deleted_at IS NULL GROUP BY status`),
+      query(`SELECT status, COUNT(*) as cnt FROM posts WHERE deleted_at IS NULL GROUP BY status`),
+      queryOne(`
+        SELECT COUNT(*) as total FROM user_platform_accounts upa
+        WHERE upa.verification_status = 'verified'
+          AND upa.user_id IN (SELECT user_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.code = 'client')
+      `),
+    ]);
+
+    return sendSuccess(res, {
+      totalClients: Number(totals?.totalClients || 0),
+      activeClients: Number(totals?.activeClients || 0),
+      totalConnectedAccounts: Number(connectedAccounts?.total || 0),
+      topSpenders: topSpenders.map(r => ({
+        id: bufferToUuid(r.id),
+        email: r.email,
+        name: [r.first_name, r.last_name].filter(Boolean).join(' ') || null,
+        totalSpentPaise: Number(r.totalSpentPaise) || 0,
+        campaignCount: Number(r.campaignCount) || 0,
+      })),
+      campaignsByStatus: Object.fromEntries(campaignStatusRows.map(r => [r.status, Number(r.cnt)])),
+      postsByStatus: Object.fromEntries(postStatusRows.map(r => [r.status, Number(r.cnt)])),
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
 export async function getEconomy(req, res, next) {
   try {
     const [walletStats, totalCredits, totalDebits] = await Promise.all([

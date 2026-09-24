@@ -8,6 +8,61 @@ import path from 'path'
 
 const dateTag = Date.now()
 
+function pngBuffer(width, height) {
+  const buf = Buffer.alloc(29)
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buf, 0)
+  buf.writeUInt32BE(13, 8)
+  buf.write('IHDR', 12)
+  buf.writeUInt32BE(width, 16)
+  buf.writeUInt32BE(height, 20)
+  return buf
+}
+
+function box(type, body) {
+  const b = Buffer.alloc(8 + body.length)
+  b.writeUInt32BE(8 + body.length, 0)
+  b.write(type, 4, 'ascii')
+  body.copy(b, 8)
+  return b
+}
+
+function u32(n) {
+  const b = Buffer.alloc(4)
+  b.writeUInt32BE(n, 0)
+  return b
+}
+
+function u16(n) {
+  const b = Buffer.alloc(2)
+  b.writeUInt16BE(n, 0)
+  return b
+}
+
+function mp4Buffer({ duration = 15000, timescale = 1000, width = 1080, height = 1920, codec = 'avc1' } = {}) {
+  const matrix = Buffer.alloc(36)
+  matrix.writeInt32BE(0x10000, 0)
+  matrix.writeInt32BE(0x10000, 20)
+  const mvhd = box('mvhd', Buffer.concat([
+    u32(0), u32(0), u32(0), u32(timescale), u32(duration), u32(0x10000), u16(0x100), u16(0),
+    Buffer.alloc(8), matrix, Buffer.alloc(24), u32(2),
+  ]))
+  const entry = box(codec, Buffer.concat([
+    u16(0), u16(0), u16(0), u16(0), u16(0), u16(1), u16(0), u16(0), u16(0), u16(0),
+    u16(0), u16(0), u16(0), u16(0), u16(width), u16(height), u32(0x480000), u16(0), u16(0),
+    u32(0), u16(0x18), u16(0xffff), Buffer.alloc(32), u16(0x18), u16(0xffff),
+  ]))
+  const stsd = box('stsd', Buffer.concat([u32(0), u32(1), entry]))
+  const minf = box('minf', box('stbl', stsd))
+  const mdia = box('mdia', minf)
+  const tkhd = box('tkhd', Buffer.concat([
+    u32(0), u32(9), u32(0), u32(1), u32(0), u32(duration), Buffer.alloc(8),
+    u16(0), u16(0), u16(0x100), u16(0), matrix, u32(width << 16), u32(height << 16),
+  ]))
+  const moov = box('moov', Buffer.concat([mvhd, box('trak', Buffer.concat([tkhd, mdia]))]))
+  const ftyp = box('ftyp', Buffer.concat([Buffer.from('isom'), u32(0), Buffer.from('isom')]))
+  return Buffer.concat([ftyp, moov])
+}
+
 describe('media library', () => {
   let testUser, adminId
   const createdAssets = []
@@ -60,6 +115,54 @@ describe('media library', () => {
     const asset = await mediaService.uploadMedia(testUser.id, file, { name: 'reel' })
     expect(asset.mediaKind).toBe('video')
     createdAssets.push(path.join('public/uploads/posts', file.filename))
+  })
+
+  it('accepts a real compliant image, recording its probed dimensions', async () => {
+    const filename = `real-ok-${dateTag}.png`
+    const fileOnDisk = path.join('public/uploads/posts', filename)
+    await fs.writeFile(fileOnDisk, pngBuffer(800, 600))
+    createdAssets.push(fileOnDisk)
+    const file = { filename, path: fileOnDisk, size: 29, mimetype: 'image/png' }
+    const asset = await mediaService.uploadMedia(testUser.id, file, { name: 'real image' })
+    expect(asset.width).toBe(800)
+    expect(asset.height).toBe(600)
+  })
+
+  it('rejects a real too-narrow image and deletes the uploaded file', async () => {
+    const filename = `real-narrow-${dateTag}.png`
+    const fileOnDisk = path.join('public/uploads/posts', filename)
+    await fs.writeFile(fileOnDisk, pngBuffer(300, 300))
+    const file = { filename, path: fileOnDisk, size: 29, mimetype: 'image/png' }
+    await expect(mediaService.uploadMedia(testUser.id, file)).rejects.toThrow(/500px/)
+    await expect(fs.access(fileOnDisk)).rejects.toThrow()
+  })
+
+  it('accepts a real compliant video, recording its probed dimensions', async () => {
+    const filename = `real-video-ok-${dateTag}.mp4`
+    const fileOnDisk = path.join('public/uploads/posts', filename)
+    await fs.writeFile(fileOnDisk, mp4Buffer({ codec: 'avc1', width: 1080, height: 1920 }))
+    createdAssets.push(fileOnDisk)
+    const file = { filename, path: fileOnDisk, size: 4096, mimetype: 'video/mp4' }
+    const asset = await mediaService.uploadMedia(testUser.id, file, { name: 'real video' })
+    expect(asset.width).toBe(1080)
+    expect(asset.height).toBe(1920)
+  })
+
+  it('rejects a real video with an unsupported codec and deletes the uploaded file', async () => {
+    const filename = `real-video-bad-codec-${dateTag}.mp4`
+    const fileOnDisk = path.join('public/uploads/posts', filename)
+    await fs.writeFile(fileOnDisk, mp4Buffer({ codec: 'mp4a' }))
+    const file = { filename, path: fileOnDisk, size: 4096, mimetype: 'video/mp4' }
+    await expect(mediaService.uploadMedia(testUser.id, file)).rejects.toThrow(/unsupported codec/)
+    await expect(fs.access(fileOnDisk)).rejects.toThrow()
+  })
+
+  it('does not block an upload whose file cannot be probed (missing on disk)', async () => {
+    // Preserves prior best-effort behavior: probing failure never blocks upload
+    const file = { filename: `unreachable-${dateTag}.png`, path: '/nonexistent/path.png', size: 29, mimetype: 'image/png' }
+    const asset = await mediaService.uploadMedia(testUser.id, file)
+    expect(asset.width).toBeNull()
+    expect(asset.height).toBeNull()
   })
 
   it('enforces the per-file size cap', async () => {

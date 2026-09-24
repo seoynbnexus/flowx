@@ -206,6 +206,12 @@ export async function getPublisherConnectedAccounts(publisherId) {
   return Number(row?.total || 0)
 }
 
+export async function getClientConnectedAccounts(clientId) {
+  const { uuidToBuffer } = await import('../../../shared/utils/uuid.utils.js')
+  const row = await queryOne('SELECT COUNT(*) as total FROM user_platform_accounts WHERE user_id = ? AND verification_status = ?', [uuidToBuffer(clientId), 'verified'])
+  return Number(row?.total || 0)
+}
+
 export async function getAdminCampaignStats() {
   const [totalRow, statusRows, unsettledRow, failedJobsRow] = await Promise.all([
     queryOne('SELECT COUNT(*) as total FROM campaigns WHERE deleted_at IS NULL'),

@@ -56,7 +56,7 @@ describe('publisher platforms', () => {
   })
 
   it('should list all accounts as admin', async () => {
-    const result = await publisherService.listAllAccounts({})
+    const result = await publisherService.listAllAccounts({ page: 1, limit: 20 })
     expect(Array.isArray(result.accounts)).toBe(true)
     expect(typeof result.total).toBe('number')
   })
@@ -75,5 +75,23 @@ describe('publisher platforms', () => {
 
   it('should reject verification of non-existent account', async () => {
     await expect(publisherService.verifyAccount(generateUuid(), 'verified', adminId || testUser.id)).rejects.toThrow(/not found/i)
+  })
+
+  it('should filter accounts by platformCode', async () => {
+    if (!facebookPlatformId) return
+    const result = await publisherService.listAllAccounts({ page: 1, limit: 100, platformCode: 'facebook' })
+    expect(result.accounts.length).toBeGreaterThan(0)
+    expect(result.accounts.every(a => a.platformCode === 'facebook')).toBe(true)
+  })
+
+  it('should filter accounts by search (matches user email)', async () => {
+    const result = await publisherService.listAllAccounts({ page: 1, limit: 100, search: testUser.email })
+    expect(result.accounts.length).toBeGreaterThan(0)
+    expect(result.accounts.every(a => a.userEmail === testUser.email)).toBe(true)
+  })
+
+  it('should return empty results for a search that matches nothing', async () => {
+    const result = await publisherService.listAllAccounts({ page: 1, limit: 100, search: `nonexistent-${dateTag}-xyz` })
+    expect(result.accounts).toEqual([])
   })
 })

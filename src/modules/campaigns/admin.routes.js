@@ -2,7 +2,7 @@ import { Router } from 'express'
 import * as adminController from './admin.controller.js'
 import { authenticate, requirePermission } from '../../../shared/middleware/auth.middleware.js'
 import { validate } from '../../../shared/middleware/validate.middleware.js'
-import { approveCampaignSchema, rejectCampaignSchema, adminCampaignQuerySchema, coinConversionRateSchema, metaAdAccountSchema, metaAdAccountUpdateSchema } from './campaign.validation.js'
+import { approveCampaignSchema, rejectCampaignSchema, adminCampaignQuerySchema, coinConversionRateSchema, metaAdAccountSchema, metaAdAccountUpdateSchema, repairRequestSchema } from './campaign.validation.js'
 
 const router = Router()
 
@@ -20,6 +20,11 @@ router.post('/:id/reject', authenticate, requirePermission('campaigns.review'), 
 router.post('/:id/retry-meta', authenticate, requirePermission('campaigns.review'), adminController.retryCampaignMeta)
 router.post('/:id/force-go-live', authenticate, requirePermission('campaigns.force-manage'), adminController.forceGoLive)
 router.post('/:id/force-cancel', authenticate, requirePermission('campaigns.force-manage'), adminController.forceCancel)
+router.get('/:id/insights', authenticate, requirePermission('campaigns.review'), adminController.getCampaignInsights)
+router.post('/:campaignId/executions/:executionId/repairs', authenticate, requirePermission('campaigns.review'), validate(repairRequestSchema), adminController.requestExecutionRepair)
+router.get('/:campaignId/executions/:executionId/repair-status', authenticate, requirePermission('campaigns.review'), adminController.getExecutionRepairStatus)
+router.post('/:campaignId/executions/:executionId/repair-preview', authenticate, requirePermission('campaigns.review'), validate(repairRequestSchema), adminController.previewExecutionRepair)
+router.get('/repairs/readiness', authenticate, requirePermission('campaigns.review'), adminController.getRepairReadiness)
 router.put('/conversion-rate', authenticate, requirePermission('campaigns.review'), validate(coinConversionRateSchema), adminController.updateConversionRate)
 
 export default router

@@ -18,6 +18,8 @@ export const deleteAccountSchema = z.object({
 
 export const listAccountsQuerySchema = z.object({
   status: z.enum(['pending', 'verified', 'rejected']).optional(),
+  platformCode: z.enum(['facebook', 'instagram']).optional(),
+  search: z.string().max(255).optional(),
   page: z.coerce.number().int().positive().optional().default(1),
   limit: z.coerce.number().int().positive().max(100).optional().default(20),
 });

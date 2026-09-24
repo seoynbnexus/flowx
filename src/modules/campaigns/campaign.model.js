@@ -45,6 +45,10 @@ export const BUDGET_TYPES = {
   LIFETIME: 'lifetime',
 }
 
+export const META_SPECIAL_AD_CATEGORIES = ['CREDIT', 'EMPLOYMENT', 'HOUSING', 'SOCIAL_ISSUES_ELECTIONS_POLITICS', 'ONLINE_GAMBLING_AND_GAMING']
+
+export const BID_STRATEGIES_REQUIRING_BID_AMOUNT = new Set(['LOWEST_COST_WITH_BID_CAP', 'TARGET_COST', 'COST_CAP'])
+
 export const REVIEW_ACTIONS = {
   SUBMITTED: 'submitted',
   APPROVED: 'approved',
@@ -59,6 +63,7 @@ export const CAMPAIGN_JOB_TYPES = {
   PUBLISHER_GO_LIVE: 'publisher_go_live',
   APPROVE_GO_LIVE: 'approve_go_live',
   CONFIRM_GO_LIVE: 'confirm_go_live',
+  APPROVE_PUBLISHER: 'approve_publisher',
   RETRY_META: 'retry_meta',
   SYNC_STATUS: 'sync_status',
   SYNC_INSIGHTS: 'sync_insights',
@@ -66,6 +71,7 @@ export const CAMPAIGN_JOB_TYPES = {
   SYNC_ACCOUNT_INSIGHTS: 'sync_account_insights',
   SETTLE_CAMPAIGN: 'settle_campaign',
   META_WEBHOOK: 'meta_webhook',
+  EXECUTION_REPAIR: 'execution_repair',
 }
 
 export const META_STATUS = {
@@ -80,6 +86,12 @@ export const META_STATUS = {
   WITH_ISSUES: 'with_issues',
   PREAPPROVED: 'preapproved',
   DELETED: 'deleted',
+}
+
+export const META_ISSUE_MESSAGES = {
+  [META_STATUS.WITH_ISSUES]: 'Meta reported an issue with this campaign — it may not be delivering. Check Meta Ads Manager for the exact reason.',
+  [META_STATUS.PENDING_BILLING_INFO]: 'Meta reports that billing information requires attention before ads can deliver normally.',
+  [META_STATUS.PENDING_REVIEW]: 'Meta is reviewing this campaign — delivery may be limited until review completes.',
 }
 
 export const BILLING_ENTRY_KINDS = {

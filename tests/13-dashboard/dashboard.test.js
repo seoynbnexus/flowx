@@ -32,6 +32,8 @@ describe('dashboard endpoints', () => {
     expect(res.body.data).toHaveProperty('posts')
     expect(res.body.data).toHaveProperty('wallet')
     expect(res.body.data.wallet).toHaveProperty('balance')
+    expect(res.body.data).toHaveProperty('accounts')
+    expect(res.body.data.accounts).toHaveProperty('connected')
     expect(res.body.data).toHaveProperty('engagement')
     expect(res.body.data.engagement).toHaveProperty('daily')
   })
@@ -68,6 +70,29 @@ describe('dashboard endpoints', () => {
 
   it('rejects publisher dashboard for client', async () => {
     const res = await supertest(app).get('/api/v1/dashboard/publisher').set('Authorization', `Bearer ${clientToken}`)
+    expect(res.status).toBe(403)
+  })
+
+  it('admin can view an arbitrary publisher\'s dashboard by id', async () => {
+    const res = await supertest(app).get(`/api/v1/dashboard/admin/publishers/${publisherId}`).set('Authorization', `Bearer ${adminToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveProperty('earnings')
+    expect(res.body.data.earnings).toHaveProperty('currentBalance')
+    expect(res.body.data).toHaveProperty('requests')
+    expect(res.body.data).toHaveProperty('accounts')
+  })
+
+  it('admin can view an arbitrary client\'s dashboard by id', async () => {
+    const res = await supertest(app).get(`/api/v1/dashboard/admin/clients/${clientId}`).set('Authorization', `Bearer ${adminToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveProperty('campaigns')
+    expect(res.body.data).toHaveProperty('wallet')
+    expect(res.body.data).toHaveProperty('accounts')
+    expect(res.body.data.accounts).toHaveProperty('connected')
+  })
+
+  it('rejects a non-admin from viewing another user\'s admin dashboard view', async () => {
+    const res = await supertest(app).get(`/api/v1/dashboard/admin/publishers/${publisherId}`).set('Authorization', `Bearer ${clientToken}`)
     expect(res.status).toBe(403)
   })
 })

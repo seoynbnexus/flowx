@@ -4,6 +4,8 @@ import * as promoRepo from './promotion.repository.js'
 import { NotFoundError, ForbiddenError } from '../../../shared/errors/AppError.js'
 import { POST_JOB_TYPES } from './post.model.js'
 import { PROMOTION_TARGET_STATUS } from './promotion.model.js'
+import { classifyIssueCode, normalizeIssuesInfo, isBoostRepairableCategory } from '../../../shared/services/meta-issue-catalog.js'
+import { isRepairCategoryEnabled } from './promotion-repair.service.js'
 import { resolveAccountContext } from '../campaigns/campaign.service.js'
 import {
   findAutoJobByRunKey,
@@ -67,7 +69,7 @@ async function notifyAdmin(subject, message) {
  * - PENDING_REVIEW/PENDING_BILLING_INFO/WITH_ISSUES/PREAPPROVED and unknown
  *   states -> log-only, no state churn.
  */
-export async function applyBoostMetaStatus(ref, metaStatus) {
+export async function applyBoostMetaStatus(ref, metaStatus, issuesInfo = null) {
   const status = String(metaStatus || '').toUpperCase()
   if (!ref || !status) return { applied: false }
 
@@ -96,6 +98,25 @@ export async function applyBoostMetaStatus(ref, metaStatus) {
       return { applied: true, statusAfter: 'paused' }
     }
     if (['DISAPPROVED', 'REJECTED'].includes(status)) {
+      // Only the new status-sync job ever passes issuesInfo — the webhook
+      // handlers and the Insights-piggyback poll never fetch issues_info,
+      // so they keep hitting today's exact FAILED write below, unchanged.
+      if (Array.isArray(issuesInfo) && issuesInfo.length) {
+        try {
+          const normalized = normalizeIssuesInfo(issuesInfo)
+          const repairableIssue = normalized.find((issue) => isBoostRepairableCategory(classifyIssueCode(issue.errorCode).category))
+          if (repairableIssue && await isRepairCategoryEnabled(classifyIssueCode(repairableIssue.errorCode).category)) {
+            const claimed = await promoRepo.claimPromotionTargetForRepairSwap(ptgt.id)
+            if (claimed) {
+              await refreshPromotionStatus(ptgt.promotionId)
+              await logMetaEvent({ action: 'boost_target_needs_repair', promotionTargetId: ptgt.id, postTargetId: ref.postTargetId, status, errorCode: repairableIssue.errorCode })
+              return { applied: true, statusAfter: 'needs_repair' }
+            }
+          }
+        } catch (err) {
+          await logMetaEvent({ action: 'boost_repair_classification_error', promotionTargetId: ptgt.id, error: err?.message || String(err) })
+        }
+      }
       await promoRepo.updatePromotionTarget(ptgt.id, {
         status: PROMOTION_TARGET_STATUS.FAILED,
         error: 'Ad disapproved by Meta',

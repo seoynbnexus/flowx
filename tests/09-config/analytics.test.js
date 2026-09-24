@@ -51,4 +51,30 @@ describe('analytics admin', () => {
     expect(data).toHaveProperty('totalWallets')
     expect(data).toHaveProperty('totalCoinsInSystem')
   })
+
+  it('should return publisher analytics', async () => {
+    const { req, res, json } = mockReqRes()
+    await analyticsController.getPublishers(req, res)
+    const data = json[0].data
+    expect(Array.isArray(data.roleBreakdown)).toBe(true)
+    expect(data).toHaveProperty('totalPublishers')
+    expect(data).toHaveProperty('activePublishers')
+    expect(data).toHaveProperty('totalPayoutCoins')
+    expect(data).toHaveProperty('totalConnectedAccounts')
+    expect(Array.isArray(data.topEarners)).toBe(true)
+    expect(data).toHaveProperty('campaignRequestsByStatus')
+    expect(data).toHaveProperty('postRequestsByStatus')
+  })
+
+  it('should return client analytics', async () => {
+    const { req, res, json } = mockReqRes()
+    await analyticsController.getClients(req, res)
+    const data = json[0].data
+    expect(data).toHaveProperty('totalClients')
+    expect(data).toHaveProperty('activeClients')
+    expect(data).toHaveProperty('totalConnectedAccounts')
+    expect(Array.isArray(data.topSpenders)).toBe(true)
+    expect(data).toHaveProperty('campaignsByStatus')
+    expect(data).toHaveProperty('postsByStatus')
+  })
 })

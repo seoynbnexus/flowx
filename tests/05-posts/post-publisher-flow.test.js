@@ -6,7 +6,8 @@ import * as postService from '../../src/modules/posts/post.service.js'
 import * as postRepo from '../../src/modules/posts/post.repository.js'
 import { queryOne, query } from '../../shared/database/connection.js'
 import { drainCampaignJobs } from '../../src/modules/campaigns/campaign.jobs.js'
-import { POST_STATUS, PUBLISHER_REQUEST_STATUS } from '../../src/modules/posts/post.model.js'
+import { enqueueTargetJob, findAutoJobByRunKey } from '../../src/modules/campaigns/campaign.repository.js'
+import { POST_STATUS, PUBLISHER_REQUEST_STATUS, POST_TARGET_STATUS } from '../../src/modules/posts/post.model.js'
 
 var metaMocks
 vi.mock('../../shared/services/meta-ads.service.js', async () => {
@@ -48,6 +49,20 @@ async function addPlatformAccount(userId, { code, platformUserId, igId = null })
     ]
   )
   return accountId
+}
+
+async function totalAvailable(userId) {
+  const { clearCache } = await import('../../src/modules/subscriptions/subscription.service.js')
+  clearCache(userId)
+  const coinService = await import('../../shared/services/coin.service.js')
+  return (await coinService.getAvailable(userId)).total
+}
+
+async function backdatePublisherRequestPublish(requestId) {
+  await query(
+    'UPDATE post_publisher_requests SET published_at = NOW() - INTERVAL 49 HOUR WHERE id = ?',
+    [uuidToBuffer(requestId)]
+  )
 }
 
 async function assignCategory(userId, categoryId) {
@@ -192,6 +207,7 @@ describe('post publisher flow', () => {
 
     await postService.acceptPostPublisherRequest(publisher.id, mine.id, { platformAccountId: publisherAccountId })
     await drainCampaignJobs()
+    await backdatePublisherRequestPublish(mine.id)
 
     const completed = await postService.completePostPublisherRequest(publisher.id, mine.id)
     expect(completed.status).toBe(PUBLISHER_REQUEST_STATUS.COMPLETED)
@@ -353,10 +369,143 @@ describe('post publisher flow', () => {
         platformAccountIds: [publisher2AccountId],
       })
       await drainCampaignJobs()
+      await backdatePublisherRequestPublish(mine.id)
       await postService.completePostPublisherRequest(publisher2.id, mine.id)
 
       const wallet = await queryOne('SELECT coins FROM user_wallets WHERE user_id = ?', [uuidToBuffer(publisher2.id)])
       expect(Number(wallet.coins)).toBe(30)
+    })
+
+    it('order-independent payout: a sibling account failing first must never permanently block payout once another account succeeds', async () => {
+      const postId = await createPublisherPost({ count: 1, coins: 10, withClientTarget: false })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id)
+
+      // FB target is created first and fails permanently; IG target
+      // (created second) succeeds. Before the fix, the request status was
+      // flipped ACCEPTED -> FAILED by the first failure, and the later
+      // successful IG post's guard (which only fired FROM 'accepted')
+      // silently no-op'd — leaving a live, successful post's publisher
+      // permanently unpaid.
+      const permErr = new Error('mock permanent failure')
+      permErr.metaHttpStatus = 400
+      metaMocks.createPagePhotoPost.mockRejectedValueOnce(permErr)
+
+      await postService.acceptPostPublisherRequest(publisher.id, mine.id, {
+        platformAccountIds: [pubFbAccount, pubIgAccount],
+      })
+      await drainCampaignJobs()
+
+      const detail = await postService.getPost(client.id, postId)
+      const fbTarget = detail.targets.find(t => t.platformAccountId === pubFbAccount)
+      const igTarget = detail.targets.find(t => t.platformAccountId === pubIgAccount)
+      expect(fbTarget.status).toBe('failed')
+      expect(igTarget.status).toBe('posted')
+
+      const stored = await queryOne('SELECT status FROM post_publisher_requests WHERE id = ?', [uuidToBuffer(mine.id)])
+      expect(stored.status).toBe('published')
+    })
+  })
+
+  describe('bug fixes', () => {
+    it('blocks self-service payout completion before the deletion-monitoring grace period elapses', async () => {
+      await query('INSERT INTO user_wallets (user_id, coins, total_purchased_coins) VALUES (?, 0, 0) ON DUPLICATE KEY UPDATE coins = coins', [uuidToBuffer(publisher.id)])
+      const postId = await createPublisherPost({ count: 1, coins: 15 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id) || requests[0]
+      await postService.acceptPostPublisherRequest(publisher.id, mine.id, { platformAccountId: publisherAccountId })
+      await drainCampaignJobs()
+
+      const req = await postRepo.findPostPublisherRequestById(mine.id)
+      expect(req.status).toBe(PUBLISHER_REQUEST_STATUS.PUBLISHED)
+      expect(req.publishedAt).toBeTruthy()
+
+      await expect(postService.completePostPublisherRequest(publisher.id, mine.id)).rejects.toThrow(/grace period/i)
+
+      await backdatePublisherRequestPublish(mine.id)
+      const completed = await postService.completePostPublisherRequest(publisher.id, mine.id)
+      expect(completed.status).toBe(PUBLISHER_REQUEST_STATUS.COMPLETED)
+    })
+
+    it('cancelling an awaiting-publishers post also cancels (not orphans) already-accepted publisher requests', async () => {
+      const postId = await createPublisherPost({ count: 2, coins: 10 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id) || requests[0]
+      await postService.acceptPostPublisherRequest(publisher.id, mine.id, { platformAccountId: publisherAccountId })
+
+      const before = await totalAvailable(client.id)
+      await postService.cancelPost(client.id, postId)
+      expect(await totalAvailable(client.id)).toBe(before + 22) // 2*10 + 10% fee, full refund
+
+      const acceptedAfter = await postRepo.findPostPublisherRequestById(mine.id)
+      expect(acceptedAfter.status).toBe(PUBLISHER_REQUEST_STATUS.CANCELLED)
+
+      const detail = await postService.getPost(client.id, postId)
+      expect(detail.status).toBe(POST_STATUS.CANCELLED)
+    })
+
+    it('admin force-go-live with zero accepted publishers throws without cancelling pending requests', async () => {
+      const postId = await createPublisherPost({ count: 2, coins: 10 })
+      await postService.approvePost(admin.id, postId, {})
+
+      await expect(postService.adminForceGoLivePost(postId)).rejects.toThrow(/no accepted publisher/i)
+
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      expect(requests.every(r => r.status === PUBLISHER_REQUEST_STATUS.PENDING)).toBe(true)
+      const detail = await postService.getPost(client.id, postId)
+      expect(detail.status).toBe(POST_STATUS.AWAITING_PUBLISHERS)
+    })
+
+    it('admin force-go-live with a partial fill refunds the exact prorated escrow (base + fee) for unfilled slots', async () => {
+      const postId = await createPublisherPost({ count: 4, coins: 10 })
+      await postService.approvePost(admin.id, postId, {})
+      const requests = await postRepo.findPostPublisherRequestsByPostId(postId)
+      const mine = requests.find(r => r.publisherId === publisher.id) || requests[0]
+      await postService.acceptPostPublisherRequest(publisher.id, mine.id, { platformAccountId: publisherAccountId })
+
+      const before = await totalAvailable(client.id)
+      const result = await postService.adminForceGoLivePost(postId)
+      expect(result.queued).toBe(true)
+
+      // escrow = 4*10 + 10% fee = 44; 1 of 4 slots filled -> 3 unfilled ->
+      // prorated refund = round(3/4 * 44) = 33 (not 3*10=30, which would
+      // silently drop the fee's proportional share on the unfilled slots)
+      expect(await totalAvailable(client.id)).toBe(before + 33)
+
+      const pending = await postRepo.findPostPublisherRequestsByStatus(postId, PUBLISHER_REQUEST_STATUS.PENDING)
+      expect(pending.length).toBe(0)
+
+      await drainCampaignJobs()
+      const detail = await postService.getPost(client.id, postId)
+      expect(detail.status).toBe(POST_STATUS.COMPLETED)
+    })
+
+    it('retryPostPublish leaves a target alone while its background publish job is still active', async () => {
+      const postId = await createPublisherPost({ count: 1, coins: 10, withClientTarget: true })
+      await postService.approvePost(admin.id, postId, {})
+      await drainCampaignJobs()
+
+      const targets = await postRepo.findPostTargetsByPostId(postId)
+      const target = targets.find(t => t.targetType === 'client')
+      await postRepo.updatePostTargetStatus(target.id, {
+        status: POST_TARGET_STATUS.PENDING,
+        publishState: 'processing',
+        containerId: 'live_container_123',
+      })
+      await enqueueTargetJob('post_ig_reel', `ig_reel:${target.id}`, { postId, targetId: target.id })
+      await query("UPDATE posts SET status = 'running' WHERE id = ?", [uuidToBuffer(postId)])
+
+      await postService.retryPostPublish(postId)
+
+      const untouched = await postRepo.findPostTargetById(target.id)
+      expect(untouched.publishState).toBe('processing')
+      expect(untouched.containerId).toBe('live_container_123')
+
+      expect(await findAutoJobByRunKey(`ig_reel:${target.id}`)).toBe(true)
+      await query("DELETE FROM campaign_jobs WHERE run_key = ?", [`ig_reel:${target.id}`])
     })
   })
 })

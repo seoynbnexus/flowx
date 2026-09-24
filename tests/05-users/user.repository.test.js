@@ -70,3 +70,28 @@ describe('updateUserRole', () => {
     ).rejects.toThrow('Role not found')
   })
 })
+
+describe('listUsers role filter', () => {
+  it('filters to only publisher-role users', async () => {
+    const publisher = await createTestUser({ email: `user-repo-pub-${Date.now()}@flowx-test.com`, password: testPassword, role: 'publisher' })
+
+    const result = await userRepo.listUsers({ page: 1, limit: 100, role: 'publisher' })
+
+    expect(result.users.some(u => u.id === publisher.id)).toBe(true)
+    // testUser was flipped to 'admin' by the previous describe block — must not leak in
+    expect(result.users.some(u => u.id === testUser.id)).toBe(false)
+  })
+
+  it('filters to only client-role users', async () => {
+    const client = await createTestUser({ email: `user-repo-client-${Date.now()}@flowx-test.com`, password: testPassword, role: 'client' })
+
+    const result = await userRepo.listUsers({ page: 1, limit: 100, role: 'client' })
+
+    expect(result.users.some(u => u.id === client.id)).toBe(true)
+  })
+
+  it('returns all roles when no role filter is passed', async () => {
+    const result = await userRepo.listUsers({ page: 1, limit: 1000 })
+    expect(result.users.some(u => u.id === testUser.id)).toBe(true)
+  })
+})

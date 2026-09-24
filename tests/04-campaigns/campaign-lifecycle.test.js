@@ -3,6 +3,9 @@ import { generateUuid, uuidToBuffer, bufferToUuid } from '../../shared/utils/uui
 import { createTestUser } from '../helpers/create-user.js'
 import * as campaignService from '../../src/modules/campaigns/campaign.service.js'
 import * as campaignRepo from '../../src/modules/campaigns/campaign.repository.js'
+import * as execRepo from '../../src/modules/campaigns/campaign-execution.repository.js'
+import { findOrCreatePendingExecution } from '../../src/modules/campaigns/campaign-execution.service.js'
+import { EXECUTION_KIND } from '../../src/modules/campaigns/campaign-execution.model.js'
 import * as subRepo from '../../src/modules/subscriptions/subscription.repository.js'
 import { queryOne, query } from '../../shared/database/connection.js'
 import { drainCampaignJobs } from '../../src/modules/campaigns/campaign.jobs.js'
@@ -29,10 +32,23 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
     deleteAdCampaign: vi.fn().mockResolvedValue({}),
     searchMeta: vi.fn().mockResolvedValue([]),
     getObjectStatus: vi.fn().mockResolvedValue({ status: 'ACTIVE', effective_status: 'ACTIVE' }),
+    getMetaObject: vi.fn().mockImplementation(async id => ({ id })),
+    listAccountCampaigns: vi.fn().mockResolvedValue({ rows: [], truncated: false }),
+    listCampaignAdSets: vi.fn().mockResolvedValue({ rows: [], truncated: false }),
+    listAdSetAds: vi.fn().mockResolvedValue({ rows: [], truncated: false }),
   }
   metaMocks = mocks
   return mocks
 })
+
+async function setRuntimeFlag(on) {
+  await query(
+    `INSERT INTO app_config (id, config_key, config_value, is_public, description, version)
+     VALUES (?, 'campaign_execution_runtime_enabled', ?, 0, 'test', 1)
+     ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+    [uuidToBuffer(generateUuid()), JSON.stringify(on)]
+  )
+}
 
 const dateTag = Date.now()
 
@@ -177,6 +193,11 @@ describe('campaign lifecycle', () => {
     })
     const creativeId = generateUuid()
     await campaignRepo.createCreative(creativeId, tempCampaign.id, { caption: 'Approve test', mediaUrl: 'https://example.com/img.jpg' })
+    await campaignRepo.createMetaSettings(generateUuid(), tempCampaign.id, {
+      objective: 'OUTCOME_TRAFFIC',
+      budgetAmount: 500,
+      endTime: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString(),
+    })
     await campaignService.submitCampaign(client.id, tempCampaign.id)
 
     if (admin.id) {
@@ -284,6 +305,11 @@ describe('campaign lifecycle', () => {
     })
     const creativeId = generateUuid()
     await campaignRepo.createCreative(creativeId, campaign.id, { caption: 'Sync pause test', mediaUrl: 'https://example.com/img.jpg' })
+    await campaignRepo.createMetaSettings(generateUuid(), campaign.id, {
+      objective: 'OUTCOME_TRAFFIC',
+      budgetAmount: 500,
+      endTime: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString(),
+    })
 
     await campaignService.submitCampaign(client.id, campaign.id)
     await campaignService.approveCampaign(admin?.id || client.id, campaign.id, {})
@@ -307,6 +333,11 @@ describe('campaign lifecycle', () => {
     })
     const creativeId = generateUuid()
     await campaignRepo.createCreative(creativeId, campaign.id, { caption: 'Sync resume test', mediaUrl: 'https://example.com/img.jpg' })
+    await campaignRepo.createMetaSettings(generateUuid(), campaign.id, {
+      objective: 'OUTCOME_TRAFFIC',
+      budgetAmount: 500,
+      endTime: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString(),
+    })
 
     await campaignService.submitCampaign(client.id, campaign.id)
     await campaignService.approveCampaign(admin?.id || client.id, campaign.id, {})
@@ -381,6 +412,11 @@ describe('campaign lifecycle', () => {
         coinsPerPublisher: 100,
       })
       await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Validate caption', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignRepo.createMetaSettings(generateUuid(), campaign.id, {
+        objective: 'OUTCOME_TRAFFIC',
+        budgetAmount: 500,
+        endTime: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString(),
+      })
       await campaignService.submitCampaign(testClient.id, campaign.id)
       return { campaign, clientId: testClient.id }
     }
@@ -548,6 +584,7 @@ describe('campaign lifecycle', () => {
         budgetAmount: 10000,
         targeting: { geo_locations: { countries: ['IN'] } },
         platformPlacement: { publisher_platforms: ['facebook', 'instagram'] },
+        endTime: new Date(Date.now() + 10 * 24 * 3600000).toISOString(),
         ...settingsOverrides,
       })
       return { campaign, clientId: testClient.id }
@@ -683,7 +720,7 @@ describe('campaign lifecycle', () => {
     })
 
     it('should require an end time for lifetime budgets', async () => {
-      const { campaign, clientId } = await createDraftWithSettings({ budgetType: 'lifetime' })
+      const { campaign, clientId } = await createDraftWithSettings({ budgetType: 'lifetime', endTime: null })
 
       const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
 
@@ -691,6 +728,236 @@ describe('campaign lifecycle', () => {
       expect(result.error).toContain('End time is required for lifetime budget')
       expect(metaMocks.createAdCreative).not.toHaveBeenCalled()
       expect(metaMocks.createAdCampaign).not.toHaveBeenCalled()
+    })
+
+    it('should require an end time for daily budgets too (campaigns must not run indefinitely)', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({ endTime: null })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('An end date is required')
+      expect(metaMocks.createAdCreative).not.toHaveBeenCalled()
+      expect(metaMocks.createAdCampaign).not.toHaveBeenCalled()
+    })
+
+    it('should require a bid amount for a capped bid strategy', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        bidStrategy: 'LOWEST_COST_WITH_BID_CAP',
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('A bid amount is required')
+      expect(metaMocks.createAdCreative).not.toHaveBeenCalled()
+      expect(metaMocks.createAdCampaign).not.toHaveBeenCalled()
+    })
+
+    it('should not require a bid amount for the default lowest-cost strategy', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        bidStrategy: 'LOWEST_COST_WITHOUT_CAP',
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      expect(result.error).toBeNull()
+    })
+
+    it('should pass a bid amount through once provided for a capped bid strategy', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        bidStrategy: 'TARGET_COST',
+        bidAmount: 50,
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      expect(result.error).toBeNull()
+    })
+
+    // Regression: a campaign with publisher_platforms: ['audience_network']
+    // and nothing else passed the creative+campaign validate_only phase but
+    // failed at real ad-set creation with "The placement combination
+    // selected is not supported by the campaign set-up" — Meta's own
+    // Placement Targeting reference documents Audience Network can never be
+    // selected without Facebook. This is now caught before any Meta call.
+    it('should reject Audience Network selected without Facebook', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        platformPlacement: { publisher_platforms: ['audience_network'] },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('Audience Network cannot be selected without Facebook')
+      expect(metaMocks.createAdCreative).not.toHaveBeenCalled()
+      expect(metaMocks.createAdCampaign).not.toHaveBeenCalled()
+    })
+
+    it('should allow Audience Network when Facebook is also selected', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        platformPlacement: { publisher_platforms: ['facebook', 'audience_network'] },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      expect(result.error).toBeNull()
+    })
+
+    it('should require ThruPlay optimization goal for Audience Network with the Video Views objective', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        objective: 'VIDEO_VIEWS',
+        optimizationGoal: 'VIDEO_VIEWS',
+        platformPlacement: { publisher_platforms: ['facebook', 'audience_network'] },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('requires the "ThruPlay" optimization goal')
+    })
+
+    it('should allow Audience Network with Video Views objective when ThruPlay is selected', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        objective: 'VIDEO_VIEWS',
+        optimizationGoal: 'THRUPLAY',
+        platformPlacement: { publisher_platforms: ['facebook', 'audience_network'] },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      expect(result.error).toBeNull()
+    })
+
+    it('should reject Facebook Stories placement without Facebook Feed or Instagram Stories', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        platformPlacement: {
+          publisher_platforms: ['facebook', 'instagram'],
+          facebook_positions: ['story'],
+          instagram_positions: ['explore'],
+        },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('Facebook Stories placement requires')
+    })
+
+    it('should allow Facebook Stories placement when Instagram Stories is also selected', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        platformPlacement: {
+          publisher_platforms: ['facebook', 'instagram'],
+          facebook_positions: ['story'],
+          instagram_positions: ['story'],
+        },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      expect(result.error).toBeNull()
+    })
+
+    it('should reject Facebook Marketplace placement without Facebook Feed', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        platformPlacement: {
+          publisher_platforms: ['facebook'],
+          facebook_positions: ['marketplace'],
+        },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('marketplace placement requires the Facebook Feed placement')
+    })
+
+    it('should leave placement checks alone when no manual placement is configured', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        platformPlacement: {},
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      expect(result.error).toBeNull()
+    })
+
+    // Regression: two live campaigns had the SAME region key in both
+    // geo_locations.regions and excluded_geo_locations.regions — Meta
+    // rejected ad-set creation with "Remove a conflicting location to
+    // continue" after the campaign/creative validate_only phase had already
+    // passed. This is a pure input contradiction, now caught before any
+    // Meta call.
+    it('should reject a location that is both included and excluded', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        targeting: {
+          geo_locations: { countries: ['IN'], regions: [{ key: '1729' }] },
+          excluded_geo_locations: { regions: [{ key: '1729' }] },
+        },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('both included and excluded')
+      expect(metaMocks.createAdCreative).not.toHaveBeenCalled()
+      expect(metaMocks.createAdCampaign).not.toHaveBeenCalled()
+    })
+
+    it('should allow distinct included and excluded locations', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        targeting: {
+          geo_locations: { countries: ['IN'], regions: [{ key: '1729' }] },
+          excluded_geo_locations: { regions: [{ key: '9999' }] },
+        },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      expect(result.error).toBeNull()
+    })
+
+    it('should detect a location conflict in city keys even when region keys differ', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        targeting: {
+          geo_locations: { countries: ['IN'], regions: [{ key: '1729' }], cities: [{ key: '1040416' }] },
+          excluded_geo_locations: { regions: [{ key: '9999' }], cities: [{ key: '1040416' }] },
+        },
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(false)
+      expect(result.error).toContain('both included and excluded')
+    })
+
+    it('should forward declared special ad categories to Meta campaign creation', async () => {
+      const { campaign, clientId } = await createDraftWithSettings({
+        specialAdCategories: ['HOUSING'],
+      })
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      const call = metaMocks.createAdCampaign.mock.calls[metaMocks.createAdCampaign.mock.calls.length - 1]
+      expect(call[5]).toMatchObject({ specialAdCategories: ['HOUSING'] })
+    })
+
+    it('should default special ad categories to an empty array when none are declared', async () => {
+      const { campaign, clientId } = await createDraftWithSettings()
+
+      const result = await campaignService.validateCampaignDraft(clientId, campaign.id)
+
+      expect(result.valid).toBe(true)
+      const call = metaMocks.createAdCampaign.mock.calls[metaMocks.createAdCampaign.mock.calls.length - 1]
+      expect(call[5]).toMatchObject({ specialAdCategories: [] })
     })
 
     it('should reject a daily budget with an end time within 24 hours', async () => {
@@ -760,6 +1027,561 @@ describe('campaign lifecycle', () => {
     })
   })
 
+  // Regression for a live production bug: a campaign whose daily-budget
+  // schedule had ~24.4 hours of runway when created (comfortably clearing
+  // Meta's bare 24h floor) drifted under that floor purely from elapsed
+  // admin-review/retry time before it was actually published, and the
+  // client had no way to have prevented it — the schedule was valid the
+  // moment they set it. saveMetaSettings now rejects a schedule up front
+  // when its margin over the 24h floor is too thin to survive ordinary
+  // review turnaround, so the client fixes it before submitting instead of
+  // an admin discovering "Failed to publish campaign on Meta: Daily budget
+  // is only allowed for ad sets running longer than 24 hours" much later.
+  describe('saveMetaSettings schedule buffer check', () => {
+    const createPreValClient = async (suffix) => {
+      const user = await createTestUser({
+        email: `camp-schedbuf-${dateTag}-${suffix}@flowx-test.com`,
+        password: 'Test@123',
+        coins: 10000,
+      })
+      await ensurePlan(user.id)
+      return user
+    }
+
+    it('rejects a daily-budget end time that clears the bare 24h floor but not the safety buffer', async () => {
+      const user = await createPreValClient('thin')
+      const campaign = await campaignService.createCampaign(user.id, { name: `SchedBuf Thin ${dateTag}`, type: 'post' })
+      // 24h26m — clears Meta's bare 24h floor (would NOT trip
+      // computeScheduleError) but not the buffer-extended floor.
+      const endTime = new Date(Date.now() + 24 * 3600000 + 26 * 60000).toISOString()
+
+      await expect(campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC',
+        budgetType: 'daily',
+        budgetAmount: 500,
+        endTime,
+      })).rejects.toThrow(/runway/i)
+
+      const settings = await campaignRepo.findMetaSettingsByCampaignId(campaign.id)
+      expect(settings).toBeNull()
+    })
+
+    it('accepts a daily-budget end time with a comfortable safety margin', async () => {
+      const user = await createPreValClient('comfortable')
+      const campaign = await campaignService.createCampaign(user.id, { name: `SchedBuf Ok ${dateTag}`, type: 'post' })
+      const endTime = new Date(Date.now() + 10 * 24 * 3600000).toISOString()
+
+      const saved = await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC',
+        budgetType: 'daily',
+        budgetAmount: 500,
+        endTime,
+      })
+      expect(saved).toBeTruthy()
+    })
+
+    it('leaves an already-invalid schedule (under the bare 24h floor) alone here — still caught downstream by validateCampaignDraft', async () => {
+      const user = await createPreValClient('bare-invalid')
+      const campaign = await campaignService.createCampaign(user.id, { name: `SchedBuf Bare ${dateTag}`, type: 'post' })
+      const endTime = new Date(Date.now() + 2 * 3600000).toISOString()
+
+      // Not rejected here — this is the exact scenario the pre-validate
+      // suite above depends on being able to construct via saveMetaSettings.
+      const saved = await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC',
+        budgetType: 'daily',
+        budgetAmount: 500,
+        endTime,
+      })
+      expect(saved).toBeTruthy()
+    })
+
+    it('leaves a lifetime budget alone regardless of end time proximity', async () => {
+      const user = await createPreValClient('lifetime')
+      const campaign = await campaignService.createCampaign(user.id, { name: `SchedBuf Lifetime ${dateTag}`, type: 'post' })
+      const endTime = new Date(Date.now() + 25 * 3600000).toISOString()
+
+      const saved = await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC',
+        budgetType: 'lifetime',
+        budgetAmount: 500,
+        endTime,
+      })
+      expect(saved).toBeTruthy()
+    })
+  })
+
+  // Regression: a client edits campaign_meta_settings (e.g. fixes an end
+  // date after "Daily budget is only allowed for ad sets running longer
+  // than 24 hours") but every subsequent build kept reading the FIRST-ever
+  // frozen execution snapshot — ensureCampaignSnapshot only freezes once,
+  // and nothing re-froze it on later edits — so the exact same stale error
+  // recurred no matter how many times the client fixed the underlying
+  // value. saveMetaSettings now re-freezes automatically, but only while no
+  // owner execution has actually started building on Meta.
+  describe('saveMetaSettings refreshes the frozen execution snapshot', () => {
+    const createSnapClient = async (suffix) => {
+      const user = await createTestUser({
+        email: `camp-snapfresh-${dateTag}-${suffix}@flowx-test.com`,
+        password: 'Test@123',
+        coins: 10000,
+      })
+      await ensurePlan(user.id)
+      return user
+    }
+
+    it('picks up a corrected end time on the next save instead of keeping the first frozen value forever', async () => {
+      const user = await createSnapClient('fresh')
+      const campaign = await campaignService.createCampaign(user.id, { name: `SnapFresh ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Snap test', mediaUrl: 'https://example.com/img.jpg' })
+      await findOrCreatePendingExecution(campaign.id, user.id, EXECUTION_KIND.CLIENT)
+
+      // MySQL truncates sub-second precision on round-trip; zero it up front
+      // so the frozen-snapshot value can be compared for exact equality.
+      const staleEndTime = new Date(Math.floor((Date.now() + 30 * 24 * 3600000) / 1000) * 1000).toISOString()
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500, endTime: staleEndTime,
+      })
+      const firstSnapshot = await campaignRepo.findCampaignSnapshot(campaign.id)
+      expect(firstSnapshot.config.settings.endTime).toBe(staleEndTime)
+
+      const correctedEndTime = new Date(Math.floor((Date.now() + 60 * 24 * 3600000) / 1000) * 1000).toISOString()
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500, endTime: correctedEndTime,
+      })
+      const secondSnapshot = await campaignRepo.findCampaignSnapshot(campaign.id)
+      expect(secondSnapshot.config.settings.endTime).toBe(correctedEndTime)
+      expect(secondSnapshot.hash).not.toBe(firstSnapshot.hash)
+    })
+
+    it('resets a stale execution configHash so the next build adopts the refreshed snapshot instead of failing hash-mismatch', async () => {
+      const user = await createSnapClient('hashreset')
+      const campaign = await campaignService.createCampaign(user.id, { name: `SnapHash ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Snap hash test', mediaUrl: 'https://example.com/img.jpg' })
+      const { execution } = await findOrCreatePendingExecution(campaign.id, user.id, EXECUTION_KIND.CLIENT)
+
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500,
+        endTime: new Date(Date.now() + 30 * 24 * 3600000).toISOString(),
+      })
+      const firstSnapshot = await campaignRepo.findCampaignSnapshot(campaign.id)
+      await execRepo.updateExecution(execution.id, { configHash: firstSnapshot.hash })
+
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500,
+        endTime: new Date(Date.now() + 60 * 24 * 3600000).toISOString(),
+      })
+      const refreshed = await execRepo.findExecutionById(execution.id)
+      expect(refreshed.configHash).toBeFalsy()
+    })
+
+    it('never re-freezes once an owner execution has started building real Meta objects', async () => {
+      const user = await createSnapClient('locked')
+      const campaign = await campaignService.createCampaign(user.id, { name: `SnapLocked ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Snap locked test', mediaUrl: 'https://example.com/img.jpg' })
+      const { execution } = await findOrCreatePendingExecution(campaign.id, user.id, EXECUTION_KIND.CLIENT)
+
+      const originalEndTime = new Date(Math.floor((Date.now() + 30 * 24 * 3600000) / 1000) * 1000).toISOString()
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500, endTime: originalEndTime,
+      })
+      const frozenBefore = await campaignRepo.findCampaignSnapshot(campaign.id)
+
+      await execRepo.updateExecution(execution.id, { platformCampaignId: 'mock_campaign_locked_1' })
+
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500,
+        endTime: new Date(Date.now() + 60 * 24 * 3600000).toISOString(),
+      })
+      const frozenAfter = await campaignRepo.findCampaignSnapshot(campaign.id)
+      expect(frozenAfter.hash).toBe(frozenBefore.hash)
+      expect(frozenAfter.config.settings.endTime).toBe(originalEndTime)
+    })
+  })
+
+  // Regression: two live campaigns got permanently stuck in
+  // awaiting_publishers/metaStatus=failed because a location-conflict error
+  // (see the locationConflictError tests above) fails identically on every
+  // retry, and updateCampaign normally blocks editing this status. This
+  // recovery path refunds escrow, cleans up the partially-created Meta
+  // campaign objects, resets execution rows, cancels outstanding publisher
+  // requests, and lands the campaign back in DRAFT so it can be fixed.
+  describe('reopenFailedAwaitingPublishersCampaign', () => {
+    const createReopenClient = async (suffix) => {
+      const user = await createTestUser({
+        email: `camp-reopen-${dateTag}-${suffix}@flowx-test.com`,
+        password: 'Test@123',
+        coins: 10000,
+      })
+      await ensurePlan(user.id)
+      return user
+    }
+
+    it('refunds escrow, cleans up Meta objects, resets executions, and cancels publisher requests', async () => {
+      const client = await createReopenClient('main')
+      const publisher = await createReopenClient('pub')
+      const campaign = await campaignService.createCampaign(client.id, { name: `Reopen ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Reopen test', mediaUrl: 'https://example.com/img.jpg' })
+
+      await query(
+        `UPDATE campaigns SET status='awaiting_publishers', meta_status='failed',
+         meta_error='Failed to create Meta ads for client: Remove a conflicting location to continue.',
+         escrow_amount=550, coins_escrowed_at=NOW() WHERE id = ?`,
+        [uuidToBuffer(campaign.id)]
+      )
+
+      const clientExecId = await execRepo.createExecution({
+        campaignId: campaign.id, ownerUserId: client.id, kind: EXECUTION_KIND.CLIENT, status: 'failed',
+        platformCampaignId: 'mock_reopen_campaign_1', error: 'Remove a conflicting location to continue.',
+      })
+      const pubExecId = await execRepo.createExecution({
+        campaignId: campaign.id, ownerUserId: publisher.id, kind: EXECUTION_KIND.PUBLISHER, status: 'failed',
+        platformCampaignId: 'mock_reopen_campaign_2', error: 'Remove a conflicting location to continue.',
+      })
+
+      const requestId = generateUuid()
+      await query(
+        `INSERT INTO campaign_publisher_requests (id, campaign_id, publisher_id, coins_offered, status)
+         VALUES (?, ?, ?, 100, 'accepted')`,
+        [uuidToBuffer(requestId), uuidToBuffer(campaign.id), uuidToBuffer(publisher.id)]
+      )
+
+      metaMocks.deleteAdCampaign.mockClear()
+
+      const result = await campaignService.reopenFailedAwaitingPublishersCampaign(client.id, campaign.id)
+
+      expect(result.status).toBe('draft')
+      expect(result.metaStatus).toBe('pending')
+      expect(result.metaError).toBeFalsy()
+      expect(Number(result.escrowAmount)).toBe(0)
+      expect(result.coinsEscrowedAt).toBeFalsy()
+
+      const refundLedgerRow = await queryOne(
+        `SELECT quantity, transaction_type FROM usage_ledger
+         WHERE user_id = ? AND resource_id = ? AND feature_key = 'monthly_coins'
+         ORDER BY created_at DESC LIMIT 1`,
+        [uuidToBuffer(client.id), campaign.id]
+      )
+      expect(refundLedgerRow?.transaction_type).toBe('refund')
+      expect(Number(refundLedgerRow?.quantity)).toBe(550)
+
+      expect(metaMocks.deleteAdCampaign).toHaveBeenCalledWith('mock_reopen_campaign_1', expect.any(String))
+      expect(metaMocks.deleteAdCampaign).toHaveBeenCalledWith('mock_reopen_campaign_2', expect.any(String))
+
+      const clientExec = await execRepo.findExecutionById(clientExecId)
+      expect(clientExec.status).toBe('pending')
+      expect(clientExec.platformCampaignId).toBeFalsy()
+      expect(clientExec.error).toBeFalsy()
+
+      const pubExec = await execRepo.findExecutionById(pubExecId)
+      expect(pubExec.status).toBe('pending')
+      expect(pubExec.platformCampaignId).toBeFalsy()
+
+      const request = await queryOne('SELECT status FROM campaign_publisher_requests WHERE id = ?', [uuidToBuffer(requestId)])
+      expect(request.status).toBe('cancelled')
+    })
+
+    // Regression: reopening cancels every request (including the one a
+    // publisher had already accepted) but keeps the rows for audit history
+    // instead of deleting them. approveCampaign's re-invite guard checked
+    // "does ANY request row exist" rather than "is any request still
+    // live" — so on resubmission it saw the 10 (now cancelled) rows, wrongly
+    // concluded publishers were already invited, and silently skipped
+    // inviting anyone. The campaign went back to awaiting_publishers with
+    // zero live requests — every row anyone looked at showed 'cancelled'.
+    it('creates a fresh live publisher request on resubmission after Fix & Resubmit, even though old rows are still cancelled in the table', async () => {
+      const client = await createReopenClient('resubmit')
+      const publisher = await createTestUser({
+        email: `camp-reopen-${dateTag}-resubmit-pub@flowx-test.com`,
+        password: 'Test@123',
+        role: 'publisher',
+      })
+      const fbPlatform = await queryOne("SELECT id FROM platforms WHERE code = 'facebook'")
+      const platformId = bufferToUuid(fbPlatform.id)
+      await query(
+        `INSERT INTO user_platform_accounts (id, user_id, platform_id, profile_url, platform_user_id, platform_username, token_type, token_expires_at, verification_status)
+         VALUES (?, ?, ?, ?, ?, ?, 'page', DATE_ADD(NOW(), INTERVAL 60 DAY), 'verified')`,
+        [uuidToBuffer(generateUuid()), uuidToBuffer(client.id), uuidToBuffer(platformId), 'https://fb.com/resubmit-client', `fb_resubmit_client_${dateTag}`, 'ResubmitClientPage']
+      )
+      await query(
+        `INSERT INTO user_platform_accounts (id, user_id, platform_id, profile_url, platform_user_id, platform_username, token_type, token_expires_at, verification_status)
+         VALUES (?, ?, ?, ?, ?, ?, 'page', DATE_ADD(NOW(), INTERVAL 60 DAY), 'verified')`,
+        [uuidToBuffer(generateUuid()), uuidToBuffer(publisher.id), uuidToBuffer(platformId), 'https://fb.com/resubmit', `fb_resubmit_${dateTag}`, 'ResubmitPage']
+      )
+
+      const categoryRow = await queryOne('SELECT id FROM ad_categories LIMIT 1')
+      const categoryId = bufferToUuid(categoryRow.id)
+      await query(
+        'INSERT INTO user_categories (id, user_id, category_id) VALUES (?, ?, ?)',
+        [uuidToBuffer(generateUuid()), uuidToBuffer(publisher.id), uuidToBuffer(categoryId)]
+      )
+
+      const campaign = await campaignService.createCampaign(client.id, {
+        name: `Resubmit ${dateTag}`, type: 'post', categoryId, publisherCount: 1, coinsPerPublisher: 100,
+      })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Resubmit test', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignRepo.createMetaSettings(generateUuid(), campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'lifetime', budgetAmount: 500,
+        endTime: new Date(Date.now() + 7 * 24 * 3600000).toISOString(),
+      })
+      await campaignService.submitCampaign(client.id, campaign.id)
+      await campaignService.approveCampaign(admin.id, campaign.id, {})
+      await drainCampaignJobs()
+
+      const firstRound = await campaignRepo.findPublisherRequestsByCampaignId(campaign.id)
+      expect(firstRound.length).toBeGreaterThan(0)
+      const firstRequest = firstRound.find(r => r.publisherId === publisher.id)
+      expect(firstRequest).toBeTruthy()
+
+      await campaignService.acceptPublisherRequest(publisher.id, firstRequest.id)
+
+      await query(
+        `UPDATE campaigns SET meta_status = 'failed', meta_error = 'Failed to create Meta ads for client: Remove a conflicting location to continue.' WHERE id = ?`,
+        [uuidToBuffer(campaign.id)]
+      )
+
+      await campaignService.reopenFailedAwaitingPublishersCampaign(client.id, campaign.id)
+
+      const afterReopen = await campaignRepo.findPublisherRequestsByCampaignId(campaign.id)
+      expect(afterReopen.length).toBeGreaterThan(0)
+      expect(afterReopen.every(r => r.status === 'cancelled')).toBe(true)
+
+      await campaignService.submitCampaign(client.id, campaign.id)
+      await campaignService.approveCampaign(admin.id, campaign.id, {})
+      await drainCampaignJobs()
+
+      const afterResubmit = await campaignRepo.findPublisherRequestsByCampaignId(campaign.id)
+      const freshLive = afterResubmit.filter(r => ['pending', 'accepted'].includes(r.status))
+      expect(freshLive.length).toBeGreaterThan(0)
+      expect(freshLive.some(r => r.publisherId === publisher.id)).toBe(true)
+    })
+
+    it('refuses to reopen a campaign that is not in the stuck state', async () => {
+      const client = await createReopenClient('notstuck')
+      const campaign = await campaignService.createCampaign(client.id, { name: `ReopenGuard ${dateTag}`, type: 'post' })
+
+      await expect(campaignService.reopenFailedAwaitingPublishersCampaign(client.id, campaign.id))
+        .rejects.toThrow(/must be awaiting publishers/i)
+    })
+
+    it('exposes known issues on the campaign detail once metaStatus is failed', async () => {
+      const client = await createReopenClient('knownissues')
+      const campaign = await campaignService.createCampaign(client.id, { name: `KnownIssues ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Known issues test', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignService.saveMetaSettings(client.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 10000,
+        targeting: {
+          geo_locations: { countries: ['IN'], regions: [{ key: '1729' }] },
+          excluded_geo_locations: { regions: [{ key: '1729' }] },
+        },
+        endTime: new Date(Date.now() + 10 * 24 * 3600000).toISOString(),
+      })
+      await query(`UPDATE campaigns SET meta_status='failed', meta_error='some error' WHERE id = ?`, [uuidToBuffer(campaign.id)])
+
+      const detail = await campaignService.getCampaign(client.id, campaign.id)
+      expect(detail.knownIssues).toEqual(expect.arrayContaining([expect.stringContaining('both included and excluded')]))
+    })
+
+    it('does not compute known issues when metaStatus is not failed', async () => {
+      const client = await createReopenClient('nocompute')
+      const campaign = await campaignService.createCampaign(client.id, { name: `NoKnownIssues ${dateTag}`, type: 'post' })
+
+      const detail = await campaignService.getCampaign(client.id, campaign.id)
+      expect(detail.knownIssues).toEqual([])
+    })
+  })
+
+  // Regression: two live campaigns had region+city+zip all selected in the
+  // SAME include list (no excluded_geo_locations involved at all) and Meta
+  // rejected ad-set creation with "Remove a conflicting location to
+  // continue" — the documented "locations overlap" restriction (a country
+  // plus a city within it is the simplest case; mixing region/city/zip
+  // granularity levels together has the same effect). The client's
+  // location picker lets — even invites — selecting region, city, and zip
+  // together for extra precision, but Meta wants exactly one granularity
+  // level per request. buildMetaAdPayloads now collapses to the single
+  // most specific level actually picked before ever calling Meta.
+  describe('geo_locations granularity collapse (Meta "locations overlap")', () => {
+    let geoCollapseCounter = 0
+
+    beforeEach(() => {
+      metaMocks.createAdCampaign.mockReset().mockImplementation(async () => ({ id: metaMocks.__nextMetaId('geocollapse_campaign') }))
+      metaMocks.createAdSet.mockReset().mockImplementation(async () => ({ id: metaMocks.__nextMetaId('geocollapse_adset') }))
+      metaMocks.createAdCreative.mockReset().mockImplementation(async () => ({ id: metaMocks.__nextMetaId('geocollapse_creative') }))
+      metaMocks.createAd.mockReset().mockImplementation(async () => ({ id: metaMocks.__nextMetaId('geocollapse_ad') }))
+      metaMocks.deleteAd.mockClear()
+      metaMocks.deleteAdSet.mockClear()
+      metaMocks.deleteAdCreative.mockClear()
+      metaMocks.deleteAdCampaign.mockClear()
+    })
+
+    const createGeoCollapseClient = async () => {
+      geoCollapseCounter += 1
+      const user = await createTestUser({
+        email: `camp-geocollapse-${dateTag}-${geoCollapseCounter}@flowx-test.com`,
+        password: 'Test@123',
+        coins: 10000,
+      })
+      await ensurePlan(user.id)
+      const fbPlatform = await queryOne("SELECT id FROM platforms WHERE code = 'facebook'")
+      if (fbPlatform) {
+        const platformId = bufferToUuid(fbPlatform.id)
+        await query(
+          `INSERT INTO user_platform_accounts (id, user_id, platform_id, profile_url, platform_user_id, platform_username, token_type, token_expires_at, verification_status)
+           VALUES (?, ?, ?, ?, ?, ?, 'page', DATE_ADD(NOW(), INTERVAL 60 DAY), 'verified')`,
+          [uuidToBuffer(generateUuid()), uuidToBuffer(user.id), uuidToBuffer(platformId), 'https://fb.com/test', `fb_geocollapse_${dateTag}_${geoCollapseCounter}`, 'GeoPage']
+        )
+      }
+      return user
+    }
+
+    const approveAndDrain = async (campaign, user) => {
+      await campaignService.submitCampaign(user.id, campaign.id)
+      metaMocks.createAdSet.mockClear()
+      const approved = await campaignService.approveCampaign(admin.id, campaign.id, {})
+      expect(approved.queued).toBe(true)
+      await drainCampaignJobs()
+    }
+
+    const realAdSetTargeting = () => {
+      const call = metaMocks.createAdSet.mock.calls.find((c) => c[7] !== true)
+      return call ? call[2] : null
+    }
+
+    it('collapses region+city+zip mixed in the same include list down to the zip only', async () => {
+      const user = await createGeoCollapseClient()
+      const campaign = await campaignService.createCampaign(user.id, { name: `GeoCollapse ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Geo collapse test', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500,
+        targeting: {
+          geo_locations: {
+            countries: ['IN'],
+            regions: [{ key: '1729' }],
+            cities: [{ key: '1040416' }],
+            zips: [{ key: 'IN:360007' }],
+          },
+        },
+        platformPlacement: { publisher_platforms: ['facebook', 'instagram'] },
+        endTime: new Date(Date.now() + 10 * 24 * 3600000).toISOString(),
+      })
+
+      await approveAndDrain(campaign, user)
+
+      const targeting = realAdSetTargeting()
+      expect(targeting).toBeTruthy()
+      expect(targeting.geo_locations).toEqual({ zips: [{ key: 'IN:360007' }] })
+
+      const updated = await campaignRepo.findCampaignById(campaign.id)
+      expect(updated.metaStatus).not.toBe('failed')
+    })
+
+    it('collapses region+city (no zip) down to the city only', async () => {
+      const user = await createGeoCollapseClient()
+      const campaign = await campaignService.createCampaign(user.id, { name: `GeoCollapseCity ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Geo collapse city test', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500,
+        targeting: {
+          geo_locations: { countries: ['IN'], regions: [{ key: '1729' }], cities: [{ key: '1040416' }] },
+        },
+        platformPlacement: { publisher_platforms: ['facebook', 'instagram'] },
+        endTime: new Date(Date.now() + 10 * 24 * 3600000).toISOString(),
+      })
+
+      await approveAndDrain(campaign, user)
+
+      const targeting = realAdSetTargeting()
+      expect(targeting.geo_locations).toEqual({ cities: [{ key: '1040416' }] })
+    })
+
+    it('leaves a single-granularity selection (region only) untouched aside from the redundant country', async () => {
+      const user = await createGeoCollapseClient()
+      const campaign = await campaignService.createCampaign(user.id, { name: `GeoCollapseRegion ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Geo collapse region test', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500,
+        targeting: {
+          geo_locations: { countries: ['IN'], regions: [{ key: '1729' }] },
+        },
+        platformPlacement: { publisher_platforms: ['facebook', 'instagram'] },
+        endTime: new Date(Date.now() + 10 * 24 * 3600000).toISOString(),
+      })
+
+      await approveAndDrain(campaign, user)
+
+      const targeting = realAdSetTargeting()
+      expect(targeting.geo_locations).toEqual({ regions: [{ key: '1729' }] })
+    })
+
+    it('applies the same collapse independently to excluded_geo_locations', async () => {
+      const user = await createGeoCollapseClient()
+      const campaign = await campaignService.createCampaign(user.id, { name: `GeoCollapseExcluded ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Geo collapse excluded test', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500,
+        targeting: {
+          geo_locations: { countries: ['IN'], zips: [{ key: 'IN:380001' }] },
+          excluded_geo_locations: { regions: [{ key: '9999' }], cities: [{ key: '8888' }] },
+        },
+        platformPlacement: { publisher_platforms: ['facebook', 'instagram'] },
+        endTime: new Date(Date.now() + 10 * 24 * 3600000).toISOString(),
+      })
+
+      await approveAndDrain(campaign, user)
+
+      const targeting = realAdSetTargeting()
+      expect(targeting.geo_locations).toEqual({ zips: [{ key: 'IN:380001' }] })
+      expect(targeting.excluded_geo_locations).toEqual({ cities: [{ key: '8888' }] })
+    })
+
+    it('still defaults to IN when nothing at all is selected', async () => {
+      const user = await createGeoCollapseClient()
+      const campaign = await campaignService.createCampaign(user.id, { name: `GeoCollapseDefault ${dateTag}`, type: 'post' })
+      await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'Geo collapse default test', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignService.saveMetaSettings(user.id, campaign.id, {
+        objective: 'OUTCOME_TRAFFIC', budgetType: 'daily', budgetAmount: 500,
+        targeting: {},
+        platformPlacement: { publisher_platforms: ['facebook', 'instagram'] },
+        endTime: new Date(Date.now() + 10 * 24 * 3600000).toISOString(),
+      })
+
+      await approveAndDrain(campaign, user)
+
+      const targeting = realAdSetTargeting()
+      expect(targeting.geo_locations).toEqual({ countries: ['IN'] })
+    })
+  })
+
+  describe('findAllCampaigns admin search', () => {
+    it('finds a campaign by name substring', async () => {
+      const uniqueName = `SearchMe ${generateUuid().substring(0, 8)}`
+      const campaign = await campaignService.createCampaign(client.id, { name: uniqueName, type: 'post' })
+
+      // limit is high (not 20) because this file creates many campaigns —
+      // by the time this test runs, dozens can share the same created_at
+      // second, and ORDER BY created_at DESC ties aren't guaranteed to put
+      // our just-created row within a small page; the search filter itself
+      // is what's under test here, not pagination/ordering.
+      const result = await campaignRepo.findAllCampaigns({ page: 1, limit: 500, search: uniqueName.split(' ')[1] })
+
+      expect(result.items.some(c => c.id === campaign.id)).toBe(true)
+    })
+
+    it('finds a campaign by client email substring', async () => {
+      const campaign = await campaignService.createCampaign(client.id, { name: `EmailSearch ${dateTag}`, type: 'post' })
+
+      const result = await campaignRepo.findAllCampaigns({ page: 1, limit: 500, search: client.email })
+
+      expect(result.items.some(c => c.id === campaign.id)).toBe(true)
+    })
+
+    it('returns nothing for a search that matches no campaign', async () => {
+      const result = await campaignRepo.findAllCampaigns({ page: 1, limit: 20, search: `nonexistent-${dateTag}-xyz` })
+      expect(result.items).toEqual([])
+    })
+  })
+
   describe('publisher go-live activation', () => {
     let pubFlowCounter = 0
 
@@ -796,6 +1618,12 @@ describe('campaign lifecycle', () => {
         coinsPerPublisher: 100,
       })
       await campaignRepo.createCreative(generateUuid(), campaign.id, { caption: 'PubFlow caption', mediaUrl: 'https://example.com/img.jpg' })
+      await campaignRepo.createMetaSettings(generateUuid(), campaign.id, {
+        objective: 'OUTCOME_TRAFFIC',
+        budgetType: 'lifetime',
+        budgetAmount: 500,
+        endTime: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      })
       await campaignRepo.updateCampaign(campaign.id, { status: 'awaiting_publishers' })
       await campaignRepo.createPublisherRequests(campaign.id, publishers.map(p => p.id), 100)
       const requests = await campaignRepo.findPublisherRequestsByCampaignId(campaign.id)
@@ -975,29 +1803,56 @@ describe('campaign lifecycle', () => {
       expect(metaMocks.updateAdStatus).toHaveBeenCalledTimes(9)
     })
 
-    it('retry-meta rebuilds client and accepted publisher objects after full cleanup', async () => {
-      const { campaign, publishers, requestIds } = await createAwaitingCampaign(2)
-      await campaignService.acceptPublisherRequest(publishers[0].id, requestIds[0])
-      await campaignService.forceGoLiveCampaign(admin?.id ?? null, campaign.id)
+    it('retry-meta resumes chains surgically without deleting existing objects', async () => {
+      await setRuntimeFlag(true)
+      try {
+        const { campaign, publishers, requestIds } = await createAwaitingCampaign(2)
+        await campaignService.acceptPublisherRequest(publishers[0].id, requestIds[0])
+        await campaignService.forceGoLiveCampaign(admin?.id ?? null, campaign.id)
 
-      const before = await query('SELECT * FROM campaign_meta_objects WHERE campaign_id = ?', [uuidToBuffer(campaign.id)])
-      expect(before).toHaveLength(8)
+        const before = await campaignRepo.findMetaObjectsByCampaignId(campaign.id)
+        expect(before).toHaveLength(8)
+        const beforeIds = new Set(before.map(r => r.objectId))
 
-      metaMocks.deleteAdCampaign.mockClear()
-      metaMocks.deleteAdSet.mockClear()
-      metaMocks.deleteAdCreative.mockClear()
-      metaMocks.deleteAd.mockClear()
+        metaMocks.deleteAdCampaign.mockClear()
+        metaMocks.deleteAdSet.mockClear()
+        metaMocks.deleteAdCreative.mockClear()
+        metaMocks.deleteAd.mockClear()
+        metaMocks.createAdCampaign.mockClear()
+        metaMocks.createAdSet.mockClear()
+        metaMocks.createAdCreative.mockClear()
+        metaMocks.createAd.mockClear()
 
-      const result = await campaignService.retryCampaignMeta(campaign.id)
+        const result = await campaignService.retryCampaignMeta(campaign.id)
 
-      expect(result.success).toBe(true)
-      expect(metaMocks.deleteAdCampaign).toHaveBeenCalledTimes(2)
+        expect(result.success).toBe(true)
+        expect(metaMocks.deleteAdCampaign).not.toHaveBeenCalled()
+        expect(metaMocks.deleteAdSet).not.toHaveBeenCalled()
+        expect(metaMocks.deleteAdCreative).not.toHaveBeenCalled()
+        expect(metaMocks.deleteAd).not.toHaveBeenCalled()
+        expect(metaMocks.createAdCampaign).not.toHaveBeenCalled()
+        expect(metaMocks.createAdSet).not.toHaveBeenCalled()
+        expect(metaMocks.createAdCreative).not.toHaveBeenCalled()
+        expect(metaMocks.createAd).not.toHaveBeenCalled()
 
-      const rows = await query('SELECT * FROM campaign_meta_objects WHERE campaign_id = ?', [uuidToBuffer(campaign.id)])
-      expect(rows).toHaveLength(8)
+        const rows = await campaignRepo.findMetaObjectsByCampaignId(campaign.id)
+        expect(rows).toHaveLength(8)
+        expect(new Set(rows.map(r => r.objectId))).toEqual(beforeIds)
 
-      const pubRequests = await campaignRepo.findPublisherRequestsByCampaignId(campaign.id)
-      expect(pubRequests.find(r => r.publisherId === publishers[0].id).status).toBe('published')
+        const pubRequests = await campaignRepo.findPublisherRequestsByCampaignId(campaign.id)
+        expect(pubRequests.find(r => r.publisherId === publishers[0].id).status).toBe('published')
+
+        const executions = await execRepo.findExecutionsByCampaignId(campaign.id)
+        expect(executions).toHaveLength(2)
+        for (const execution of executions) {
+          expect(execution.platformCampaignId).toBeTruthy()
+          expect(execution.platformAdsetId).toBeTruthy()
+          expect(execution.platformCreativeId).toBeTruthy()
+          expect(execution.platformAdId).toBeTruthy()
+        }
+      } finally {
+        await setRuntimeFlag(false)
+      }
     })
   })
 })

@@ -1,6 +1,15 @@
 import * as service from './campaign.service.js'
 import { sendSuccess, sendCreated, sendNoContent, sendPaginated, sendAccepted } from '../../../shared/utils/response.utils.js'
 
+export async function checkCampaignMedia(req, res, next) {
+  try {
+    const result = await service.checkCampaignMedia(req.body)
+    return sendSuccess(res, result)
+  } catch (error) {
+    next(error)
+  }
+}
+
 export async function createCampaign(req, res, next) {
   try {
     const campaign = await service.createCampaign(req.user.id, req.body)
@@ -68,6 +77,24 @@ export async function validateCampaign(req, res, next) {
   }
 }
 
+export async function reopenCampaign(req, res, next) {
+  try {
+    const campaign = await service.reopenFailedAwaitingPublishersCampaign(req.user.id, req.params.id)
+    return sendSuccess(res, campaign, 'Campaign reopened for edit — escrow refunded')
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function requestCreativeAmendment(req, res, next) {
+  try {
+    const result = await service.requestClientCreativeAmendment(req.user.id, req.params.id, req.body)
+    return sendAccepted(res, result, 'Creative fix queued — rebuilding the live ad')
+  } catch (error) {
+    next(error)
+  }
+}
+
 export async function saveCreative(req, res, next) {
   try {
     const creative = await service.saveCreative(req.user.id, req.params.id, req.body)
@@ -90,7 +117,7 @@ export async function confirmAdjustments(req, res, next) {
   try {
     const result = await service.confirmAdjustments(req.user.id, req.params.id)
     if (result?.queued) {
-      return sendAccepted(res, { jobId: result.jobId }, 'Adjustments confirmed — activation queued')
+      return sendAccepted(res, { jobId: result.jobId, executionId: result.executionId || null }, 'Adjustments confirmed — activation queued')
     }
     return sendSuccess(res, result, 'Adjustments confirmed, publisher requests sent')
   } catch (error) {

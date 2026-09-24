@@ -69,6 +69,7 @@ function mapMetaSettingsRow(row) {
     objective: row.objective,
     adAccountId: row.ad_account_id,
     bidStrategy: row.bid_strategy,
+    bidAmount: row.bid_amount ? Number(row.bid_amount) : null,
     optimizationGoal: row.optimization_goal,
     budgetType: row.budget_type,
     budgetAmount: row.budget_amount ? Number(row.budget_amount) : null,
@@ -77,6 +78,7 @@ function mapMetaSettingsRow(row) {
     endTime: row.end_time || null,
     targeting: typeof row.targeting === 'string' ? JSON.parse(row.targeting) : row.targeting || {},
     platformPlacement: typeof row.platform_placement === 'string' ? JSON.parse(row.platform_placement) : row.platform_placement || {},
+    specialAdCategories: typeof row.special_ad_categories === 'string' ? JSON.parse(row.special_ad_categories) : row.special_ad_categories || [],
   }
 }
 
@@ -157,6 +159,33 @@ export async function findCampaignById(id) {
   return  mapCampaignRow(row)
 }
 
+function mapCampaignSnapshotRow(row) {
+  if (!row || !row.resolved_config) return null
+  const config = typeof row.resolved_config === 'string' ? JSON.parse(row.resolved_config) : row.resolved_config
+  return {
+    config,
+    hash: row.resolved_config_hash || null,
+    graphVersion: row.resolved_graph_version || null,
+    resolvedAt: row.resolved_at || null,
+  }
+}
+
+export async function findCampaignSnapshot(campaignId) {
+  const row = await queryOne(
+    'SELECT resolved_config, resolved_config_hash, resolved_graph_version, resolved_at FROM campaigns WHERE id = ?',
+    [uuidToBuffer(campaignId)]
+  )
+  return mapCampaignSnapshotRow(row)
+}
+
+export async function freezeCampaignSnapshot(campaignId, { config, hash, graphVersion }) {
+  const result = await query(
+    'UPDATE campaigns SET resolved_config = ?, resolved_config_hash = ?, resolved_graph_version = ?, resolved_at = NOW() WHERE id = ?',
+    [JSON.stringify(config), hash, graphVersion, uuidToBuffer(campaignId)]
+  )
+  return result.affectedRows || 0
+}
+
 export async function findCampaignsByClientId(clientId, { page = 1, limit = 20, status }) {
   const offset = (page - 1) * limit
   const where = ['client_id = ?', 'deleted_at IS NULL']
@@ -187,7 +216,7 @@ export async function findCampaignsByClientId(clientId, { page = 1, limit = 20, 
   }
 }
 
-export async function findAllCampaigns({ page = 1, limit = 20, status, clientId }) {
+export async function findAllCampaigns({ page = 1, limit = 20, status, clientId, search }) {
   const offset = (page - 1) * limit
   const where = ['c.deleted_at IS NULL']
   const params = []
@@ -202,10 +231,19 @@ export async function findAllCampaigns({ page = 1, limit = 20, status, clientId 
     params.push(uuidToBuffer(clientId))
   }
 
+  if (search) {
+    where.push('(c.name LIKE ? OR u.email LIKE ? OR up.first_name LIKE ? OR up.last_name LIKE ?)')
+    const pattern = `%${search}%`
+    params.push(pattern, pattern, pattern, pattern)
+  }
+
   const whereClause = `WHERE ${where.join(' AND ')}`
 
   const countRow = await queryOne(
-    `SELECT COUNT(*) as total FROM campaigns c ${whereClause}`,
+    `SELECT COUNT(*) as total FROM campaigns c
+     JOIN users u ON u.id = c.client_id
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     ${whereClause}`,
     params
   )
 
@@ -347,19 +385,21 @@ export async function findCreativeByCampaignId(campaignId) {
 
 export async function createMetaSettings(id, campaignId, data) {
   await query(
-    `INSERT INTO campaign_meta_settings (id, campaign_id, objective, ad_account_id, bid_strategy, optimization_goal, budget_type, budget_amount, billing_event, spend_cap, end_time, targeting, platform_placement)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO campaign_meta_settings (id, campaign_id, objective, ad_account_id, bid_strategy, bid_amount, optimization_goal, budget_type, budget_amount, billing_event, spend_cap, end_time, targeting, platform_placement, special_ad_categories)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE objective = VALUES(objective), ad_account_id = VALUES(ad_account_id),
-       bid_strategy = VALUES(bid_strategy), optimization_goal = VALUES(optimization_goal),
+       bid_strategy = VALUES(bid_strategy), bid_amount = VALUES(bid_amount), optimization_goal = VALUES(optimization_goal),
        budget_type = VALUES(budget_type), budget_amount = VALUES(budget_amount),
        billing_event = VALUES(billing_event), spend_cap = VALUES(spend_cap), end_time = VALUES(end_time),
-       targeting = VALUES(targeting), platform_placement = VALUES(platform_placement)`,
+       targeting = VALUES(targeting), platform_placement = VALUES(platform_placement),
+       special_ad_categories = VALUES(special_ad_categories)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(campaignId),
       data.objective,
       data.adAccountId || null,
       data.bidStrategy || null,
+      data.bidAmount || null,
       data.optimizationGoal || null,
       data.budgetType || null,
       data.budgetAmount || null,
@@ -368,6 +408,7 @@ export async function createMetaSettings(id, campaignId, data) {
       data.endTime ? new Date(data.endTime).toISOString().slice(0, 19).replace('T', ' ') : null,
       JSON.stringify(data.targeting || {}),
       JSON.stringify(data.platformPlacement || {}),
+      JSON.stringify(data.specialAdCategories || []),
     ]
   )
   return findMetaSettingsByCampaignId(campaignId)
@@ -425,6 +466,24 @@ export async function findMetaObjectsByCampaignId(campaignId) {
   return rows.map(mapMetaObjectRow)
 }
 
+export async function findMetaObjectByObjectId(objectId) {
+  const row = await queryOne(
+    'SELECT * FROM campaign_meta_objects WHERE object_id = ?',
+    [objectId]
+  )
+  return mapMetaObjectRow(row)
+}
+
+export async function deleteMetaObjectsByObjectIds(campaignId, objectIds) {
+  if (!objectIds.length) return 0
+  const placeholders = objectIds.map(() => '?').join(',')
+  const result = await query(
+    `DELETE FROM campaign_meta_objects WHERE campaign_id = ? AND object_id IN (${placeholders})`,
+    [uuidToBuffer(campaignId), ...objectIds]
+  )
+  return result.affectedRows || 0
+}
+
 export async function findMetaObjectsForUser(campaignId, userId) {
   const rows = await query(
     'SELECT * FROM campaign_meta_objects WHERE campaign_id = ? AND created_for_user_id = ?',
@@ -436,6 +495,50 @@ export async function findMetaObjectsForUser(campaignId, userId) {
 export async function deleteMetaObjectsForUser(campaignId, userId) {
   await query(
     'DELETE FROM campaign_meta_objects WHERE campaign_id = ? AND created_for_user_id = ?',
+    [uuidToBuffer(campaignId), uuidToBuffer(userId)]
+  )
+}
+
+function mapCampaignAdVideoRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    campaignId: bufferToUuid(row.campaign_id),
+    createdForUserId: bufferToUuid(row.created_for_user_id),
+    mediaUrl: row.media_url,
+    videoId: row.video_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+// Persists the Meta ad-account video object resolved for a (campaign, owner)
+// pair, keyed also by the source mediaUrl so a changed creative media URL is
+// detected as stale rather than silently reusing a video for different
+// content. This is what lets a job retry resume without re-uploading —
+// video processing/upload is a real cost, and campaign job retries are
+// automatic (unlike the admin-triggered repair flow).
+export async function findCampaignAdVideo(campaignId, userId) {
+  const row = await queryOne(
+    'SELECT * FROM campaign_ad_videos WHERE campaign_id = ? AND created_for_user_id = ?',
+    [uuidToBuffer(campaignId), uuidToBuffer(userId)]
+  )
+  return mapCampaignAdVideoRow(row)
+}
+
+export async function upsertCampaignAdVideo(campaignId, userId, mediaUrl, videoId) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO campaign_ad_videos (id, campaign_id, created_for_user_id, media_url, video_id)
+     VALUES (?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE media_url = VALUES(media_url), video_id = VALUES(video_id)`,
+    [uuidToBuffer(id), uuidToBuffer(campaignId), uuidToBuffer(userId), mediaUrl, videoId]
+  )
+}
+
+export async function deleteCampaignAdVideo(campaignId, userId) {
+  await query(
+    'DELETE FROM campaign_ad_videos WHERE campaign_id = ? AND created_for_user_id = ?',
     [uuidToBuffer(campaignId), uuidToBuffer(userId)]
   )
 }
@@ -754,6 +857,15 @@ export async function countPublisherRequestsByStatus(campaignId, status) {
   return row.count
 }
 
+export async function countLivePublisherRequestsByPublisher(campaignId, publisherId, excludeId) {
+  const row = await queryOne(
+    `SELECT COUNT(*) as count FROM campaign_publisher_requests
+     WHERE campaign_id = ? AND publisher_id = ? AND status IN ('accepted','published') AND id != ?`,
+    [uuidToBuffer(campaignId), uuidToBuffer(publisherId), uuidToBuffer(excludeId)]
+  )
+  return Number(row.count) || 0
+}
+
 export async function findPublisherRequestsByStatus(campaignId, status) {
   const rows = await query(
     'SELECT * FROM campaign_publisher_requests WHERE campaign_id = ? AND status = ?',
@@ -877,6 +989,16 @@ export async function enqueueCampaignJob(id, campaignId, jobType, actorId = null
 
 export async function findCampaignJobById(id) {
   const row = await queryOne('SELECT * FROM campaign_jobs WHERE id = ?', [uuidToBuffer(id)])
+  return mapCampaignJobRow(row)
+}
+
+export async function findActiveCampaignJob(campaignId, jobType) {
+  const row = await queryOne(
+    `SELECT * FROM campaign_jobs
+     WHERE campaign_id = ? AND job_type = ? AND status IN ('queued', 'running')
+     ORDER BY created_at ASC LIMIT 1`,
+    [uuidToBuffer(campaignId), jobType]
+  )
   return mapCampaignJobRow(row)
 }
 
@@ -1620,6 +1742,22 @@ export async function markCampaignSettled(campaignId) {
   )
 }
 
+export async function claimCampaignSettlement(campaignId) {
+  const result = await query(
+    'UPDATE campaigns SET settled_at = NOW() WHERE id = ? AND settled_at IS NULL',
+    [uuidToBuffer(campaignId)]
+  )
+  return result.affectedRows || 0
+}
+
+export async function releaseCampaignSettlement(campaignId) {
+  const result = await query(
+    'UPDATE campaigns SET settled_at = NULL WHERE id = ?',
+    [uuidToBuffer(campaignId)]
+  )
+  return result.affectedRows || 0
+}
+
 export async function findEndableRunningCampaigns() {
   const rows = await query(
     `SELECT c.* FROM campaigns c
@@ -1900,4 +2038,266 @@ export async function getSchedulerLease(leaseName) {
     expiresAt: row.expires_at,
     updatedAt: row.updated_at,
   }
+}
+
+const EXECUTION_STATS_CHUNK = 500
+
+export async function findExecutionIdsByFbObjectIds(fbObjectIds) {
+  if (!fbObjectIds?.length) return new Map()
+  const map = new Map()
+  for (let i = 0; i < fbObjectIds.length; i += 100) {
+    const chunk = fbObjectIds.slice(i, i + 100)
+    const placeholders = chunk.map(() => '?').join(', ')
+    const rows = await query(
+      `SELECT id, platform_campaign_id, campaign_id, kind, owner_user_id, status
+       FROM campaign_executions
+       WHERE platform_campaign_id IN (${placeholders})`,
+      chunk
+    )
+    for (const row of rows) {
+      map.set(row.platform_campaign_id, {
+        id: bufferToUuid(row.id),
+        campaignId: bufferToUuid(row.campaign_id),
+        kind: row.kind,
+        ownerUserId: bufferToUuid(row.owner_user_id),
+        status: row.status,
+      })
+    }
+  }
+  return map
+}
+
+function mapExecutionDailyStatRow(row) {
+  return {
+    id: bufferToUuid(row.id),
+    executionId: bufferToUuid(row.campaign_execution_id),
+    statDate: row.stat_date,
+    impressions: Number(row.impressions) || 0,
+    reach: Number(row.reach) || 0,
+    frequency: Number(row.frequency) || 0,
+    clicks: Number(row.clicks) || 0,
+    uniqueClicks: Number(row.unique_clicks) || 0,
+    ctr: Number(row.ctr) || 0,
+    cpc: Number(row.cpc) || 0,
+    cpm: Number(row.cpm) || 0,
+    spendPaise: Number(row.spend_paise) || 0,
+    actions: row.actions ? JSON.parse(row.actions) : {},
+    costPerActionType: row.cost_per_action_type ? JSON.parse(row.cost_per_action_type) : {},
+    updatedAt: row.updated_at || null,
+  }
+}
+
+export async function findExecutionDailyStats(executionId, { from, to } = {}) {
+  const conditions = ['campaign_execution_id = ?']
+  const params = [uuidToBuffer(executionId)]
+  if (from) {
+    conditions.push('stat_date >= ?')
+    params.push(from)
+  }
+  if (to) {
+    conditions.push('stat_date <= ?')
+    params.push(to)
+  }
+  const rows = await query(
+    `SELECT * FROM campaign_execution_daily_stats WHERE ${conditions.join(' AND ')} ORDER BY stat_date ASC`,
+    params
+  )
+  return rows.map(mapExecutionDailyStatRow)
+}
+
+export async function findExecutionDailyStatsByCampaignId(campaignId, { from, to } = {}) {
+  const conditions = ['ce.campaign_id = ?']
+  const params = [uuidToBuffer(campaignId)]
+  if (from) {
+    conditions.push('eds.stat_date >= ?')
+    params.push(from)
+  }
+  if (to) {
+    conditions.push('eds.stat_date <= ?')
+    params.push(to)
+  }
+  const rows = await query(
+    `SELECT eds.*, ce.kind, ce.owner_user_id, ce.status, ce.platform_campaign_id, ce.ad_account_act_id,
+            u.email AS owner_email, up.first_name AS owner_first_name, up.last_name AS owner_last_name,
+            pr.id AS publisher_request_id, pr.publisher_id,
+            pu.email AS publisher_email, pup.first_name AS publisher_first_name, pup.last_name AS publisher_last_name
+     FROM campaign_execution_daily_stats eds
+     JOIN campaign_executions ce ON ce.id = eds.campaign_execution_id
+     JOIN users u ON u.id = ce.owner_user_id
+     LEFT JOIN user_profiles up ON up.user_id = u.id
+     LEFT JOIN campaign_publisher_requests pr ON pr.id = ce.publisher_request_id
+     LEFT JOIN users pu ON pu.id = pr.publisher_id
+     LEFT JOIN user_profiles pup ON pup.user_id = pu.id
+     WHERE ${conditions.join(' AND ')}
+     ORDER BY eds.stat_date ASC`,
+    params
+  )
+  return rows.map(r => ({
+    ...mapExecutionDailyStatRow(r),
+    kind: r.kind,
+    status: r.status,
+    platformCampaignId: r.platform_campaign_id,
+    adAccountActId: r.ad_account_act_id,
+    owner: {
+      id: bufferToUuid(r.owner_user_id),
+      email: r.owner_email,
+      firstName: r.owner_first_name,
+      lastName: r.owner_last_name,
+    },
+    publisher: r.publisher_id ? {
+      id: bufferToUuid(r.publisher_id),
+      email: r.publisher_email,
+      firstName: r.publisher_first_name,
+      lastName: r.publisher_last_name,
+    } : null,
+  }))
+}
+
+export async function upsertExecutionDailyStatsBulk(executionId, snapshots) {
+  const list = (snapshots || []).filter(s => s && s.statDate)
+  if (!list.length) return 0
+  let written = 0
+  for (let offset = 0; offset < list.length; offset += EXECUTION_STATS_CHUNK) {
+    const chunk = list.slice(offset, offset + EXECUTION_STATS_CHUNK)
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
+    const params = []
+    for (const s of chunk) {
+      params.push(
+        uuidToBuffer(generateUuid()),
+        uuidToBuffer(executionId),
+        s.statDate,
+        s.impressions || 0,
+        s.reach || 0,
+        s.frequency || 0,
+        s.clicks || 0,
+        s.uniqueClicks || 0,
+        s.ctr || 0,
+        s.cpc || 0,
+        s.cpm || 0,
+        s.spendPaise || 0,
+        JSON.stringify(s.actions || {}),
+        JSON.stringify(s.costPerActionType || {})
+      )
+    }
+    await query(
+      `INSERT INTO campaign_execution_daily_stats
+         (id, campaign_execution_id, stat_date, impressions, reach, frequency, clicks, unique_clicks, ctr, cpc, cpm, spend_paise, actions, cost_per_action_type)
+       VALUES ${placeholders}
+       ON DUPLICATE KEY UPDATE
+         impressions = VALUES(impressions),
+         reach = VALUES(reach),
+         frequency = VALUES(frequency),
+         clicks = VALUES(clicks),
+         unique_clicks = VALUES(unique_clicks),
+         ctr = VALUES(ctr),
+         cpc = VALUES(cpc),
+         cpm = VALUES(cpm),
+         spend_paise = VALUES(spend_paise),
+         actions = VALUES(actions),
+         cost_per_action_type = VALUES(cost_per_action_type)`,
+      params
+    )
+    written += chunk.length
+  }
+  return written
+}
+
+export async function upsertExecutionSpendOnly(executionId, statDate, spendPaise) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO campaign_execution_daily_stats (id, campaign_execution_id, stat_date, spend_paise)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE spend_paise = GREATEST(spend_paise, VALUES(spend_paise))`,
+    [uuidToBuffer(id), uuidToBuffer(executionId), statDate, spendPaise]
+  )
+}
+
+export async function findExecutionByPlatformCampaignId(platformCampaignId) {
+  const row = await queryOne(
+    'SELECT id FROM campaign_executions WHERE platform_campaign_id = ?',
+    [platformCampaignId]
+  )
+  return row ? bufferToUuid(row.id) : null
+}
+
+export function mapMetaObjectIssueRow(row) {
+  if (!row) return null
+  return {
+    id: bufferToUuid(row.id),
+    executionId: bufferToUuid(row.campaign_execution_id),
+    executionKind: row.execution_kind || null,
+    ownerUserId: row.owner_user_id ? bufferToUuid(row.owner_user_id) : null,
+    objectId: row.object_id,
+    creativeId: row.creative_id || null,
+    level: row.level || null,
+    errorCode: row.error_code,
+    summary: row.error_summary || null,
+    message: row.error_message || null,
+    errorType: row.error_type || null,
+    active: Number(row.active) === 1,
+    observedAt: row.observed_at,
+    clearedAt: row.cleared_at || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+export async function upsertMetaObjectIssue(executionId, issue) {
+  const id = generateUuid()
+  await query(
+    `INSERT INTO meta_object_issues
+       (id, campaign_execution_id, object_id, creative_id, level, error_code, error_summary, error_message, error_type)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       active = 1,
+       cleared_at = NULL,
+       creative_id = COALESCE(VALUES(creative_id), creative_id),
+       level = VALUES(level),
+       error_summary = VALUES(error_summary),
+       error_message = VALUES(error_message),
+       error_type = VALUES(error_type)`,
+    [
+      uuidToBuffer(id),
+      uuidToBuffer(executionId),
+      issue.objectId,
+      issue.creativeId || null,
+      issue.level || null,
+      issue.errorCode,
+      issue.summary || null,
+      issue.message || null,
+      issue.errorType || null,
+    ]
+  )
+  const row = await queryOne(
+    `SELECT * FROM meta_object_issues
+     WHERE campaign_execution_id = ? AND object_id = ? AND error_code = ?`,
+    [uuidToBuffer(executionId), issue.objectId, issue.errorCode]
+  )
+  return mapMetaObjectIssueRow(row)
+}
+
+export async function deactivateMissingMetaObjectIssues(executionId, objectId, activeCodes) {
+  const codes = (activeCodes || []).map(String)
+  let sql = `UPDATE meta_object_issues
+     SET active = 0, cleared_at = COALESCE(cleared_at, NOW())
+     WHERE campaign_execution_id = ? AND object_id = ? AND active = 1`
+  const params = [uuidToBuffer(executionId), objectId]
+  if (codes.length) {
+    sql += ` AND error_code NOT IN (${codes.map(() => '?').join(',')})`
+    params.push(...codes)
+  }
+  const result = await query(sql, params)
+  return Number(result?.affectedRows || 0)
+}
+
+export async function findMetaObjectIssuesByCampaignId(campaignId, { activeOnly = false } = {}) {
+  let sql = `SELECT i.*, ce.kind AS execution_kind, ce.owner_user_id
+     FROM meta_object_issues i
+     JOIN campaign_executions ce ON ce.id = i.campaign_execution_id
+     WHERE ce.campaign_id = ?`
+  const params = [uuidToBuffer(campaignId)]
+  if (activeOnly) sql += ' AND i.active = 1'
+  sql += ' ORDER BY i.observed_at ASC'
+  const rows = await query(sql, params)
+  return rows.map(mapMetaObjectIssueRow)
 }

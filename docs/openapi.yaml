@@ -295,6 +295,292 @@ components:
           type: string
           format: date-time
 
+    Campaign:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          type: string
+        status:
+          type: string
+          enum: [draft, pending_review, approved, scheduled, running, paused, completed, cancelled, failed, awaiting_publishers, archived]
+        metaStatus:
+          type: string
+          nullable: true
+        metaError:
+          type: string
+          nullable: true
+        metaIssues:
+          type: array
+          items:
+            $ref: "#/components/schemas/CampaignMetaIssue"
+        scheduledAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    CampaignCreative:
+      type: object
+      properties:
+        mediaUrl:
+          type: string
+          nullable: true
+        caption:
+          type: string
+          nullable: true
+        hashtags:
+          type: string
+          nullable: true
+        textBody:
+          type: string
+          nullable: true
+        callToAction:
+          type: string
+          nullable: true
+        headline:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+
+    CampaignMetaSettings:
+      type: object
+      properties:
+        objective:
+          type: string
+        budgetType:
+          type: string
+          nullable: true
+        budgetAmount:
+          type: number
+          nullable: true
+        platformPlacement:
+          type: object
+          nullable: true
+        targeting:
+          type: object
+          nullable: true
+
+    CampaignMetaIssue:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        executionId:
+          type: string
+          format: uuid
+          nullable: true
+        executionKind:
+          type: string
+          nullable: true
+        ownerUserId:
+          type: string
+          format: uuid
+          nullable: true
+        objectId:
+          type: string
+        creativeId:
+          type: string
+          nullable: true
+        level:
+          type: string
+          nullable: true
+        errorCode:
+          type: string
+        summary:
+          type: string
+          nullable: true
+        message:
+          type: string
+          nullable: true
+        errorType:
+          type: string
+          nullable: true
+        active:
+          type: boolean
+        observedAt:
+          type: string
+          format: date-time
+        clearedAt:
+          type: string
+          format: date-time
+          nullable: true
+        category:
+          type: string
+          nullable: true
+        guidance:
+          type: string
+          nullable: true
+
+    ExecutionRepairStatus:
+      type: object
+      properties:
+        executionId:
+          type: string
+          format: uuid
+        campaignId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        ownerUserId:
+          type: string
+          format: uuid
+        health:
+          type: string
+          enum: [HEALTHY, ACTION_REQUIRED]
+        workflowState:
+          type: string
+        eligible:
+          type: boolean
+        reasons:
+          type: array
+          items:
+            type: string
+        issues:
+          type: array
+          items:
+            type: object
+        activeRepair:
+          type: object
+          nullable: true
+        lastRepair:
+          type: object
+          nullable: true
+        completedRepairs:
+          type: integer
+        generation:
+          type: object
+          nullable: true
+
+    RepairPreviewResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              key:
+                type: string
+              ok:
+                type: boolean
+              message:
+                type: string
+                nullable: true
+        issue:
+          type: object
+          nullable: true
+        media:
+          type: object
+          nullable: true
+          properties:
+            assetId:
+              type: string
+              format: uuid
+              nullable: true
+            url:
+              type: string
+            width:
+              type: integer
+              nullable: true
+            height:
+              type: integer
+              nullable: true
+            name:
+              type: string
+              nullable: true
+            kind:
+              type: string
+              nullable: true
+            durationSeconds:
+              type: number
+              nullable: true
+        execution:
+          type: object
+          nullable: true
+
+    RepairRequestResult:
+      type: object
+      properties:
+        repairId:
+          type: string
+          format: uuid
+        runKey:
+          type: string
+        status:
+          type: string
+        queued:
+          type: boolean
+        duplicate:
+          type: boolean
+        rearmed:
+          type: boolean
+
+    RepairReadiness:
+      type: object
+      properties:
+        ready:
+          type: boolean
+        stage:
+          type: integer
+        flags:
+          type: object
+        checks:
+          type: array
+          items:
+            type: object
+        fleet:
+          type: object
+        metrics:
+          type: object
+
+    MetaAdAccount:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        accountId:
+          type: string
+        name:
+          type: string
+          nullable: true
+        monthlyCapPaise:
+          type: integer
+        isPrimary:
+          type: boolean
+        status:
+          type: string
+          enum: [active, disabled]
+
+    QueuedJob:
+      type: object
+      properties:
+        queued:
+          type: boolean
+        jobId:
+          type: string
+          format: uuid
+        executionId:
+          type: string
+          format: uuid
+          nullable: true
+
 tags:
   - name: Auth
     description: Authentication and registration
@@ -316,6 +602,10 @@ tags:
     description: Admin operations for identity document management
   - name: Health
     description: Health check
+  - name: Campaigns
+    description: Client campaign lifecycle and Meta settings
+  - name: Admin Campaigns
+    description: Admin campaign review, Meta operations, and execution repair
 
 paths:
   /identity/documents:
@@ -1724,3 +2014,904 @@ paths:
       responses:
         "204":
           description: Category deleted
+
+  /campaigns/meta-search:
+    get:
+      tags: [Campaigns]
+      summary: Search Meta objects for campaign setup (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Meta search results
+
+  /campaigns:
+    post:
+      tags: [Campaigns]
+      summary: Create campaign draft (client)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                type:
+                  type: string
+                  default: post
+                categoryId:
+                  type: string
+                  format: uuid
+                  nullable: true
+                scheduledAt:
+                  type: string
+                  format: date-time
+                  nullable: true
+                publisherCount:
+                  type: integer
+                  nullable: true
+                coinsPerPublisher:
+                  type: number
+                  nullable: true
+      responses:
+        "201":
+          description: Campaign draft created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/Campaign"
+
+    get:
+      tags: [Campaigns]
+      summary: List my campaigns (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: status
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated campaigns
+
+  /campaigns/{id}:
+    get:
+      tags: [Campaigns]
+      summary: Get campaign detail with creative, settings, issues (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Campaign detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/Campaign"
+        "404":
+          description: Campaign not found
+
+    patch:
+      tags: [Campaigns]
+      summary: Update editable campaign (resets non-draft to draft)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                categoryId:
+                  type: string
+                  format: uuid
+                  nullable: true
+                scheduledAt:
+                  type: string
+                  format: date-time
+                  nullable: true
+      responses:
+        "200":
+          description: Campaign updated
+        "422":
+          description: Campaign not editable in its current status
+
+  /campaigns/{id}/submit:
+    post:
+      tags: [Campaigns]
+      summary: Submit campaign for review (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Campaign submitted
+
+  /campaigns/{id}/cancel:
+    post:
+      tags: [Campaigns]
+      summary: Cancel campaign and refund unused resources (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Campaign cancelled
+
+  /campaigns/{id}/validate:
+    post:
+      tags: [Campaigns]
+      summary: Pre-validate draft against Meta validate_only (client, no writes)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Per-check validation result with Meta error detail
+
+  /campaigns/{id}/creative:
+    get:
+      tags: [Campaigns]
+      summary: Get campaign creative (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Creative detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/CampaignCreative"
+
+    put:
+      tags: [Campaigns]
+      summary: Save campaign creative (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CampaignCreative"
+      responses:
+        "200":
+          description: Creative saved
+
+  /campaigns/{id}/meta-settings:
+    get:
+      tags: [Campaigns]
+      summary: Get Meta ad settings (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Meta settings detail
+
+    put:
+      tags: [Campaigns]
+      summary: Save Meta ad settings (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CampaignMetaSettings"
+      responses:
+        "200":
+          description: Meta settings saved
+
+  /campaigns/{id}/confirm-adjustments:
+    post:
+      tags: [Campaigns]
+      summary: Confirm Meta-suggested adjustments, publish and activate (client, 202 when queued)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Adjustments confirmed synchronously
+        "202":
+          description: Activation queued; poll the job
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/QueuedJob"
+
+  /campaigns/{id}/publishers:
+    get:
+      tags: [Campaigns]
+      summary: List publisher requests for a campaign (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Publisher requests
+
+  /campaigns/{id}/duplicate:
+    post:
+      tags: [Campaigns]
+      summary: Duplicate a campaign as a new draft (client)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "201":
+          description: Campaign duplicated
+
+  /campaigns/{id}/insights:
+    get:
+      tags: [Campaigns]
+      summary: Cached daily Meta stats with totals (client, refresh=true requeues sync)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: refresh
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Cached insights or refresh-queued acknowledgement
+
+  /admin/campaigns/meta/sync-health:
+    get:
+      tags: [Admin Campaigns]
+      summary: Meta sync health, queue depth, leases, accounts (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Sync health snapshot
+
+  /admin/campaigns/meta/accounts:
+    get:
+      tags: [Admin Campaigns]
+      summary: List Meta ad accounts (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Ad accounts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MetaAdAccount"
+
+    post:
+      tags: [Admin Campaigns]
+      summary: Add Meta ad account (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - metaAccountId
+              properties:
+                metaAccountId:
+                  type: string
+                name:
+                  type: string
+                  nullable: true
+                token:
+                  type: string
+                  nullable: true
+                monthlyCapPaise:
+                  type: integer
+                  default: 0
+                isPrimary:
+                  type: boolean
+                  default: false
+                status:
+                  type: string
+                  enum: [active, disabled]
+                  default: active
+      responses:
+        "201":
+          description: Ad account created
+
+  /admin/campaigns/meta/accounts/{id}:
+    put:
+      tags: [Admin Campaigns]
+      summary: Update Meta ad account (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                token:
+                  type: string
+                monthlyCapPaise:
+                  type: integer
+                isPrimary:
+                  type: boolean
+                status:
+                  type: string
+                  enum: [active, disabled]
+      responses:
+        "200":
+          description: Ad account updated
+
+    delete:
+      tags: [Admin Campaigns]
+      summary: Delete Meta ad account (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Ad account deleted
+
+  /admin/campaigns:
+    get:
+      tags: [Admin Campaigns]
+      summary: List all campaigns (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: status
+          schema:
+            type: string
+        - in: query
+          name: clientId
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Paginated campaigns
+
+  /admin/campaigns/{id}:
+    get:
+      tags: [Admin Campaigns]
+      summary: Campaign detail with issues and executions (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Campaign detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/Campaign"
+        "404":
+          description: Campaign not found
+
+  /admin/campaigns/{id}/sync:
+    post:
+      tags: [Admin Campaigns]
+      summary: Force per-campaign Meta sync via account job (admin, campaigns.review, 202)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "202":
+          description: Sync queued
+
+  /admin/campaigns/{id}/settle:
+    post:
+      tags: [Admin Campaigns]
+      summary: Settle campaign billing (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Settlement result
+
+  /admin/campaigns/{id}/approve:
+    post:
+      tags: [Admin Campaigns]
+      summary: Approve campaign, create Meta objects and activate (admin, campaigns.review, 202 when queued)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notes:
+                  type: string
+                publisherCount:
+                  type: integer
+      responses:
+        "200":
+          description: Approved synchronously (fast paths)
+        "202":
+          description: Approval queued; poll the job
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/QueuedJob"
+
+  /admin/campaigns/{id}/reject:
+    post:
+      tags: [Admin Campaigns]
+      summary: Reject campaign with notes (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - notes
+              properties:
+                notes:
+                  type: string
+      responses:
+        "200":
+          description: Campaign rejected
+
+  /admin/campaigns/{id}/retry-meta:
+    post:
+      tags: [Admin Campaigns]
+      summary: Retry failed Meta chain creation (admin, campaigns.review, 202)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "202":
+          description: Retry queued
+
+  /admin/campaigns/{id}/force-go-live:
+    post:
+      tags: [Admin Campaigns]
+      summary: Force go-live bypassing publisher fill (admin, campaigns.force-manage, 202)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "202":
+          description: Go-live queued
+
+  /admin/campaigns/{id}/force-cancel:
+    post:
+      tags: [Admin Campaigns]
+      summary: Force-cancel campaign (admin, campaigns.force-manage)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Campaign force-cancelled
+
+  /admin/campaigns/{id}/insights:
+    get:
+      tags: [Admin Campaigns]
+      summary: Campaign insights for review (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Insights detail
+
+  /admin/campaigns/{campaignId}/executions/{executionId}/repairs:
+    post:
+      tags: [Admin Campaigns]
+      summary: Request execution repair with replacement media (admin, campaigns.review, 202)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: campaignId
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: executionId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mediaAssetId:
+                  type: string
+                  format: uuid
+                mediaUrl:
+                  type: string
+                  format: uri
+                  description: Direct image/video URL, sent to Meta as-is. Exactly one of mediaAssetId or mediaUrl is required.
+                issueCode:
+                  type: string
+      responses:
+        "202":
+          description: Repair queued (or duplicate acknowledgment)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/RepairRequestResult"
+        "403":
+          description: Rollout off, kill switch on, or missing permission
+        "422":
+          description: Media outside Facebook/Instagram criteria, unknown issue, or validation failure
+
+  /admin/campaigns/{campaignId}/executions/{executionId}/repair-status:
+    get:
+      tags: [Admin Campaigns]
+      summary: Execution repair status, eligibility, and active repair (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: campaignId
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: executionId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Repair status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/ExecutionRepairStatus"
+        "422":
+          description: Execution does not belong to this campaign
+
+  /admin/campaigns/{campaignId}/executions/{executionId}/repair-preview:
+    post:
+      tags: [Admin Campaigns]
+      summary: Preview repair eligibility without mutating (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: campaignId
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: path
+          name: executionId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mediaAssetId:
+                  type: string
+                  format: uuid
+                mediaUrl:
+                  type: string
+                  format: uri
+                issueCode:
+                  type: string
+      responses:
+        "200":
+          description: Per-check preview result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/RepairPreviewResult"
+
+  /admin/campaigns/repairs/readiness:
+    get:
+      tags: [Admin Campaigns]
+      summary: Repair rollout readiness, fleet summary, and metrics (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Readiness report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: "#/components/schemas/RepairReadiness"
+        "403":
+          description: Non-admin callers are denied
+
+  /admin/campaigns/conversion-rate:
+    put:
+      tags: [Admin Campaigns]
+      summary: Update coin-to-INR conversion rate (admin, campaigns.review)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - rate
+              properties:
+                rate:
+                  type: number
+      responses:
+        "200":
+          description: Conversion rate updated

@@ -95,12 +95,12 @@ async function insertTarget(postId, accountId, { targetType = 'client', metaObje
   return { targetId, objectId }
 }
 
-async function insertRequest(postId, publisherId, { coinsOffered = 100, status = 'published', accountId = null } = {}) {
+async function insertRequest(postId, publisherId, { coinsOffered = 100, status = 'published', accountId = null, publishedHoursAgo = 49 } = {}) {
   const requestId = generateUuid()
   await query(
     `INSERT INTO post_publisher_requests (id, post_id, publisher_id, platform_account_id, coins_offered, status, published_at)
-     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-    [uuidToBuffer(requestId), uuidToBuffer(postId), uuidToBuffer(publisherId), accountId ? uuidToBuffer(accountId) : null, coinsOffered, status]
+     VALUES (?, ?, ?, ?, ?, ?, NOW() - INTERVAL ? HOUR)`,
+    [uuidToBuffer(requestId), uuidToBuffer(postId), uuidToBuffer(publisherId), accountId ? uuidToBuffer(accountId) : null, coinsOffered, status, publishedHoursAgo]
   )
   return requestId
 }
@@ -603,6 +603,32 @@ describe('grace recovery and confirmation', () => {
     expect(Number(row.boost_paused_by_deletion)).toBe(0)
     expect(metaMocks.updateAdStatus).toHaveBeenCalledWith(ptgt.platformCampaignId, 'ACTIVE', expect.anything())
     expect((await promoRepo.findPromotionTargetById(ptgtId)).status).toBe('active')
+  })
+
+  it('recovery clears the webhook-set meta_deleted_at/meta_remote_status flags too — not just deletion_review_state', async () => {
+    const user = await createTestUser({ email: `dm7b-${Date.now()}@flowx-test.com`, password: 'Test@123' })
+    const { accountId } = await insertAccount(user.id, 'facebook', 'page')
+    const postId = await insertPost(user.id, `DelMon recover flags ${Date.now()}`)
+    const { targetId } = await insertTarget(postId, accountId)
+    await insertActivePromotion(postId, user.id, targetId, accountId)
+
+    metaMocks.getObjectRemoteState.mockResolvedValue({ state: 'missing' })
+    await deletionService.runRemoteHealthJob()
+    // Simulate the webhook handler's independent (unconditional) flag —
+    // separate from deletion_review_state, gates engagement sync + future
+    // webhook-expedited rechecks.
+    await query(
+      "UPDATE post_targets SET meta_deleted_at = NOW(), meta_remote_status = 'deleted' WHERE id = ?",
+      [uuidToBuffer(targetId)]
+    )
+
+    metaMocks.getObjectRemoteState.mockResolvedValue({ state: 'visible' })
+    const outcome = await deletionService.handleRemoteContentSignal({ postTargetId: targetId, remoteState: 'visible', source: 'poll' })
+    expect(outcome.recovered).toBe(true)
+    const row = await queryOne('SELECT deletion_review_state, meta_deleted_at, meta_remote_status FROM post_targets WHERE id = ?', [uuidToBuffer(targetId)])
+    expect(row.deletion_review_state).toBe('none')
+    expect(row.meta_deleted_at).toBeNull()
+    expect(row.meta_remote_status).toBeNull()
   })
 
   it('client-paused boost is never resumed by the deletion system', async () => {

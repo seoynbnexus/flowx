@@ -26,7 +26,7 @@ function fail(reason) {
 }
 
 function notContainer() {
-  return { status: 'unknown', kind: null, reason: 'unrecognized container (not JPEG or ISO-BMFF)' }
+  return { status: 'unknown', kind: null, reason: 'unrecognized container (not JPEG, PNG, GIF, WebP, or ISO-BMFF)' }
 }
 
 function parseJpeg(buffer) {
@@ -320,11 +320,121 @@ function parseStsd(buffer, bodyStart, bodyEnd, state) {
   }
 }
 
+function parsePng(buffer) {
+  if (buffer.length < 24) return fail('truncated PNG (missing IHDR)')
+  if (buffer.toString('ascii', 12, 16) !== 'IHDR') return fail('invalid PNG (missing IHDR chunk)')
+  const width = buffer.readUInt32BE(16)
+  const height = buffer.readUInt32BE(20)
+  if (!width || !height) return fail(`invalid PNG dimensions ${width}x${height}`)
+  return {
+    status: 'valid',
+    kind: 'image',
+    mediaType: 'png',
+    width,
+    height,
+    aspect: width / height,
+    sizeBytes: buffer.length,
+  }
+}
+
+function parseGif(buffer) {
+  if (buffer.length < 10) return fail('truncated GIF header')
+  const magic = buffer.toString('ascii', 0, 6)
+  if (magic !== 'GIF87a' && magic !== 'GIF89a') return fail('invalid GIF header')
+  const width = buffer.readUInt16LE(6)
+  const height = buffer.readUInt16LE(8)
+  if (!width || !height) return fail(`invalid GIF dimensions ${width}x${height}`)
+  return {
+    status: 'valid',
+    kind: 'image',
+    mediaType: 'gif',
+    width,
+    height,
+    aspect: width / height,
+    sizeBytes: buffer.length,
+  }
+}
+
+function parseWebp(buffer) {
+  if (buffer.length < 12) return fail('truncated WebP header')
+  if (buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WEBP') {
+    return fail('invalid WebP header')
+  }
+  const webpDims = (width, height) => {
+    if (!width || !height) return fail(`invalid WebP dimensions ${width}x${height}`)
+    return {
+      status: 'valid',
+      kind: 'image',
+      mediaType: 'webp',
+      width,
+      height,
+      aspect: width / height,
+      sizeBytes: buffer.length,
+    }
+  }
+  let offset = 12
+  while (offset + 8 <= buffer.length) {
+    const fourcc = buffer.toString('ascii', offset, offset + 4)
+    const size = buffer.readUInt32LE(offset + 4)
+    const dataStart = offset + 8
+    const dataEnd = dataStart + size
+    if (dataEnd > buffer.length) {
+      return { status: 'unknown', kind: 'image', mediaType: 'webp', reason: 'truncated WebP chunk', sizeBytes: buffer.length }
+    }
+    if (fourcc === 'VP8X') {
+      if (size < 10) return fail('truncated WebP VP8X chunk')
+      const width = buffer.readUIntLE(dataStart + 4, 3) + 1
+      const height = buffer.readUIntLE(dataStart + 7, 3) + 1
+      return webpDims(width, height)
+    }
+    if (fourcc === 'VP8 ') {
+      if (size < 10) return fail('truncated WebP VP8 chunk')
+      if (buffer[dataStart + 3] !== 0x9d || buffer[dataStart + 4] !== 0x01 || buffer[dataStart + 5] !== 0x2a) {
+        return fail('invalid WebP VP8 frame signature')
+      }
+      const width = buffer.readUInt16LE(dataStart + 6) & 0x3fff
+      const height = buffer.readUInt16LE(dataStart + 8) & 0x3fff
+      return webpDims(width, height)
+    }
+    if (fourcc === 'VP8L') {
+      if (size < 5) return fail('truncated WebP VP8L chunk')
+      if (buffer[dataStart] !== 0x2f) return fail('invalid WebP VP8L signature')
+      const b0 = buffer[dataStart + 1]
+      const b1 = buffer[dataStart + 2]
+      const b2 = buffer[dataStart + 3]
+      const b3 = buffer[dataStart + 4]
+      const width = 1 + (((b1 & 0x3f) << 8) | b0)
+      const height = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6))
+      return webpDims(width, height)
+    }
+    offset = dataEnd + (size % 2)
+  }
+  return { status: 'unknown', kind: 'image', mediaType: 'webp', reason: 'WebP dimensions not found', sizeBytes: buffer.length }
+}
+
 export function probeMedia(buffer) {
   if (!buffer || buffer.length < 2) return fail('truncated media (fewer than 2 bytes)')
 
   const firstTwo = buffer.readUInt16BE(0)
   if (firstTwo === JPEG_SOI) return parseJpeg(buffer)
+
+  if (buffer[0] === 0x89) {
+    if (buffer.length < 8) return fail('truncated PNG header')
+    if (buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47
+      && buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a) {
+      return parsePng(buffer)
+    }
+  }
+
+  if (buffer.length >= 3 && buffer.toString('ascii', 0, 3) === 'GIF') {
+    return parseGif(buffer)
+  }
+
+  if (buffer.length >= 12
+    && buffer.toString('ascii', 0, 4) === 'RIFF'
+    && buffer.toString('ascii', 8, 12) === 'WEBP') {
+    return parseWebp(buffer)
+  }
 
   if (buffer.length >= 8) {
     const topType = buffer.toString('ascii', 4, 8)

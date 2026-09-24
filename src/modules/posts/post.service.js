@@ -2,7 +2,7 @@ import * as repo from './post.repository.js'
 import { generateUuid, uuidToBuffer, bufferToUuid } from '../../../shared/utils/uuid.utils.js'
 import { NotFoundError, ValidationError, ForbiddenError } from '../../../shared/errors/AppError.js'
 import { POST_STATUS, POST_TYPES, VALID_TRANSITIONS, REVIEW_ACTIONS, POST_JOB_TYPES, POST_TARGET_STATUS, POST_TARGET_TYPES, POST_TARGET_PUBLISH_STATE, PUBLISHER_REQUEST_STATUS } from './post.model.js'
-import { enqueueCampaignJob as enqueueJob, enqueueTargetJob as enqueueReelJob, requeueAutoJob, enqueueCampaignJob } from '../campaigns/campaign.repository.js'
+import { enqueueCampaignJob as enqueueJob, enqueueTargetJob as enqueueReelJob, requeueAutoJob, enqueueCampaignJob, findAutoJobByRunKey } from '../campaigns/campaign.repository.js'
 import { transaction, queryOne } from '../../../shared/database/connection.js'
 import { createPagePhotoPost, createPageVideoPost, createFeedPost, createInstagramMedia, publishInstagramMedia, createInstagramStory, getContainerStatus, getMediaEngagement, deleteInstagramContainer, extractMetaError, createPageVideoStory, createPagePhotoStory, startPageReel, uploadPageReelMedia, getPageReelStatus, finishPageReel, resolvePageReelPostId, qualifyFbPostId, createUnpublishedPagePost, createAdCreativeFromPost, createAdCreative, createAdCampaign, createAdSet, createAd, updateAdStatus, getPostPromotability, resolveFbPostObjectId, isPostLiveForBoost, isInstagramPostLive, getInstagramBoostEligibility, createAdCreativeFromInstagramPost, getConnectedFacebookPage, getCreativeStoryId, deleteAdCreative, deleteAdCampaign, deleteAdSet } from '../../../shared/services/meta-ads.service.js'
 import { getInstagramMedia } from '../../../shared/services/meta-graph.service.js'
@@ -15,7 +15,9 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveAccountContext, getCoinConversionRate } from '../campaigns/campaign.service.js'
+import { BID_STRATEGIES_REQUIRING_BID_AMOUNT } from '../campaigns/campaign.model.js'
 import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
+import { REMOTE_HEALTH_GRACE_SECONDS } from './deletion-monitoring.service.js'
 
 async function createPromotionIntentForPost(post, clientTargetIds) {
   const { createPromotionIntentForPost: createIntent } = await import('./promotion.service.js')
@@ -41,6 +43,45 @@ async function promotionExistsForPost(postId) {
 async function promotionsEnabled() {
   const { isPromotionsEnabled } = await import('./promotion.service.js')
   return isPromotionsEnabled()
+}
+
+// Terminal failure for a boosted post BEFORE (or with) a live promotion:
+// cancels/settles the promotion so its charge is refunded, instead of being
+// stuck forever. Mirrors cancelPost's existing dual-path handling (a
+// promotion row that never got created falls back to a plain refund of the
+// raw charged amount; an existing non-terminal promotion goes through the
+// real cancel+settle machinery, which correctly consumes/refunds each of
+// its own targets before computing the leftover). Reused by cancelPost,
+// refreshPostStatus's all-targets-failed branch, and expirePublisherPosts'
+// zero-acceptance branch — the three ways a boosted post can permanently
+// end without ever going live to completion.
+async function cancelPromotionForFailedPost(post, reason) {
+  if (!post.boostEnabled || !post.chargedBoostPaise || post.chargedBoostPaise <= 0) return
+  const ownedByPromotion = await promotionExistsForPost(post.id)
+  if (!ownedByPromotion) {
+    try {
+      const coinService = await import('../../../shared/services/coin.service.js')
+      const coinRate = await getCoinConversionRate()
+      const refundCoins = Math.round(post.chargedBoostPaise / (coinRate * 100))
+      if (refundCoins > 0) {
+        await coinService.refundWithDetail(post.clientId, refundCoins, 'post_boost', post.id, `Refund: ${reason} — boost refund for "${post.name}"`, { fromMonthly: 0, fromWallet: refundCoins })
+        await repo.insertPostBillingEntry(post.id, { kind: 'refund', paise: post.chargedBoostPaise, coins: refundCoins, rate: coinRate, paidFromMonthly: 0, paidFromWallet: refundCoins, reason: `Boost refund — ${reason}` })
+      }
+    } catch (err) {
+      await logMetaEvent({ action: 'promotion_cancel_on_failure_error', postId: post.id, error: err?.message || String(err) })
+    }
+    return
+  }
+  try {
+    const { findPromotionByPostId } = await import('./promotion.repository.js')
+    const { cancelPromotionById } = await import('./promotion.service.js')
+    const promotion = await findPromotionByPostId(post.id)
+    if (promotion && !['completed', 'failed', 'cancelled'].includes(promotion.status)) {
+      await cancelPromotionById(promotion.id)
+    }
+  } catch (err) {
+    await logMetaEvent({ action: 'promotion_cancel_on_failure_error', postId: post.id, error: err?.message || String(err) })
+  }
 }
 
 async function chargePromotionOnApproval(post) {
@@ -158,8 +199,17 @@ export async function buildPostBoostPayloads(post, target, coinRate) {
   if (post.scheduledAt && startTimeMs && startTimeMs <= now) scheduleError = 'Boost start time must be in the future'
   if (endTimeMs && endTimeMs <= now) scheduleError = 'Boost end time must be in the future'
   if (endTimeMs && startTimeMs && endTimeMs <= startTimeMs) scheduleError = 'End time must be after start time'
-  if (isLifetime && !endTimeMs) scheduleError = 'End time is required for lifetime budget'
+  // Parity with traditional campaigns: an end date is mandatory for every
+  // boost, not just lifetime budgets — boosts can't run indefinitely either.
+  if (!endTimeMs) scheduleError = isDaily ? 'An end date is required' : 'End time is required for lifetime budget'
   if (isDaily && endTimeMs && endTimeMs - startTimeMs <= 24 * 60 * 60 * 1000) scheduleError = 'Daily budget requires duration > 24h'
+
+  const bidStrategy = post.boostBidStrategy || 'LOWEST_COST_WITHOUT_CAP'
+  const requiresBidAmount = BID_STRATEGIES_REQUIRING_BID_AMOUNT.has(bidStrategy)
+  const bidAmountInPaise = post.boostBidAmount ? Math.round(post.boostBidAmount * coinRate * 100) : null
+  const bidAmountError = requiresBidAmount && !bidAmountInPaise
+    ? `A bid amount is required for the "${bidStrategy}" bid strategy`
+    : null
 
   const legacyObjectiveMap = {
     REACH: 'OUTCOME_AWARENESS',
@@ -174,8 +224,11 @@ export async function buildPostBoostPayloads(post, target, coinRate) {
     CONVERSIONS: 'OUTCOME_SALES',
     LEAD_GENERATION: 'OUTCOME_LEADS',
   }
+  // OUTCOME_AWARENESS deliberately excluded — invalid for the ON_POST /
+  // existing-post creative every boost uses (per boost-capabilities.js);
+  // legacy names that map to it below fall through to OUTCOME_ENGAGEMENT.
   const allowedObjectives = new Set([
-    'OUTCOME_AWARENESS','OUTCOME_TRAFFIC','OUTCOME_ENGAGEMENT'
+    'OUTCOME_TRAFFIC','OUTCOME_ENGAGEMENT'
   ])
   let rawObjective = String(post.boostObjective || 'OUTCOME_ENGAGEMENT').toUpperCase().trim()
   if (legacyObjectiveMap[rawObjective]) rawObjective = legacyObjectiveMap[rawObjective]
@@ -183,9 +236,6 @@ export async function buildPostBoostPayloads(post, target, coinRate) {
   const fbCampaignName = `FlowX-Boost-${(post.name || 'Boost').slice(0, 40)}-${String(post.id).slice(0, 8)}`
   const targeting = post.boostTargeting && typeof post.boostTargeting === 'object' ? { ...post.boostTargeting } : {}
   const boostCallToAction = post.boostCallToAction || null
-  const boostLink = post.boostLink || post.mediaUrl || null
-  const boostHeadline = post.boostHeadline || null
-  const boostDescription = post.boostDescription || null
   delete targeting.age
   delete targeting.gender
   delete targeting.country
@@ -195,7 +245,6 @@ export async function buildPostBoostPayloads(post, target, coinRate) {
   const geoError = hasGeoSelection ? null : 'Select at least one location for boost targeting'
 
   const objectiveConfig = {
-    OUTCOME_AWARENESS: { goals: ['REACH','IMPRESSIONS'], defaultGoal: 'REACH' },
     OUTCOME_TRAFFIC: { goals: ['LINK_CLICKS','LANDING_PAGE_VIEWS'], defaultGoal: 'LINK_CLICKS' },
     OUTCOME_ENGAGEMENT: { goals: ['POST_ENGAGEMENT','THRUPLAY','REACH'], defaultGoal: 'REACH' },
   }
@@ -213,23 +262,30 @@ export async function buildPostBoostPayloads(post, target, coinRate) {
     isDaily,
     minBudgetError: budgetInINR < minBudgetInr ? `Minimum ${isDaily ? 'daily' : 'lifetime'} budget is ₹${minBudgetInr} (${Math.ceil(minBudgetInr / coinRate)} coins)` : null,
     scheduleError,
+    bidAmountError,
     geoError,
     fbCampaignName,
     targeting,
+    specialAdCategories: Array.isArray(post.boostSpecialAdCategories) ? post.boostSpecialAdCategories : [],
     spendCapInPaise: post.boostSpendCap ? Math.round(post.boostSpendCap * coinRate * 100) : null,
     creativeMessage: buildPostMessage(post),
     creativeMediaUrl: post.mediaUrl,
     boostCallToAction,
-    boostLink,
-    boostHeadline,
-    boostDescription,
     adSetBudget: {
       budgetType,
       budgetAmount: budgetInINR,
-      bidStrategy: post.boostBidStrategy || 'LOWEST_COST_WITHOUT_CAP',
+      bidStrategy,
+      bidAmount: bidAmountInPaise,
       optimizationGoal: effectiveOptimization,
       promotedPageId: target.platformCode === 'instagram' ? null : target.platformUserId,
-      destinationType: 'ON_POST',
+      // Meta requires destination_type ON_POST to pair with the
+      // OUTCOME_ENGAGEMENT campaign objective specifically — sending it for
+      // OUTCOME_TRAFFIC/OUTCOME_AWARENESS boosts risks outright rejection.
+      // Omitted (left undefined) for other objectives — the field is
+      // documented as optional and boosts never set a creative-level link
+      // for Meta to route WEBSITE-style clicks to, so there's no verified
+      // alternative value to send instead.
+      destinationType: rawObjective === 'OUTCOME_ENGAGEMENT' ? 'ON_POST' : undefined,
     },
     adSetSchedule: (() => {
       const hasFutureStart = startTimeMs && startTimeMs > now
@@ -348,6 +404,10 @@ async function createPostBoostForTarget(post, target, jobPayload = {}) {
     await logMetaEvent({ action: 'post_boost_create', postId: post.id, targetId: target.id, error: boostPayload.geoError })
     return { success: false, error: boostPayload.geoError }
   }
+  if (boostPayload.bidAmountError) {
+    await logMetaEvent({ action: 'post_boost_create', postId: post.id, targetId: target.id, error: boostPayload.bidAmountError })
+    return { success: false, error: boostPayload.bidAmountError }
+  }
 
   const pageId = target.platformCode === 'instagram' ? (target.igBusinessAccountId || target.platformUserId) : target.platformUserId
   const promotable = target.promotableId || null
@@ -439,9 +499,9 @@ export async function executeBoostCreation(ctx, opts = {}) {
         if (target.platformCode === 'instagram') {
           const igActorId = target.igBusinessAccountId || target.platformUserId
           const fbPageIdForIg = await getFbPageIdForIgTarget(target, post.clientId)
-          await createAdCreativeFromInstagramPost(adAccountId, objectStoryId, igActorId, fbPageIdForIg, `Boost ${post.name}`, systemToken, true)
+          await createAdCreativeFromInstagramPost(adAccountId, objectStoryId, igActorId, fbPageIdForIg, `Boost ${post.name}`, systemToken, true, boostPayload.boostCallToAction)
         } else {
-          await createAdCreativeFromPost(adAccountId, objectStoryId, `Boost ${post.name}`, systemToken, true)
+          await createAdCreativeFromPost(adAccountId, objectStoryId, `Boost ${post.name}`, systemToken, true, boostPayload.boostCallToAction)
         }
       } catch (err) {
         const d = extractMetaError(err)
@@ -461,14 +521,14 @@ export async function executeBoostCreation(ctx, opts = {}) {
 
     if (!existingIds.campaignId) {
       const campaignValidationError = await validateStep('validate_campaign', () =>
-        createAdCampaign(adAccountId, boostPayload.fbCampaignName, boostPayload.campaignObjective, 'PAUSED', systemToken, { spendCap: boostPayload.spendCapInPaise }, true)
+        createAdCampaign(adAccountId, boostPayload.fbCampaignName, boostPayload.campaignObjective, 'PAUSED', systemToken, { spendCap: boostPayload.spendCapInPaise, specialAdCategories: boostPayload.specialAdCategories }, true)
       )
       if (campaignValidationError) return { success: false, error: campaignValidationError }
     }
 
     let fbCampaignId = existingIds.campaignId || null
     if (!fbCampaignId) {
-      const fbCampaign = await createAdCampaign(adAccountId, boostPayload.fbCampaignName, boostPayload.campaignObjective, 'PAUSED', systemToken, { spendCap: boostPayload.spendCapInPaise })
+      const fbCampaign = await createAdCampaign(adAccountId, boostPayload.fbCampaignName, boostPayload.campaignObjective, 'PAUSED', systemToken, { spendCap: boostPayload.spendCapInPaise, specialAdCategories: boostPayload.specialAdCategories })
       fbCampaignId = fbCampaign.id
       await markCreated('facebook_campaign', fbCampaignId)
     }
@@ -497,7 +557,7 @@ export async function executeBoostCreation(ctx, opts = {}) {
       } else if (target.platformCode === 'instagram') {
         const igActorId = target.igBusinessAccountId || target.platformUserId
         const fbPageIdForIg = await getFbPageIdForIgTarget(target, post.clientId)
-        fbCreative = await createAdCreativeFromInstagramPost(adAccountId, objectStoryId, igActorId, fbPageIdForIg, `Boost ${post.name}`, systemToken)
+        fbCreative = await createAdCreativeFromInstagramPost(adAccountId, objectStoryId, igActorId, fbPageIdForIg, `Boost ${post.name}`, systemToken, false, boostPayload.boostCallToAction)
 
         let storyId = await getCreativeStoryId(fbCreative.id, systemToken)
         let storyAttempts = 0
@@ -518,7 +578,7 @@ export async function executeBoostCreation(ctx, opts = {}) {
           return { requeueAfterSeconds: igStoryPoll.requeueSeconds, attempts: { ...jobPayload, storyAttempts: nextAttempts } }
         }
       } else {
-        fbCreative = await createAdCreativeFromPost(adAccountId, objectStoryId, `Boost ${post.name}`, systemToken)
+        fbCreative = await createAdCreativeFromPost(adAccountId, objectStoryId, `Boost ${post.name}`, systemToken, false, boostPayload.boostCallToAction)
       }
     } catch (err) {
       if (isInvalidPostIdError(err)) {
@@ -1051,7 +1111,7 @@ export async function updatePost(userId, postId, data) {
   if (!post) throw new NotFoundError('Post not found')
   if (post.clientId !== userId) throw new ForbiddenError('Not your post')
 
-  if (data.boostEnabled !== undefined || data.boostBudgetAmount !== undefined || data.boostBudgetType !== undefined || data.boostSpendCap !== undefined || data.boostEndTime !== undefined || data.boostObjective !== undefined || data.boostBidStrategy !== undefined || data.boostOptimizationGoal !== undefined || data.boostTargeting !== undefined || data.boostPlacement !== undefined || data.boostCallToAction !== undefined || data.boostLink !== undefined || data.boostHeadline !== undefined || data.boostDescription !== undefined || data.promotableId !== undefined || data.isEligibleForPromotion !== undefined) {
+  if (data.boostEnabled !== undefined || data.boostBudgetAmount !== undefined || data.boostBudgetType !== undefined || data.boostSpendCap !== undefined || data.boostEndTime !== undefined || data.boostObjective !== undefined || data.boostBidStrategy !== undefined || data.boostBidAmount !== undefined || data.boostSpecialAdCategories !== undefined || data.boostOptimizationGoal !== undefined || data.boostTargeting !== undefined || data.boostPlacement !== undefined || data.boostCallToAction !== undefined || data.promotableId !== undefined || data.isEligibleForPromotion !== undefined) {
     throw new ValidationError('Boost can only be set at creation')
   }
 
@@ -1113,8 +1173,10 @@ export async function cancelPost(userId, postId) {
   if (post.clientId !== userId) throw new ForbiddenError('Not your post')
   assertValidTransition(post.status, POST_STATUS.CANCELLED)
 
-  if (post.status === POST_STATUS.AWAITING_PUBLISHERS && post.escrowAmount > 0) {
-    await refundPostEscrow(post, post.escrowAmount, `Refund: post cancelled while awaiting publishers`)
+  if (post.status === POST_STATUS.AWAITING_PUBLISHERS) {
+    if (post.escrowAmount > 0) {
+      await refundPostEscrow(post, post.escrowAmount, `Refund: post cancelled while awaiting publishers`)
+    }
     const pending = await repo.findPostPublisherRequestsByStatus(postId, PUBLISHER_REQUEST_STATUS.PENDING)
     for (const p of pending) {
       await repo.updatePostPublisherRequestStatusWithGuard(
@@ -1124,31 +1186,39 @@ export async function cancelPost(userId, postId) {
         PUBLISHER_REQUEST_STATUS.PENDING
       )
     }
-  }
-
-  if (post.boostEnabled && post.chargedBoostPaise > 0) {
-    const ownedByPromotion = await promotionExistsForPost(postId)
-    if (!ownedByPromotion) {
+    // The full escrow (including the share reserved for already-accepted
+    // slots) is refunded above, so an accepted request must be terminated
+    // here too — left as 'accepted' it would never be visited again
+    // (expirePublisherPosts/handleExpiredPublisherPosts both gate on
+    // post.status === AWAITING_PUBLISHERS, which this post is about to
+    // leave), stranding it forever while the client already has their money
+    // back and the publisher is never told their accepted slot fell through.
+    const accepted = await repo.findAcceptedPostPublisherRequests(postId)
+    for (const a of accepted) {
+      await repo.updatePostPublisherRequestStatusWithGuard(
+        a.id,
+        PUBLISHER_REQUEST_STATUS.CANCELLED,
+        new Date().toISOString().slice(0, 19).replace('T', ' '),
+        PUBLISHER_REQUEST_STATUS.ACCEPTED
+      )
       try {
-        const coinService = await import('../../../shared/services/coin.service.js')
-        const coinRate = await getCoinConversionRate()
-        const refundCoins = Math.round(post.chargedBoostPaise / (coinRate * 100))
-        if (refundCoins > 0) {
-          await coinService.refundWithDetail(post.clientId, refundCoins, 'post_boost', post.id, `Refund: post cancelled — boost refund for "${post.name}"`, { fromMonthly: 0, fromWallet: refundCoins })
-          await repo.insertPostBillingEntry(post.id, { kind: 'refund', paise: post.chargedBoostPaise, coins: refundCoins, rate: coinRate, paidFromMonthly: 0, paidFromWallet: refundCoins, reason: 'Boost refund on cancel' })
-        }
-      } catch {}
-    } else {
-      try {
-        const { findPromotionByPostId } = await import('./promotion.repository.js')
-        const { cancelPromotionById } = await import('./promotion.service.js')
-        const promotion = await findPromotionByPostId(postId)
-        if (promotion && !['completed', 'failed', 'cancelled'].includes(promotion.status)) {
-          await cancelPromotionById(promotion.id)
-        }
-      } catch {}
+        const { createAndSend } = await import('../notifications/notifications.service.js')
+        await createAndSend(
+          a.publisherId,
+          'post_request_cancelled',
+          'Post Request Cancelled',
+          `The post "${post.name}" was cancelled by the client before it went live — your accepted slot is no longer needed.`,
+          { postId, postName: post.name, requestId: a.id },
+          null,
+          null,
+        )
+      } catch (err) {
+        console.warn(`[posts] Failed to notify publisher ${a.publisherId} of cancellation: ${err.message}`)
+      }
     }
   }
+
+  await cancelPromotionForFailedPost(post, 'post cancelled')
 
   const updated = await repo.updatePostWithStatusGuard(postId, { status: POST_STATUS.CANCELLED }, post.status)
   await repo.createReviewLog(postId, userId, REVIEW_ACTIONS.CANCELLED, post.status, null)
@@ -1302,11 +1372,29 @@ export async function queuePostPublish(postId, runAfter = null) {
   }
 
   const jobId = generateUuid()
+  // run_key backed by the real (job_type, run_key) unique constraint — the
+  // ONLY thing that made a duplicate top-level publish job impossible was a
+  // non-atomic NOT EXISTS check; two concurrent enqueue attempts (or this
+  // call racing verifyPostJob's requeue below) previously both landed as
+  // fresh, un-deduped rows with run_key=NULL (NULLs never match each other
+  // in a unique index), and processDueJobs would then run both concurrently
+  // via Promise.all — publishing the same not-yet-posted target twice, live,
+  // on the customer's real Facebook/Instagram page.
   const enqueued = await enqueueJob(jobId, postId, POST_JOB_TYPES.PUBLISH, null, {}, {
+    runKey: `post_publish:${postId}`,
     runAfter: runAfter ? new Date(runAfter) : null,
     entityType: 'post',
   })
   return { jobId, enqueued }
+}
+
+const TARGET_JOB_RUN_KEY_PREFIXES = ['fb_reel', 'ig_reel', 'ig_story', 'ig_image']
+
+async function hasActiveTargetPublishJob(targetId) {
+  for (const prefix of TARGET_JOB_RUN_KEY_PREFIXES) {
+    if (await findAutoJobByRunKey(`${prefix}:${targetId}`)) return true
+  }
+  return false
 }
 
 export async function retryPostPublish(postId) {
@@ -1318,9 +1406,19 @@ export async function retryPostPublish(postId) {
 
   const targets = await repo.findPostTargetsByPostId(postId)
   for (const target of targets) {
-    if (target.status !== POST_TARGET_STATUS.POSTED) {
-      await repo.resetPostTargetForRetry(target.id)
-    }
+    if (target.status === POST_TARGET_STATUS.POSTED) continue
+    // A RUNNING post can have per-target FSM jobs (fb_reel/ig_reel/ig_story/
+    // ig_image) still queued/running in the background — publishPostJob
+    // dispatches them and returns without waiting. Resetting such a target
+    // here would null its container_id/publish_state out from under the
+    // live job: the job would abandon the real Meta container (invisible to
+    // the stale-container cleanup sweep too, since that scans by
+    // container_id — which was just wiped) and start a brand new one,
+    // wasting processing quota for no benefit. Leave in-flight targets
+    // alone; their own FSM timeout/backoff will reach a terminal state on
+    // its own if genuinely stuck, at which point retry can reset them.
+    if (await hasActiveTargetPublishJob(target.id)) continue
+    await repo.resetPostTargetForRetry(target.id)
   }
 
   const queuedJob = await queuePostPublish(postId)
@@ -1331,6 +1429,18 @@ function calculatePublisherEscrow(post) {
   const publisherCost = (post.publisherCount || 0) * (post.coinsPerPublisher || 0)
   const platformFee = Math.round(publisherCost * 0.1)
   return { publisherCost, platformFee, total: publisherCost + platformFee }
+}
+
+// Prorates the FULL charged escrow (base cost + the 10% platform fee) across
+// unfilled slots, instead of refunding only unfilled * coinsPerPublisher
+// (base cost only). The full-non-acceptance path already refunds 100% of
+// escrowAmount including the fee when 0 slots fill — a partial fill must
+// scale the exact same way, or the platform silently keeps the fee share for
+// slots that were never delivered while charging 100% of it for 0% delivery
+// in the full case, which is an inconsistency, not a stated policy.
+function unfilledPublisherEscrowRefund(post, unfilled) {
+  if (!unfilled || unfilled <= 0 || !post.publisherCount || !(Number(post.escrowAmount) > 0)) return 0
+  return Math.round((unfilled / post.publisherCount) * Number(post.escrowAmount))
 }
 
 async function refundPostEscrow(post, refundAmount, note) {
@@ -1648,6 +1758,22 @@ export async function completePostPublisherRequest(publisherId, requestId) {
     throw new ValidationError(`Cannot complete request with status '${request.status}' — must be 'published'`)
   }
 
+  // Deletion confirmation can only ever happen after the grace re-verify
+  // window (48h by default — deletion-monitoring.service.js), so a payout
+  // eligible before that window closes could never have been checked against
+  // a deletion at all: publish -> delete immediately -> complete immediately
+  // would collect payout with zero chance for the deletion pipeline to catch
+  // it. Gate self-service completion on the same window so the deletion
+  // check below is actually meaningful by the time it runs.
+  if (request.publishedAt) {
+    const elapsedMs = Date.now() - new Date(request.publishedAt).getTime()
+    const graceMs = REMOTE_HEALTH_GRACE_SECONDS * 1000
+    if (elapsedMs < graceMs) {
+      const remainingHours = Math.max(1, Math.ceil((graceMs - elapsedMs) / 3600000))
+      throw new ValidationError(`Payout is available ${remainingHours}h after publishing, once the deletion-monitoring grace period has passed`)
+    }
+  }
+
   const post = await repo.findPostById(request.postId)
   if (!post) throw new NotFoundError('Post not found')
 
@@ -1745,14 +1871,24 @@ export async function expirePublisherPosts(postIds) {
             )
           }
           const unfilled = Math.max(0, (post.publisherCount || 0) - accepted.length)
-          if (unfilled > 0 && post.coinsPerPublisher) {
-            const refundAmount = unfilled * post.coinsPerPublisher
+          const refundAmount = unfilledPublisherEscrowRefund(post, unfilled)
+          if (refundAmount > 0) {
             await refundPostEscrow(post, refundAmount,
               `Refund: ${unfilled} unfilled publisher slot(s) after deadline for ${post.name}`)
           }
           await repo.createReviewLog(postId, null, REVIEW_ACTIONS.SUBMITTED, POST_STATUS.AWAITING_PUBLISHERS,
             `Publisher deadline passed — publishing to ${accepted.length} accepted publisher(s)`)
         })
+        // Outside the transaction — coin/billing writes only, but kept
+        // consistent with the same not-inside-a-lock-holding-transaction
+        // principle used for the boost cancel path.
+        if (post.boostEnabled) {
+          const unfilled = Math.max(0, (post.publisherCount || 0) - accepted.length)
+          if (unfilled > 0) {
+            const { refundUnfilledPromotionSlots } = await import('./promotion.service.js')
+            await refundUnfilledPromotionSlots(postId, unfilled, 'publisher deadline passed with unfilled slots')
+          }
+        }
         await enqueueCampaignJob(generateUuid(), postId, POST_JOB_TYPES.PUBLISHER_GO_LIVE, null, {}, {
           runKey: `post:go-live:${postId}`,
           entityType: 'post',
@@ -1780,6 +1916,11 @@ export async function expirePublisherPosts(postIds) {
           await repo.createReviewLog(postId, null, REVIEW_ACTIONS.SUBMITTED, POST_STATUS.AWAITING_PUBLISHERS,
             'Publisher response deadline passed — no publishers accepted')
         })
+        // Outside the transaction: cancelPromotionForFailedPost does real Meta
+        // cleanup calls (via cancelPromotionById) — must never run inside a
+        // lock-holding transaction that could still roll back later (same class
+        // of bug fixed for campaigns' go-live/retry flow).
+        await cancelPromotionForFailedPost(post, 'publisher deadline passed with no accepted publishers')
         results.push({ postId, success: true, mode: 'no-acceptance', accepted: 0 })
       }
     } catch (err) {
@@ -1815,29 +1956,47 @@ export async function adminForceGoLivePost(postId) {
     throw new ValidationError('Post must be awaiting publishers or approved to force go-live')
   }
 
-  await transaction(async () => {
-    await repo.lockPostById(postId)
-    const current = await repo.findPostById(postId)
-    if (current.status === POST_STATUS.AWAITING_PUBLISHERS) {
-      const pending = await repo.findPostPublisherRequestsByStatus(postId, PUBLISHER_REQUEST_STATUS.PENDING)
-      for (const p of pending) {
-        await repo.updatePostPublisherRequestStatusWithGuard(
-          p.id,
-          PUBLISHER_REQUEST_STATUS.CANCELLED,
-          new Date().toISOString().slice(0, 19).replace('T', ' '),
-          PUBLISHER_REQUEST_STATUS.PENDING
-        )
-      }
-    }
-  })
-
-  const accepted = await repo.findAcceptedPostPublisherRequests(postId)
-  if (accepted.length === 0 && !post.runOnPublishers) {
+  if (post.status !== POST_STATUS.AWAITING_PUBLISHERS) {
     return queuePostPublish(postId)
   }
-  if (accepted.length === 0 && post.runOnPublishers) {
-    throw new ValidationError('Cannot force go-live — no accepted publisher slots')
+
+  // Throwing inside the transaction (no accepted slots) rolls back cleanly —
+  // pending requests must survive a rejected force-go-live attempt, not be
+  // cancelled as a side effect of an action that then errors out and leaves
+  // the post permanently stuck in awaiting_publishers with nothing left to
+  // accept.
+  const acceptedCount = await transaction(async () => {
+    await repo.lockPostById(postId)
+    const accepted = await repo.findAcceptedPostPublisherRequests(postId)
+    if (accepted.length === 0) {
+      throw new ValidationError('Cannot force go-live — no accepted publisher slots')
+    }
+    const pending = await repo.findPostPublisherRequestsByStatus(postId, PUBLISHER_REQUEST_STATUS.PENDING)
+    for (const p of pending) {
+      await repo.updatePostPublisherRequestStatusWithGuard(
+        p.id,
+        PUBLISHER_REQUEST_STATUS.CANCELLED,
+        new Date().toISOString().slice(0, 19).replace('T', ' '),
+        PUBLISHER_REQUEST_STATUS.PENDING
+      )
+    }
+    return accepted.length
+  })
+
+  // Same shortfall accounting as the natural-deadline path
+  // (expirePublisherPosts) — forcing go-live early must not silently strand
+  // the client's coins for publisher slots that will now never be filled.
+  const unfilled = Math.max(0, (post.publisherCount || 0) - acceptedCount)
+  const escrowRefundAmount = unfilledPublisherEscrowRefund(post, unfilled)
+  if (escrowRefundAmount > 0) {
+    await refundPostEscrow(post, escrowRefundAmount,
+      `Refund: ${unfilled} unfilled publisher slot(s) — admin forced go-live for ${post.name}`)
   }
+  if (unfilled > 0 && post.boostEnabled) {
+    const { refundUnfilledPromotionSlots } = await import('./promotion.service.js')
+    await refundUnfilledPromotionSlots(postId, unfilled, 'admin forced go-live with unfilled slots')
+  }
+
   await enqueueCampaignJob(generateUuid(), postId, POST_JOB_TYPES.PUBLISHER_GO_LIVE, null, {}, {
     runKey: `post:go-live:${postId}`,
     entityType: 'post',
@@ -1881,15 +2040,31 @@ async function syncPublisherRequestOnPost(target) {
   try {
     const request = await repo.findPostPublisherRequestById(target.publisherRequestId)
     if (!request) return
-    if (target.status === POST_TARGET_STATUS.POSTED && request.status === PUBLISHER_REQUEST_STATUS.ACCEPTED) {
-      await repo.updatePostPublisherRequestPublishedWithGuard(target.publisherRequestId, PUBLISHER_REQUEST_STATUS.ACCEPTED)
-    } else if (target.status === POST_TARGET_STATUS.FAILED && [PUBLISHER_REQUEST_STATUS.ACCEPTED, PUBLISHER_REQUEST_STATUS.PUBLISHED].includes(request.status)) {
-      await repo.updatePostPublisherRequestStatusWithGuard(
-        target.publisherRequestId,
-        PUBLISHER_REQUEST_STATUS.FAILED,
-        new Date().toISOString().slice(0, 19).replace('T', ' '),
-        request.status
-      )
+    if (target.status === POST_TARGET_STATUS.POSTED) {
+      if (request.status === PUBLISHER_REQUEST_STATUS.PUBLISHED) return
+      // Payout is per-REQUEST, not per-target: a request accepted with
+      // multiple platform accounts is fulfilled the moment ANY one of its
+      // targets goes live, and that must win over a sibling target that
+      // already failed and flipped the request to FAILED first — order
+      // across a publisher's own accounts is not guaranteed, and a failure
+      // must never permanently deny payout for a live, successful post.
+      await repo.updatePostPublisherRequestPublishedWithGuard(target.publisherRequestId, request.status)
+    } else if (target.status === POST_TARGET_STATUS.FAILED && request.status === PUBLISHER_REQUEST_STATUS.ACCEPTED) {
+      // Only downgrade to FAILED once every one of this request's targets
+      // has reached a terminal outcome and none of them posted — a single
+      // failed account must never overwrite a sibling account's success
+      // (checked here, not assumed, since siblings can finish in any order).
+      const siblings = await repo.findPostTargetsByPublisherRequestId(target.publisherRequestId)
+      const anyPosted = siblings.some(t => t.status === POST_TARGET_STATUS.POSTED)
+      const allTerminal = siblings.every(t => t.status === POST_TARGET_STATUS.POSTED || t.status === POST_TARGET_STATUS.FAILED)
+      if (!anyPosted && allTerminal) {
+        await repo.updatePostPublisherRequestStatusWithGuard(
+          target.publisherRequestId,
+          PUBLISHER_REQUEST_STATUS.FAILED,
+          new Date().toISOString().slice(0, 19).replace('T', ' '),
+          PUBLISHER_REQUEST_STATUS.ACCEPTED
+        )
+      }
     }
   } catch (err) {
     console.warn(`[posts] Failed to sync publisher request ${target.publisherRequestId}: ${err.message}`)
@@ -1968,7 +2143,7 @@ export async function verifyPostJob(postId) {
             verificationAttempts: attempts,
             lastVerifyAt: new Date().toISOString().slice(0, 19).replace('T', ' '),
           })
-          await repo.requeueAutoJob(postId, POST_JOB_TYPES.PUBLISH, {}, { entityType: 'post' })
+          await repo.requeueAutoJob(postId, POST_JOB_TYPES.PUBLISH, {}, { entityType: 'post', runKey: `post_publish:${postId}` })
           results.push({ targetId: target.id, status: 'retry_pending', attempts })
         }
       }
@@ -1987,6 +2162,9 @@ export async function verifyPostJob(postId) {
 
 async function classifyPublishError(err) {
   if (err instanceof ValidationError) return { kind: 'permanent' }
+  // 9007 "media not ready, wait a moment" is transient by Meta's own user message,
+  // even though it arrives as HTTP 400. Only this code gets special treatment.
+  if (err?.metaErrorCode === 9007 || extractMetaError(err)?.code === 9007) return { kind: 'retryable' }
   if (err?.metaHttpStatus == null) {
     return { kind: err?.metaAmbiguous ? 'ambiguous' : 'retryable' }
   }
@@ -2060,6 +2238,7 @@ export async function refreshPostStatus(postId) {
       error: message,
     }, post.status)
     await repo.createReviewLog(postId, null, REVIEW_ACTIONS.SUBMITTED, post.status, `Post failed on all targets: ${message}`)
+    await cancelPromotionForFailedPost(post, 'post publishing failed for all targets')
   } else if (allPosted && post.status !== POST_STATUS.COMPLETED) {
     await repo.updatePostWithStatusGuard(postId, {
       status: POST_STATUS.COMPLETED,
@@ -2440,6 +2619,30 @@ export const igVideoState = {
   backoffSteps: [5, 15, 30, 60, 120, 300],
 }
 
+// Dedicated IMAGE readiness tunables. Images need no transcoding — only Meta's
+// fetch of image_url — so the processing cap is deliberately shorter than video.
+// Dedicated vars (not POST_IG_PROCESSING_CAP_MS) per approved design.
+export const igImageState = {
+  pollSeconds: Number(process.env.POST_IG_IMAGE_POLL_SECONDS) || 5,
+  processingCapMs: Number(process.env.POST_IG_IMAGE_PROCESSING_CAP_MS) || 10 * 60 * 1000,
+}
+
+export function isImageReadinessEnabled() {
+  const raw = String(process.env.INSTAGRAM_IMAGE_CONTAINER_READINESS_ENABLED || '').toLowerCase()
+  return raw === '1' || raw === 'true'
+}
+
+// Conservative image predicate for FSM routing: only positively-identified images
+// enter the durable FSM. Uncertain media stays on the inline path (with its sniff
+// fallback), preserving existing behavior for extension-less/unknown URLs.
+function mediaIsImageForTarget(post, target, mediaByTarget) {
+  const report = mediaByTarget?.[target.id]
+  if (report?.probe?.kind != null) return report.probe.kind === 'image'
+  if (report?.contentType) return String(report.contentType).startsWith('image/')
+  if (isVideoUrl(post.mediaUrl)) return false
+  return isImageUrl(post.mediaUrl)
+}
+
 const IG_VIDEO_IN_FLIGHT_STATES = [
   POST_TARGET_PUBLISH_STATE.NONE,
   POST_TARGET_PUBLISH_STATE.UPLOADING,
@@ -2449,6 +2652,13 @@ const IG_VIDEO_IN_FLIGHT_STATES = [
   POST_TARGET_PUBLISH_STATE.RETRY_PENDING,
   POST_TARGET_PUBLISH_STATE.VERIFYING,
   POST_TARGET_PUBLISH_STATE.UNKNOWN,
+]
+
+// Image FSM reuses the video in-flight set plus PUBLISHING, so targets that ran
+// the legacy inline path (flag OFF) can still enter the FSM after a flag flip.
+const IG_IMAGE_IN_FLIGHT_STATES = [
+  ...IG_VIDEO_IN_FLIGHT_STATES,
+  POST_TARGET_PUBLISH_STATE.PUBLISHING,
 ]
 
 function igBackoffForStep(step) {
@@ -2482,7 +2692,7 @@ async function igContainerUnknown(target, message, step) {
   })
   await refreshPostStatus(target.postId)
   try {
-    await repo.requeueAutoJob(target.postId, POST_JOB_TYPES.VERIFY, {}, { entityType: 'post' })
+    await repo.requeueAutoJob(target.postId, POST_JOB_TYPES.VERIFY, {}, { entityType: 'post', runKey: `post_verify:${target.postId}` })
   } catch {
     // verify job already queued or running
   }
@@ -2556,7 +2766,7 @@ async function igContainerPublish(post, target, igId, product, attempts) {
   return { done: true }
 }
 
-async function igContainerStatus(post, target, igId, product, attempts) {
+async function igContainerStatus(post, target, igId, product, attempts, policy = igVideoState) {
   let status
   try {
     status = await getContainerStatus(target.containerId, target.accessToken)
@@ -2585,9 +2795,13 @@ async function igContainerStatus(post, target, igId, product, attempts) {
       lastOperationAt: nowString(),
     })
     if (!ok) return { requeueAfterSeconds: 15, attempts: 0 }
-    return igContainerPublish(post, { ...target, publishState: POST_TARGET_PUBLISH_STATE.READY }, igId, product, attempts)
+    const readyTarget = { ...target, publishState: POST_TARGET_PUBLISH_STATE.READY }
+    // READY publishes through the product pipeline: images recreate on 9007
+    // (no verified reuse semantics), video reuses the same container.
+    if (product === 'image') return igImagePublish(post, readyTarget, igId, attempts)
+    return igContainerPublish(post, readyTarget, igId, product, attempts)
   }
-  if (igElapsedMs(target) >= igVideoState.processingCapMs) {
+  if (igElapsedMs(target) >= policy.processingCapMs) {
     const err = new Error('Timed out waiting for Instagram to process the media container')
     err.metaAmbiguous = true
     return igContainerFailure(target, err, 'processing_cap', attempts)
@@ -2600,17 +2814,23 @@ async function igContainerStatus(post, target, igId, product, attempts) {
     lastOperationAt: nowString(),
   })
   if (!ok) return { requeueAfterSeconds: 15, attempts: 0 }
-  return { requeueAfterSeconds: igVideoState.pollSeconds, attempts: 0 }
+  return { requeueAfterSeconds: policy.pollSeconds, attempts: 0 }
 }
 
 async function igContainerCreate(post, target, igId, product, attempts) {
   if (!post.mediaUrl) {
     return igContainerPermanent(target, `Instagram ${product}s require a media URL`, 'create')
   }
+  const imageProduct = product === 'image'
+  const fromStates = imageProduct ? IG_IMAGE_IN_FLIGHT_STATES : IG_VIDEO_IN_FLIGHT_STATES
   let container
   try {
     if (product === 'story') {
       container = await createInstagramStory(igId, post.mediaUrl, target.accessToken, { videoUrl: post.mediaUrl })
+    } else if (imageProduct) {
+      container = await createInstagramMedia(igId, post.mediaUrl, buildPostMessage(post), target.accessToken, {
+        mediaType: 'IMAGE',
+      })
     } else {
       container = await createInstagramMedia(igId, post.mediaUrl, buildPostMessage(post), target.accessToken, {
         mediaType: 'REELS',
@@ -2624,9 +2844,13 @@ async function igContainerCreate(post, target, igId, product, attempts) {
   if (!container?.id) {
     return igContainerPermanent(target, 'Instagram media container creation returned no id', 'create')
   }
-  const ok = await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.UPLOADING, {
+  const ok = await repo.transitionPostTargetState(target.id, fromStates, POST_TARGET_PUBLISH_STATE.UPLOADING, {
     error: null,
     containerId: container.id,
+    // Readiness clock: fresh on first create, preserved across 9007 recreates so
+    // a perpetually-not-ready image still converges to the 10-minute cap
+    // (UNKNOWN + verify) instead of recreating forever.
+    ...(imageProduct ? { processingStartedAt: target.processingStartedAt || nowString() } : {}),
     lastMetaStatus: 'container_created',
     lastOperation: 'create',
     lastOperationAt: nowString(),
@@ -2687,6 +2911,83 @@ export async function igVideoStoryJob(postId, targetId, payload = {}) {
   return igVideoJob(postId, targetId, payload, 'story')
 }
 
+// IMAGE publish step. Identical success contract to igContainerPublish, except a
+// 9007 ("media not ready") RECREATES instead of reusing: there is no verified
+// evidence that IMAGE containers are safely republishable after 9007.
+async function igImagePublish(post, target, igId, attempts) {
+  let published
+  try {
+    published = await publishInstagramMedia(igId, target.containerId, target.accessToken)
+  } catch (err) {
+    const detail = extractMetaError(err)
+    const notReady = err?.metaErrorCode === 9007 || detail?.code === 9007
+    if (notReady) {
+      await igCleanupContainer(target)
+      return igContainerCreate(post, { ...target, containerId: null }, igId, 'image', attempts)
+    }
+    return igContainerFailure(target, err, 'publish', attempts)
+  }
+  const ok = await repo.transitionPostTargetState(target.id, IG_VIDEO_IN_FLIGHT_STATES, POST_TARGET_PUBLISH_STATE.PUBLISHED, {
+    status: POST_TARGET_STATUS.POSTED,
+    metaObjectId: published?.id || target.containerId,
+    containerId: null,
+    postedAt: nowString(),
+    error: null,
+    lastMetaStatus: 'published',
+    lastOperation: 'published',
+    lastOperationAt: nowString(),
+  })
+  if (!ok) return { requeueAfterSeconds: 15, attempts: 0 }
+  await syncPublisherRequestOnPost({ ...target, status: POST_TARGET_STATUS.POSTED })
+  await refreshPostStatus(target.postId)
+  return { done: true }
+}
+
+// Durable IMAGE readiness FSM. Scope: instagram + image media + post type only
+// (stories stay inline). Dispatch keys off containerId, never process memory:
+// every step persists state and returns a parked requeue the next worker resumes.
+export async function igImageJob(postId, targetId, payload = {}) {
+  if (!postId || !targetId) return { done: true }
+  const attempts = Number(payload?.attempts) || 0
+  const post = await repo.findPostById(postId)
+  if (!post) throw new NotFoundError('Post not found')
+  if (post.type !== POST_TYPES.POST) return { done: true }
+
+  const target = await repo.findPostTargetById(targetId)
+  if (!target || target.platformCode !== 'instagram') return { done: true }
+
+  if ([POST_STATUS.COMPLETED, POST_STATUS.CANCELLED].includes(post.status)) {
+    if (target.containerId) await igCleanupContainer(target)
+    return { done: true }
+  }
+  if (target.status === POST_TARGET_STATUS.POSTED) return { done: true }
+  if ([POST_TARGET_PUBLISH_STATE.PUBLISHED, POST_TARGET_PUBLISH_STATE.PERMANENT_FAILURE, POST_TARGET_PUBLISH_STATE.MANUAL_REVIEW].includes(target.publishState)) {
+    return { done: true }
+  }
+  // Ambiguous outcomes belong to post_verify reconciliation — never blind publish.
+  if ([POST_TARGET_PUBLISH_STATE.UNKNOWN, POST_TARGET_PUBLISH_STATE.VERIFYING].includes(target.publishState)) {
+    return { done: true }
+  }
+
+  const igId = target.igBusinessAccountId || target.platformUserId
+  const accessToken = target.accessToken
+  if (!igId || !accessToken) {
+    return igContainerPermanent(target, 'Instagram business account or token is missing for target account', 'setup')
+  }
+
+  if (isRateLimited(tokenKeyFor(accessToken))) {
+    return { requeueAfterSeconds: 30, attempts: 0 }
+  }
+
+  if (target.containerId) {
+    if (target.publishState === POST_TARGET_PUBLISH_STATE.READY) {
+      return igImagePublish(post, target, igId, attempts)
+    }
+    return igContainerStatus(post, target, igId, 'image', attempts, igImageState)
+  }
+  return igContainerCreate(post, target, igId, 'image', attempts)
+}
+
 export async function publishPostJob(postId) {
   const post = await repo.findPostById(postId)
   if (!post) throw new NotFoundError('Post not found')
@@ -2745,8 +3046,13 @@ export async function publishPostJob(postId) {
     post.type === POST_TYPES.REEL ||
     (post.type === POST_TYPES.STORY && mediaIsVideoForTarget(post, t, mediaByTarget))
   )
-  const jobTargets = actionable.filter(t => isFbReelTarget(t) || isIgVideoTarget(t))
-  const directTargets = actionable.filter(t => !isFbReelTarget(t) && !isIgVideoTarget(t))
+  // V1 scope: instagram image feed/posts only. Image stories stay inline.
+  const isIgImageTarget = t => t.platformCode === 'instagram'
+    && post.type === POST_TYPES.POST
+    && isImageReadinessEnabled()
+    && mediaIsImageForTarget(post, t, mediaByTarget)
+  const jobTargets = actionable.filter(t => isFbReelTarget(t) || isIgVideoTarget(t) || isIgImageTarget(t))
+  const directTargets = actionable.filter(t => !isFbReelTarget(t) && !isIgVideoTarget(t) && !isIgImageTarget(t))
 
   const mediaError = mediaErrorMessage || 'Media failed publish-mode validation'
 
@@ -2763,12 +3069,16 @@ export async function publishPostJob(postId) {
     if (target.publishState === POST_TARGET_PUBLISH_STATE.PERMANENT_FAILURE) continue
     if (target.publishState === POST_TARGET_PUBLISH_STATE.PUBLISHED) continue
     const isIg = target.platformCode === 'instagram'
-    const jobType = isIg
-      ? (post.type === POST_TYPES.REEL ? POST_JOB_TYPES.IG_REEL : POST_JOB_TYPES.IG_STORY)
-      : POST_JOB_TYPES.FB_REEL
-    const runKey = isIg
-      ? (post.type === POST_TYPES.REEL ? `ig_reel:${target.id}` : `ig_story:${target.id}`)
-      : `fb_reel:${target.id}`
+    const jobType = !isIg
+      ? POST_JOB_TYPES.FB_REEL
+      : post.type === POST_TYPES.REEL ? POST_JOB_TYPES.IG_REEL
+      : post.type === POST_TYPES.STORY ? POST_JOB_TYPES.IG_STORY
+      : POST_JOB_TYPES.IG_IMAGE
+    const runKey = !isIg
+      ? `fb_reel:${target.id}`
+      : post.type === POST_TYPES.REEL ? `ig_reel:${target.id}`
+      : post.type === POST_TYPES.STORY ? `ig_story:${target.id}`
+      : `ig_image:${target.id}`
     try {
       await enqueueReelJob(jobType, runKey, { postId, targetId: target.id })
     } catch {
@@ -2865,7 +3175,7 @@ export async function publishPostJob(postId) {
 
   if (needsVerify) {
     try {
-      await repo.requeueAutoJob(postId, POST_JOB_TYPES.VERIFY, {}, { entityType: 'post' })
+      await repo.requeueAutoJob(postId, POST_JOB_TYPES.VERIFY, {}, { entityType: 'post', runKey: `post_verify:${postId}` })
     } catch {
       // already queued or running — verify job exists
     }
@@ -3023,12 +3333,16 @@ export async function syncPostEngagementJob(postId, options = {}) {
       const systemToken = process.env.META_SYSTEM_USER_TOKEN
       const preferred = platform === 'facebook' ? target.accessToken : (systemToken || target.accessToken)
       const fallback = platform === 'facebook' ? null : (systemToken ? target.accessToken : null)
+      const knownKind = platform === 'facebook' ? target.remoteMediaKind : null
       let engagement
       try {
-        engagement = await getMediaEngagement(target.metaObjectId, preferred, { mediaKind, platform })
+        engagement = await getMediaEngagement(target.metaObjectId, preferred, { mediaKind, platform, knownKind })
       } catch (err) {
         if (!fallback) throw err
-        engagement = await getMediaEngagement(target.metaObjectId, fallback, { mediaKind, platform })
+        engagement = await getMediaEngagement(target.metaObjectId, fallback, { mediaKind, platform, knownKind })
+      }
+      if (engagement.classifyKind && engagement.classifyKind !== target.remoteMediaKind) {
+        await repo.updatePostTargetStatus(target.id, { remoteMediaKind: engagement.classifyKind })
       }
       await repo.upsertPostEngagement(target.id, postId, {
         statDate,
@@ -3198,11 +3512,13 @@ export async function cleanupOrphanContainers() {
 }
 
 export async function watchdogIgVideoTargets() {
-  const targets = await repo.findInFlightIgTargetsWithoutJob([POST_JOB_TYPES.IG_REEL, POST_JOB_TYPES.IG_STORY])
+  const targets = await repo.findInFlightIgTargetsWithoutJob([POST_JOB_TYPES.IG_REEL, POST_JOB_TYPES.IG_STORY, POST_JOB_TYPES.IG_IMAGE])
   const reenqueued = []
   for (const target of targets) {
-    const jobType = target.postType === POST_TYPES.STORY ? POST_JOB_TYPES.IG_STORY : POST_JOB_TYPES.IG_REEL
-    const runKey = `${jobType === POST_JOB_TYPES.IG_STORY ? 'ig_story' : 'ig_reel'}:${target.id}`
+    const jobType = target.postType === POST_TYPES.STORY ? POST_JOB_TYPES.IG_STORY : target.postType === POST_TYPES.POST ? POST_JOB_TYPES.IG_IMAGE : POST_JOB_TYPES.IG_REEL
+    // Image FSM jobs only exist while the readiness flag is on; never resurrect them when off.
+    if (jobType === POST_JOB_TYPES.IG_IMAGE && !isImageReadinessEnabled()) continue
+    const runKey = `${jobType === POST_JOB_TYPES.IG_STORY ? 'ig_story' : jobType === POST_JOB_TYPES.IG_IMAGE ? 'ig_image' : 'ig_reel'}:${target.id}`
     const enqueued = await enqueueReelJob(jobType, runKey, { postId: target.postId, targetId: target.id })
     if (enqueued) reenqueued.push(target.id)
   }

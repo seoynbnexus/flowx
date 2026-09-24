@@ -4,8 +4,40 @@ import { NotFoundError, ForbiddenError, ValidationError, ConflictError } from '.
 import { mediaKindForMime, MAX_MEDIA_FILE_BYTES, MEDIA_UPLOAD_DIR } from '../../../shared/utils/post-media-upload.js'
 import { MEDIA_DEFAULT_QUOTA_BYTES } from './media.model.js'
 import { queryOne } from '../../../shared/database/connection.js'
+import { evaluateRepairImage, evaluateRepairVideo } from '../../../shared/services/repair-media-criteria.js'
 import fs from 'fs/promises'
 import path from 'path'
+
+const UPLOAD_PROBE_IMAGE_BYTES = 5 * 1024 * 1024
+// Local disk reads are cheap (no network cost), so the video probe window
+// can be generous — large enough to reach the moov box in the vast majority
+// of real-world uploads (mirrors shared/services/ad-content-validation.js's
+// adMediaProbeLimits reasoning for the equivalent URL-fetch path).
+const UPLOAD_PROBE_VIDEO_BYTES = 50 * 1024 * 1024
+
+async function probeUploadedFile(file, fileSize, kind) {
+  const filePath = file?.path || (file?.filename ? path.join(MEDIA_UPLOAD_DIR, file.filename) : null)
+  if (!filePath) return null
+  const budget = kind === 'video' ? UPLOAD_PROBE_VIDEO_BYTES : UPLOAD_PROBE_IMAGE_BYTES
+  let handle = null
+  try {
+    const readBytes = fileSize && fileSize <= budget ? fileSize : budget
+    handle = await fs.open(filePath, 'r')
+    const { bytesRead, buffer } = await handle.read(Buffer.alloc(readBytes), 0, readBytes, 0)
+    if (!bytesRead) return null
+    const { probeMedia } = await import('../../../shared/services/media-probe.js')
+    return probeMedia(buffer.subarray(0, bytesRead))
+  } catch {
+    return null
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+}
+
+async function cleanupRejectedUpload(file) {
+  const filePath = file?.path || (file?.filename ? path.join(MEDIA_UPLOAD_DIR, file.filename) : null)
+  if (filePath) await fs.unlink(filePath).catch(() => {})
+}
 
 export function getMediaQuotaBytes() {
   const configured = Number(process.env.POST_MEDIA_QUOTA_BYTES)
@@ -79,12 +111,57 @@ export async function uploadMedia(userId, file, { name } = {}) {
   }
 
   const storagePath = `/uploads/posts/${file.filename}`
+  let width = null
+  let height = null
+
+  // Best-effort probe: an unreadable/unprobeable file (missing path in test
+  // fixtures, disk error, truncated read) never blocks the upload — only a
+  // SUCCESSFULLY probed file that violates a real rule (wrong format, too
+  // small, wrong codec, over the size/duration cap) is rejected. This is the
+  // same generic, placement-agnostic gate the ad-campaign content validator
+  // uses (shared/services/repair-media-criteria.js) — placement-specific
+  // rules (Reels/Stories orientation) apply later once a campaign/placement
+  // actually exists.
+  const probed = await probeUploadedFile(file, fileSize, kind)
+  if (probed?.status === 'valid') {
+    if (Number.isFinite(probed.width)) width = probed.width
+    if (Number.isFinite(probed.height)) height = probed.height
+
+    if (kind === 'image') {
+      const check = evaluateRepairImage({
+        mimeType: file.mimetype,
+        mediaType: probed.mediaType,
+        width, height,
+        sizeBytes: fileSize,
+      })
+      if (!check.ok) {
+        await cleanupRejectedUpload(file)
+        throw new ValidationError(check.failures[0].message)
+      }
+    } else if (kind === 'video') {
+      const check = evaluateRepairVideo({
+        mimeType: file.mimetype,
+        mediaType: probed.mediaType,
+        width, height,
+        durationSeconds: probed.durationSeconds ?? null,
+        codecs: probed.codecs ?? null,
+        sizeBytes: fileSize,
+      })
+      if (!check.ok) {
+        await cleanupRejectedUpload(file)
+        throw new ValidationError(check.failures[0].message)
+      }
+    }
+  }
+
   const asset = await repo.createMediaAsset(generateUuid(), userId, {
     name: name?.trim() || file.originalname || file.filename,
     storagePath,
     mimeType: file.mimetype,
     mediaKind: kind,
     sizeBytes: fileSize,
+    width,
+    height,
   })
   return {
     ...asset,

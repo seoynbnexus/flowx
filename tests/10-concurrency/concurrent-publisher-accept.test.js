@@ -84,11 +84,22 @@ describe('concurrent publisher accept', () => {
   })
 
   it('should only accept the same request once', async () => {
-    const requestId = await createRequest()
+    const racer = await createTestUser({
+      email: `con-publisher-race-${dateTag}@flowx-test.com`,
+      password: 'Test@123',
+      role: 'publisher',
+    })
+    await addVerifiedPage(racer.id, 'con_pub_page_race')
+    const requestId = generateUuid()
+    await query(
+      `INSERT INTO campaign_publisher_requests (id, campaign_id, publisher_id, coins_offered, status)
+       VALUES (?, ?, ?, ?, 'pending')`,
+      [uuidToBuffer(requestId), uuidToBuffer(campaignId), uuidToBuffer(racer.id), 100]
+    )
 
     const results = await Promise.allSettled([
-      campaignService.acceptPublisherRequest(publisherId, requestId),
-      campaignService.acceptPublisherRequest(publisherId, requestId),
+      campaignService.acceptPublisherRequest(racer.id, requestId),
+      campaignService.acceptPublisherRequest(racer.id, requestId),
     ])
 
     const succeeded = results.filter(r => r.status === 'fulfilled').length
@@ -96,5 +107,10 @@ describe('concurrent publisher accept', () => {
 
     expect(succeeded).toBe(1)
     expect(failed).toBe(1)
+  })
+
+  it('should reject accepting a second live request on the same campaign (D1 one-chain invariant)', async () => {
+    const requestId = await createRequest()
+    await expect(campaignService.acceptPublisherRequest(publisherId, requestId)).rejects.toThrow(/already hold a live request/)
   })
 })

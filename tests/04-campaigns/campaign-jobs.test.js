@@ -36,11 +36,17 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
 const dateTag = Date.now()
 
 async function createCampaign(userId, overrides = {}) {
-  return campaignService.createCampaign(userId, {
+  const campaign = await campaignService.createCampaign(userId, {
     name: `JobTest ${generateUuid().substring(0, 8)}`,
     type: 'post',
     ...overrides,
   })
+  await campaignRepo.createMetaSettings(generateUuid(), campaign.id, {
+    objective: 'OUTCOME_TRAFFIC',
+    budgetAmount: 500,
+    endTime: new Date(Date.now() + 10 * 24 * 3600000).toISOString(),
+  })
+  return campaign
 }
 
 let pubCounter = 0

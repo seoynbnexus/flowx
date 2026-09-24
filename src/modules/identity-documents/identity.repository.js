@@ -73,7 +73,7 @@ export async function verify(id, status, adminId, rejectedReason = null) {
   return findById(id);
 }
 
-export async function listAll({ status, page, limit }) {
+export async function listAll({ status, page, limit, documentType, search }) {
   const offset = (page - 1) * limit;
   const where = ['u.deleted_at IS NULL'];
   const params = [];
@@ -83,20 +83,29 @@ export async function listAll({ status, page, limit }) {
     params.push(status);
   }
 
+  if (documentType) {
+    where.push('d.document_type = ?');
+    params.push(documentType);
+  }
+
+  if (search) {
+    where.push('(u.email LIKE ? OR up.first_name LIKE ? OR up.last_name LIKE ?)');
+    const pattern = `%${search}%`;
+    params.push(pattern, pattern, pattern);
+  }
+
   const whereClause = `WHERE ${where.join(' AND ')}`;
-
-  const countRow = await queryOne(
-    `SELECT COUNT(*) as total FROM identity_documents d
-     JOIN users u ON u.id = d.user_id ${whereClause}`,
-    params
-  );
-
-  const rows = await query(
-    `    SELECT d.*, u.email as user_email, up.first_name as user_first_name, up.last_name as user_last_name
+  const joinClause = `
      FROM identity_documents d
      JOIN users u ON u.id = d.user_id
      LEFT JOIN user_profiles up ON up.user_id = u.id
-     ${whereClause}
+     ${whereClause}`;
+
+  const countRow = await queryOne(`SELECT COUNT(*) as total ${joinClause}`, params);
+
+  const rows = await query(
+    `SELECT d.*, u.email as user_email, up.first_name as user_first_name, up.last_name as user_last_name
+     ${joinClause}
      ORDER BY d.created_at DESC
      LIMIT ? OFFSET ?`,
     [...params, String(limit), String(offset)]

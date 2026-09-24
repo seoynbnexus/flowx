@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { USER_STATUS } from '../../../shared/constants/index.js';
+import { USER_STATUS, ROLE_CODES } from '../../../shared/constants/index.js';
 
 export const updateProfileSchema = z.object({
   firstName: z.string().min(1).max(100).optional(),
@@ -49,6 +49,7 @@ export const listUsersSchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   limit: z.coerce.number().int().positive().max(100).default(20),
   status: z.enum([USER_STATUS.ACTIVE, USER_STATUS.INACTIVE, USER_STATUS.BLOCKED, USER_STATUS.PENDING]).optional(),
+  role: z.enum([ROLE_CODES.SUPER_ADMIN, ROLE_CODES.ADMIN, ROLE_CODES.PUBLISHER, ROLE_CODES.CLIENT, ROLE_CODES.SUPPORT_AGENT]).optional(),
   search: z.string().max(255).optional(),
 });
 

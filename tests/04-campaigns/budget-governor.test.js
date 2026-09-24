@@ -103,6 +103,44 @@ describe('budget governor — pause at cap', () => {
     expect(Number(logs[0].n)).toBe(2)
   })
 
+  it('pauses every owner ad on a multi-publisher campaign sharing the capped account', async () => {
+    const client = await createTestUser({ email: `bg-multi-client-${dateTag}@flowx-test.com`, password: 'Test@123', coins: 1000 })
+    const publisher = await createTestUser({ email: `bg-multi-pub-${dateTag}@flowx-test.com`, password: 'Test@123', coins: 1000 })
+    const account = await repo.createMetaAdAccount({ metaAccountId: `bgMulti_${dateTag}`, token: 't', monthlyCapPaise: 100000 })
+
+    const campaign = await repo.createCampaign(generateUuid(), client.id, {
+      name: `BG Multi ${generateUuid().substring(0, 8)}`,
+      type: 'post',
+      adAccountId: account.id,
+    })
+    const clientAdId = `ad_bg_client_${generateUuid()}`
+    const publisherAdId = `ad_bg_pub_${generateUuid()}`
+    await repo.createMetaObject(campaign.id, 'facebook_campaign', `fb_bg_client_${generateUuid()}`, null, 'ACTIVE', client.id)
+    await repo.createMetaObject(campaign.id, 'ad', clientAdId, null, 'ACTIVE', client.id)
+    await repo.createMetaObject(campaign.id, 'facebook_campaign', `fb_bg_pub_${generateUuid()}`, null, 'ACTIVE', publisher.id)
+    await repo.createMetaObject(campaign.id, 'ad', publisherAdId, null, 'ACTIVE', publisher.id)
+    await repo.updateCampaignStatus(campaign.id, 'running')
+    await repo.updateCampaign(campaign.id, { chargedAdBudgetPaise: 120000 })
+
+    metaMocks.listAccountAds.mockResolvedValue({
+      rows: [
+        { id: clientAdId, status: 'PAUSED', effective_status: 'PAUSED' },
+        { id: publisherAdId, status: 'PAUSED', effective_status: 'PAUSED' },
+      ],
+      truncated: false,
+    })
+
+    const result = await service.syncAccountStatusJob(`bgMulti_${dateTag}`)
+    expect(result.budget.atCap).toBe(true)
+    expect(result.budget.paused).toEqual([campaign.id])
+
+    expect(metaMocks.updateAdStatus).toHaveBeenCalledWith(clientAdId, 'PAUSED', 't')
+    expect(metaMocks.updateAdStatus).toHaveBeenCalledWith(publisherAdId, 'PAUSED', 't')
+
+    const after = await repo.findCampaignById(campaign.id)
+    expect(after.status).toBe('paused')
+  })
+
   it('does not re-pause already paused campaigns on the next sync', async () => {
     const user = await createTestUser({ email: `bg2-${dateTag}@flowx-test.com`, password: 'Test@123', coins: 1000 })
     const account = await repo.createMetaAdAccount({ metaAccountId: `bgB_${dateTag}`, token: 't', monthlyCapPaise: 100000 })

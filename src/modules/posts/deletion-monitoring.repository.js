@@ -187,7 +187,9 @@ export async function recoverFlaggedDeletion(targetId, remoteState, source, toke
             remote_verified_at = NOW(),
             deletion_review_state = 'none',
             deletion_flagged_at = NULL,
-            deletion_reason = NULL
+            deletion_reason = NULL,
+            meta_deleted_at = NULL,
+            meta_remote_status = NULL
       WHERE id = ? AND deletion_review_state = 'flagged'`,
     [remoteState, source, tokenKey, uuidToBuffer(targetId)]
   )

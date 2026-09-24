@@ -11,6 +11,8 @@ function mapMediaRow(row) {
     mimeType: row.mime_type || null,
     mediaKind: row.media_kind,
     sizeBytes: Number(row.size_bytes),
+    width: row.width === null || row.width === undefined ? null : Number(row.width),
+    height: row.height === null || row.height === undefined ? null : Number(row.height),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -18,8 +20,8 @@ function mapMediaRow(row) {
 
 export async function createMediaAsset(id, userId, data) {
   await query(
-    `INSERT INTO media_assets (id, user_id, name, storage_path, mime_type, media_kind, size_bytes)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO media_assets (id, user_id, name, storage_path, mime_type, media_kind, size_bytes, width, height)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       uuidToBuffer(id),
       uuidToBuffer(userId),
@@ -28,6 +30,8 @@ export async function createMediaAsset(id, userId, data) {
       data.mimeType || null,
       data.mediaKind,
       data.sizeBytes,
+      data.width ?? null,
+      data.height ?? null,
     ]
   )
   return findMediaAssetById(id)

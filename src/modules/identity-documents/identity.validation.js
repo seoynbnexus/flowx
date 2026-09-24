@@ -2,6 +2,8 @@ import { z } from 'zod';
 
 export const listDocumentsQuerySchema = z.object({
   status: z.string().optional(),
+  documentType: z.string().max(100).optional(),
+  search: z.string().max(255).optional(),
   page: z.coerce.number().int().positive().optional().default(1),
   limit: z.coerce.number().int().positive().max(100).optional().default(20),
 });

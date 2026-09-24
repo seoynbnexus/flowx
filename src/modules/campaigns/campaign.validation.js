@@ -1,5 +1,6 @@
 import { z } from 'zod'
-import { CAMPAIGN_TYPES, BUDGET_TYPES } from './campaign.model.js'
+import { CAMPAIGN_TYPES, BUDGET_TYPES, META_SPECIAL_AD_CATEGORIES } from './campaign.model.js'
+import { META_CALL_TO_ACTION_TYPES } from '../../../shared/services/ad-content-validation.js'
 
 export const createCampaignSchema = z.object({
   name: z.string().min(1, 'Name is required').max(255),
@@ -26,7 +27,7 @@ export const creativeSchema = z.object({
   caption: z.string().max(2200).optional().nullable(),
   hashtags: z.string().max(500).optional().nullable(),
   textBody: z.string().max(5000).optional().nullable(),
-  callToAction: z.string().max(100).optional().nullable(),
+  callToAction: z.enum(META_CALL_TO_ACTION_TYPES).optional().nullable(),
   headline: z.string().max(255).optional().nullable(),
   description: z.string().max(1000).optional().nullable(),
   utmSource: z.string().max(500).optional().nullable(),
@@ -58,12 +59,14 @@ export const metaSettingsSchema = z.object({
   objective: z.string().min(1, 'Objective is required'),
   adAccountId: z.string().optional().nullable(),
   bidStrategy: z.string().optional().nullable(),
+  bidAmount: z.coerce.number().positive().optional().nullable(),
   optimizationGoal: z.string().optional().nullable(),
   budgetType: z.nativeEnum(BUDGET_TYPES).optional().nullable(),
   budgetAmount: z.coerce.number().positive().optional().nullable(),
   billingEvent: z.string().optional().nullable(),
   spendCap: z.coerce.number().positive().optional().nullable(),
   endTime: z.string().datetime().optional().nullable(),
+  specialAdCategories: z.array(z.enum(META_SPECIAL_AD_CATEGORIES)).optional().default([]),
   targeting: z.object({
     age_min: z.number().int().min(13).max(65).optional(),
     age_max: z.number().int().min(13).max(65).optional(),
@@ -106,6 +109,7 @@ export const adminCampaignQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(100).default(20),
   status: z.string().optional(),
   clientId: z.string().uuid().optional(),
+  search: z.string().max(255).optional(),
 })
 
 export const approveCampaignSchema = z.object({
@@ -145,4 +149,17 @@ export const metaAdAccountUpdateSchema = z.object({
   monthlyCapPaise: z.coerce.number().int().nonnegative().optional(),
   isPrimary: z.boolean().optional(),
   status: z.enum(['active', 'disabled']).optional(),
+})
+
+export const checkCampaignMediaSchema = z.object({
+  mediaUrl: z.string().url('Invalid media URL'),
+  platformPlacement: z.record(z.any()).optional().nullable(),
+})
+
+export const repairRequestSchema = z.object({
+  mediaAssetId: z.string().uuid('Invalid media asset ID').optional(),
+  mediaUrl: z.string().url('Invalid media URL').max(2048, 'Media URL too long').optional(),
+  issueCode: z.string().max(32).optional(),
+}).refine((data) => Boolean(data.mediaAssetId) !== Boolean(data.mediaUrl), {
+  message: 'Exactly one of mediaAssetId or mediaUrl is required',
 })

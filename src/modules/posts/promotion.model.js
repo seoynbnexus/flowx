@@ -16,6 +16,11 @@ export const PROMOTION_TARGET_STATUS = {
   CREATING: 'creating',
   ACTIVE: 'active',
   PAUSED: 'paused',
+  // Deliberately NOT added to IN_FLIGHT_PROMOTION_TARGET_STATUSES or any
+  // bucket refreshPromotionStatus filters on — that omission is what keeps
+  // a target mid-repair invisible to promotion-level aggregation, so the
+  // promotion never prematurely settles while a repair is in flight.
+  NEEDS_REPAIR: 'needs_repair',
   FAILED: 'failed',
   CANCELLED: 'cancelled',
 }
@@ -28,6 +33,7 @@ export const PROMOTION_TARGET_ELIGIBILITY = {
 
 export const PROMOTION_JOB_TYPES = {
   EXECUTE: 'promotion_execute',
+  REPAIR: 'promotion_repair',
 }
 
 export const PROMOTION_STATUS_LABELS = {
@@ -48,6 +54,7 @@ export const PROMOTION_TARGET_STATUS_LABELS = {
   creating: 'Creating',
   active: 'Active',
   paused: 'Paused',
+  needs_repair: 'Needs Repair',
   failed: 'Failed',
   cancelled: 'Cancelled',
 }

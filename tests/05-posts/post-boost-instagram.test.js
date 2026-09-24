@@ -37,6 +37,7 @@ vi.mock('../../shared/services/meta-ads.service.js', async () => {
 })
 
 const dateTag = Date.now()
+const futureBoostEndTime = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
 
 async function addPlatformAccount(userId, { code, platformUserId, igId = null }) {
   const platform = await queryOne("SELECT id FROM platforms WHERE code = ?", [code])
@@ -100,7 +101,7 @@ describe('instagram post boost via boost_eligibility_info', () => {
       mediaUrl,
       boostEnabled: true,
       boostBudgetType: 'daily',
-      boostBudgetAmount: 500,
+      boostBudgetAmount: 500, boostEndTime: futureBoostEndTime,
       boostObjective: 'OUTCOME_ENGAGEMENT',
       boostOptimizationGoal: 'POST_ENGAGEMENT',
       boostTargeting: { geo_locations: { countries: ['IN'] } },
@@ -128,10 +129,42 @@ describe('instagram post boost via boost_eligibility_info', () => {
     expect(placement.publisherPlatforms).toEqual(['instagram'])
     expect(budget.promotedPageId).toBeNull()
     expect(schedule.startTime).toBeUndefined()
-    expect(schedule.endTime).toBeUndefined()
+    expect(schedule.endTime).toBeGreaterThan(Math.floor(Date.now() / 1000))
     const boosts = await postRepo.findPostBoostTargetsByTargetId(targetId)
     expect(boosts.length).toBe(4)
     await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(postId)])
+  })
+
+  it('should forward boostCallToAction as call_to_action_type on the ad creative (no link/headline/description override)', async () => {
+    const post = await postService.createPost(client.id, {
+      name: `IG Boost CTA ${generateUuid()}`,
+      type: 'post',
+      caption: 'IG boost CTA',
+      mediaUrl: 'https://example.com/img.jpg',
+      boostEnabled: true,
+      boostBudgetType: 'daily',
+      boostBudgetAmount: 500, boostEndTime: futureBoostEndTime,
+      boostObjective: 'OUTCOME_ENGAGEMENT',
+      boostOptimizationGoal: 'POST_ENGAGEMENT',
+      boostCallToAction: 'SHOP_NOW',
+      boostTargeting: { geo_locations: { countries: ['IN'] } },
+      targetAccountIds: [igAccountId],
+    })
+    await postService.submitPost(client.id, post.id)
+    await postService.approvePost(admin.id, post.id, {})
+    const targets = await postRepo.findPostTargetsByPostId(post.id)
+    const target = targets[0]
+    const igMediaId = `ig_cta_${generateUuid().slice(0, 8)}`
+    await query("UPDATE post_targets SET status = 'posted', publish_state = 'published', meta_object_id = ?, posted_at = NOW() WHERE id = ?", [igMediaId, uuidToBuffer(target.id)])
+    await query("UPDATE posts SET status = 'completed' WHERE id = ?", [uuidToBuffer(post.id)])
+
+    const result = await postService.postBoostJob(post.id, target.id, {})
+    expect(result.done).toBe(true)
+    const calls = metaMocks.createAdCreativeFromInstagramPost.mock.calls
+    const lastCall = calls[calls.length - 1]
+    // (adAccountId, igMediaId, igActorId, pageId, name, accessToken, validateOnly, callToActionType)
+    expect(lastCall[7]).toBe('SHOP_NOW')
+    await query('DELETE FROM campaign_jobs WHERE campaign_id = ?', [uuidToBuffer(post.id)])
   })
 
   it('should boost IG reel post', async () => {
@@ -195,7 +228,7 @@ describe('instagram post boost via boost_eligibility_info', () => {
       mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true,
       boostBudgetType: 'daily',
-      boostBudgetAmount: 500,
+      boostBudgetAmount: 500, boostEndTime: futureBoostEndTime,
       boostObjective: 'OUTCOME_ENGAGEMENT',
       boostOptimizationGoal: 'POST_ENGAGEMENT',
       boostTargeting: { geo_locations: { countries: ['IN'] } },
@@ -226,7 +259,7 @@ describe('instagram post boost via boost_eligibility_info', () => {
       mediaUrl: 'https://example.com/img.jpg',
       boostEnabled: true,
       boostBudgetType: 'daily',
-      boostBudgetAmount: 500,
+      boostBudgetAmount: 500, boostEndTime: futureBoostEndTime,
       boostObjective: 'OUTCOME_ENGAGEMENT',
       boostOptimizationGoal: 'POST_ENGAGEMENT',
       boostTargeting: { geo_locations: { countries: ['IN'] } },
