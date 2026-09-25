@@ -4,16 +4,19 @@ import { uuidToBuffer, bufferToUuid, generateUuid } from '../../../shared/utils/
 import { sendSuccess, sendError } from '../../../shared/utils/response.utils.js';
 import { HTTP_STATUS } from '../../../shared/constants/httpStatus.js';
 import { AI_LIMITS, getMarkupCoins, invalidateMarkupCache, getImageBaseCost, invalidateImageBaseCache } from './ai.config.js';
+import { validatePlatformFeePct, setPlatformFeePct, loadPlatformFeePct } from '../../../shared/services/platform-fee.js';
 
 export async function getConfig(req, res, next) {
   try {
-    const [markupCoins, imageBaseCost] = await Promise.all([
+    const [markupCoins, imageBaseCost, platformFeePct] = await Promise.all([
       getMarkupCoins(),
       getImageBaseCost(),
+      loadPlatformFeePct(),
     ]);
     const config = {
       pricing: { markupCoins },
       imagePricing: { imageBaseCost },
+      platformFee: { platformFeePct },
       limits: {
         maxPromptLength: AI_LIMITS.maxPromptLength,
         rateLimitRpm: AI_LIMITS.rateLimitRpm,
@@ -27,7 +30,7 @@ export async function getConfig(req, res, next) {
 
 export async function updateConfig(req, res, next) {
   try {
-    const { markupCoins } = req.body;
+    const { markupCoins, imageBaseCost } = req.body;
 
     if (markupCoins !== undefined) {
       if (typeof markupCoins !== 'number' || markupCoins < 0 || !Number.isInteger(markupCoins)) {
@@ -79,11 +82,38 @@ export async function updateConfig(req, res, next) {
       invalidateImageBaseCache();
     }
 
-    const [newMarkup, newImageBaseCost] = await Promise.all([
+    if (req.body.platformFeePct !== undefined) {
+      const feeError = validatePlatformFeePct(req.body.platformFeePct);
+      if (feeError) {
+        return sendError(res, HTTP_STATUS.UNPROCESSABLE_ENTITY, feeError);
+      }
+
+      const existing = await queryOne(
+        "SELECT id FROM app_config WHERE config_key = 'platform_fee_pct'"
+      );
+
+      if (existing) {
+        await query(
+          "UPDATE app_config SET config_value = ?, updated_by = ?, version = version + 1 WHERE config_key = 'platform_fee_pct'",
+          [JSON.stringify(req.body.platformFeePct), uuidToBuffer(req.user.id)]
+        );
+      } else {
+        await query(
+          `INSERT INTO app_config (id, config_key, config_value, is_public, description, version, updated_by)
+           VALUES (?, 'platform_fee_pct', ?, 0, 'Platform fee on publisher payouts, in percent (supports decimals)', 1, ?)`,
+          [uuidToBuffer(generateUuid()), JSON.stringify(req.body.platformFeePct), uuidToBuffer(req.user.id)]
+        );
+      }
+
+      setPlatformFeePct(req.body.platformFeePct);
+    }
+
+    const [newMarkup, newImageBaseCost, newPlatformFeePct] = await Promise.all([
       getMarkupCoins(),
       getImageBaseCost(),
+      loadPlatformFeePct(),
     ]);
-    return sendSuccess(res, { pricing: { markupCoins: newMarkup }, imagePricing: { imageBaseCost: newImageBaseCost } }, 'AI config updated');
+    return sendSuccess(res, { pricing: { markupCoins: newMarkup }, imagePricing: { imageBaseCost: newImageBaseCost }, platformFee: { platformFeePct: newPlatformFeePct } }, 'AI config updated');
   } catch (error) {
     next(error);
   }

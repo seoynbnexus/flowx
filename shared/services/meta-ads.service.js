@@ -313,6 +313,7 @@ export async function createAdCreative(adAccountId, pageId, message, mediaUrl, c
     if (extra.headline) linkData.name = extra.headline
     if (extra.description) linkData.description = extra.description
     if (extra.imageHash) linkData.image_hash = extra.imageHash
+    else linkData.picture = mediaUrl
     objectStorySpec.link_data = linkData
   }
 

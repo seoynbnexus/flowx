@@ -98,6 +98,10 @@ async function start() {
     await pool.getConnection();
     logger.info('Database connected');
 
+    const { loadPlatformFeePct } = await import('./shared/services/platform-fee.js');
+    const platformFeePct = await loadPlatformFeePct().catch(() => null);
+    logger.info({ platformFeePct }, 'Platform fee loaded');
+
     const { startBackgroundWorkers } = await import('./src/modules/campaigns/campaign.jobs.js');
     const background = startBackgroundWorkers();
     logger.info(background, 'Campaign job worker + Meta sync scheduler started');

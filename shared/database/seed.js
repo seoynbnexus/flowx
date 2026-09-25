@@ -195,6 +195,7 @@ const APP_CONFIG_SEEDS = [
   { key: 'campaign_repair_killed', value: false, is_public: 0, description: 'Repair kill switch: when true, all repair mutations (request + worker) are refused without state changes. Emergency stop.' },
   { key: 'campaign_repair_category_media_dimension', value: true, is_public: 0, description: 'Per-category repair gate for MEDIA_DIMENSION issues: when true, media-dimension repairs may be created. Default on.' },
   { key: 'campaign_repair_category_client_edit', value: false, is_public: 0, description: 'Per-category repair gate for CLIENT_EDIT amendments (client-initiated creative fix on a FAILED, already-live campaign): when true, these amendments may be created. Fail-closed default off.' },
+  { key: 'platform_fee_pct', value: 10, is_public: 0, description: 'Platform fee on publisher payouts, in percent (supports decimals, e.g. 7.5). Applied to campaign and post publisher escrow.' },
 ]
 
 const report = []

@@ -23,6 +23,7 @@ const deductCoinsSchema = z.object({
 const updateConfigSchema = z.object({
   markupCoins: z.number().int().min(0).optional(),
   imageBaseCost: z.number().int().min(0).optional(),
+  platformFeePct: z.number().min(0).max(100).optional(),
 });
 
 router.get('/config', adminController.getConfig);

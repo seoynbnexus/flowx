@@ -77,6 +77,29 @@ describe('meta ads validate_only support', () => {
     expect(spec.video_data).toBeUndefined()
   })
 
+  it('should send link_data.picture for a plain image creative (not just link)', async () => {
+    // Regression: "link" is documented as the CTA click-through destination,
+    // not a field Meta crawls for a creative image. Relying on link alone
+    // produced a live "Please specify the media to run with this ad." error
+    // even though a valid, reachable image URL was set — Meta had nothing
+    // explicit to use as the ad's picture. "picture" is Meta's documented
+    // field for supplying the creative image directly.
+    await createAdCreative('act_1', 'page_1', 'msg', 'https://example.com/img.jpg', 'OPEN_LINK', 'tok', {})
+    const [, options] = apiFetch.mock.calls[0]
+    const params = Object.fromEntries(new URLSearchParams(options.body))
+    const spec = JSON.parse(params.object_story_spec)
+    expect(spec.link_data.picture).toBe('https://example.com/img.jpg')
+  })
+
+  it('should send image_hash instead of picture when extra.imageHash is provided (Meta forbids both)', async () => {
+    await createAdCreative('act_1', 'page_1', 'msg', 'https://example.com/img.jpg', 'OPEN_LINK', 'tok', { imageHash: 'abc123hash' })
+    const [, options] = apiFetch.mock.calls[0]
+    const params = Object.fromEntries(new URLSearchParams(options.body))
+    const spec = JSON.parse(params.object_story_spec)
+    expect(spec.link_data.image_hash).toBe('abc123hash')
+    expect(spec.link_data.picture).toBeUndefined()
+  })
+
   it('should send video_data (not link_data) when extra.video.videoId is provided, even if mediaUrl is also set', async () => {
     // Regression: object_story_spec must never carry both link_data and
     // video_data — Meta treats a raw video URL passed as link_data.link as a

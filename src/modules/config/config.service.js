@@ -6,6 +6,7 @@ import * as aiRepo from '../ai/ai.repository.js';
 import * as subService from '../subscriptions/subscription.service.js';
 import { query } from '../../../shared/database/connection.js';
 import { DEFAULT_FEATURE_VISIBILITY } from './feature.controller.js';
+import { loadPlatformFeePct, PLATFORM_FEE_DEFAULT_PCT } from '../../../shared/services/platform-fee.js';
 import {
   IDENTITY_STATUS,
   USER_STATUS,
@@ -93,11 +94,12 @@ async function getDropdownOptions() {
 }
 
 export async function getPublicConfig() {
-  const [staticRows, dropdownOptions, countryCodes, promotionFlags] = await Promise.all([
+  const [staticRows, dropdownOptions, countryCodes, promotionFlags, platformFeePct] = await Promise.all([
     query('SELECT config_key, config_value FROM app_config WHERE is_public = 1'),
     getDropdownOptions(),
     getCountryCodes(),
     readPromotionFlags(),
+    loadPlatformFeePct(),
   ]);
   const raw = transformConfigRows(staticRows);
 
@@ -116,6 +118,7 @@ export async function getPublicConfig() {
     },
     coinConversionRate: raw.coin_conversion_rate ?? null,
     featureVisibility: { ...DEFAULT_FEATURE_VISIBILITY, ...(raw.feature_visibility || {}), ...promotionFlags },
+    platformFeePct: platformFeePct ?? PLATFORM_FEE_DEFAULT_PCT,
     publisherMaxAccounts: Number(raw.publisher_max_accounts_per_request) || 5,
     publisherDeadlineHours: Number(raw.publisher_response_deadline_hours) || 48,
   };

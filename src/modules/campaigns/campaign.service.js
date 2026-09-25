@@ -37,6 +37,7 @@ import { logMetaEvent } from '../../../shared/services/meta-logger.service.js'
 import { transaction, queryOne } from '../../../shared/database/connection.js'
 import { isRateLimited, isSoftThrottled, getRateLimitState, getAllRateLimitStates } from '../../../shared/services/meta-rate-limiter.js'
 import { normalizeIssuesInfo, classifyIssueCode, describeIssuesForCampaign, hasRepairableIssue } from '../../../shared/services/meta-issue-catalog.js'
+import { platformFeeFor, withPlatformFee } from '../../../shared/services/platform-fee.js'
 import { checkAdContentForMeta, checkAdMediaForMeta } from '../../../shared/services/ad-content-validation.js'
 import { sendAdminAlert, sendPublisherRepublishNotification } from '../../../shared/mailer/alert.mailer.js'
 import * as execRepo from './campaign-execution.repository.js'
@@ -536,9 +537,9 @@ export async function confirmAndGoLive(campaignId, userId) {
   return repo.findCampaignById(campaignId)
 }
 
-function calculateTotalEscrow(campaign) {
+export function calculateTotalEscrow(campaign) {
   const publisherCost = (campaign.publisherCount || 0) * (campaign.coinsPerPublisher || 0)
-  const platformFee = Math.round(publisherCost * 0.1)
+  const platformFee = platformFeeFor(publisherCost)
   return publisherCost + platformFee
 }
 
@@ -2785,7 +2786,7 @@ export async function forceGoLiveCampaign(adminId, campaignId) {
     // so a second attempt sees zero pending requests here and skips this.
     const unfilledSlots = (campaign.publisherCount || 0) - accepted.length
     if (unfilledSlots > 0 && campaign.coinsPerPublisher && pendingRequests.length > 0) {
-      const refundAmount = unfilledSlots * campaign.coinsPerPublisher * 1.1
+      const refundAmount = withPlatformFee(unfilledSlots * campaign.coinsPerPublisher)
       const coinService = await import('../../../shared/services/coin.service.js')
       await coinService.refund(campaign.clientId, Math.round(refundAmount), 'campaign_escrow', campaignId,
         `Refund for ${unfilledSlots} unfilled publisher slots`)

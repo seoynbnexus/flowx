@@ -10,6 +10,7 @@ import { buildPostMessage, validatePostContent, PostValidationError } from '../.
 import { isPublicHttpUrl, resolveMediaHost, inspectMediaSize, fetchBoundedBytes } from '../../../shared/services/media-url.js'
 import { probeMedia, probeWithFfprobe } from '../../../shared/services/media-probe.js'
 import { isRateLimited, tokenKeyFor } from '../../../shared/services/meta-rate-limiter.js'
+import { platformFeeFor } from '../../../shared/services/platform-fee.js'
 import { randomBytes, createHash } from 'node:crypto'
 import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1425,9 +1426,9 @@ export async function retryPostPublish(postId) {
   return { queued: true, jobId: queuedJob.jobId }
 }
 
-function calculatePublisherEscrow(post) {
+export function calculatePublisherEscrow(post) {
   const publisherCost = (post.publisherCount || 0) * (post.coinsPerPublisher || 0)
-  const platformFee = Math.round(publisherCost * 0.1)
+  const platformFee = platformFeeFor(publisherCost)
   return { publisherCost, platformFee, total: publisherCost + platformFee }
 }
 
